@@ -48,7 +48,7 @@ def extract_number(text):
 
 def send_main_menu(phone):
     menu = (
-        "📋 *Otros servicios disponibles:*
+        "📋 *Otros servicios disponibles:*"
 "
         "1️⃣ Seguros de Auto
 "
