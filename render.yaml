@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: bot-vicky
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: META_TOKEN
+        sync: true
+      - key: WABA_PHONE_ID
+        sync: true
+      - key: VERIFY_TOKEN
+        sync: true
+      - key: OPENAI_API_KEY
+        sync: true
+      - key: ADVISOR_NUMBER
+        sync: true
