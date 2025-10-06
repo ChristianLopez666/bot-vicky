@@ -1,4 +1,5 @@
-# app.py — versión final (condición opción 7 corregida)
+# app.py — Vicky Redes (versión DIAGNÓSTICO)
+# Objetivo: no cambia la lógica; solo agrega logs detallados para aislar por qué la opción 7 no notifica.
 # -*- coding: utf-8 -*-
 
 import os
@@ -23,26 +24,35 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 app = Flask(__name__)
 
 # ---------------------- UTILIDADES ----------------------
+def _wa_endpoint():
+    return f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
+
 def wa_send_text(to, text):
+    """Envía texto por WhatsApp Cloud API. Retorna (ok, status, body) y deja logs detallados."""
+    url = _wa_endpoint()
+    headers = {
+        "Authorization": f"Bearer {META_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": str(to),
+        "type": "text",
+        "text": {"body": text}
+    }
     try:
-        url = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
-        headers = {
-            "Authorization": f"Bearer {META_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": str(to),
-            "type": "text",
-            "text": {"body": text}
-        }
+        logging.info(f"[WA][REQ] to={to} payload={json.dumps(payload, ensure_ascii=False)[:400]}")
         resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
-        logging.info(f"[WA] status={resp.status_code} resp={resp.text[:400]}")
+        body = resp.text
+        logging.info(f"[WA][RES] to={to} status={resp.status_code} body={body[:600]}")
         resp.raise_for_status()
-        return True
+        return True, resp.status_code, body
     except Exception as e:
-        logging.exception(f"❌ Error enviando mensaje a {to}: {e}")
-        return False
+        logging.exception(f"❌ [WA][ERR] to={to} exception={e}")
+        try:
+            return False, resp.status_code, resp.text
+        except Exception:
+            return False, None, str(e)
 
 def clean_option(text):
     if not text:
@@ -97,6 +107,7 @@ def verify_webhook():
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
+    logging.info(f"[VERIFY] mode={mode} token_match={token==VERIFY_TOKEN}")
     if mode == "subscribe" and token == VERIFY_TOKEN:
         return challenge, 200
     return "Verification token mismatch", 403
@@ -105,13 +116,14 @@ def verify_webhook():
 def receive_message():
     try:
         data = request.get_json(force=True, silent=True) or {}
-        logging.info(f"📩 Webhook body: {json.dumps(data)[:1500]}")
+        logging.info(f"📩 Webhook body: {json.dumps(data, ensure_ascii=False)[:1500]}")
 
         entry = (data.get("entry") or [{}])[0]
         changes = (entry.get("changes") or [{}])[0]
         value = changes.get("value") or {}
 
         if "messages" not in value:
+            logging.info("ℹ️ Evento ignorado (no 'messages' en payload)")
             return jsonify({"ignored": True}), 200
 
         message = value["messages"][0]
@@ -119,31 +131,46 @@ def receive_message():
         profile_name = contact.get("profile", {}).get("name", "Cliente")
         phone_number = message.get("from") or contact.get("wa_id")
         user_text = (message.get("text", {}) or {}).get("body", "").strip()
+        msg_type = message.get("type")
 
-        if message.get("type") != "text":
+        logging.info(f"[IN] from={phone_number} name={profile_name!r} type={msg_type} text={user_text!r}")
+
+        if msg_type != "text":
+            logging.info("[FLOW] Mensaje no-text → envío menú")
             send_main_menu(phone_number)
             return jsonify({"status": "ok"}), 200
 
         if user_text.lower() in {"menu", "menú", "hola", "inicio"}:
+            logging.info("[FLOW] Solicitud de menú explícita")
             send_main_menu(phone_number)
             return jsonify({"status": "ok"}), 200
 
         option = clean_option(user_text)
+        logging.info(f"[FLOW] option_normalized={option!r} raw={user_text!r}")
 
-        # ----------- Opción 7 corregida -----------
+        # ----------- Opción 7 (misma lógica, más logs) -----------
         if option == "7" or ("contactar con christian" in user_text.lower()):
-            wa_send_text(phone_number, "✅ Gracias por tu interés. Un asesor se comunicará contigo en breve.")
+            logging.info(f"[FLOW] Entrando a opción 7 → advisor={ADVISOR_NUMBER}")
+            user_msg = "✅ Gracias por tu interés. Un asesor se comunicará contigo en breve."
+            ok_user, sc_user, body_user = wa_send_text(phone_number, user_msg)
+            logging.info(f"[FLOW] user_ack ok={ok_user} status={sc_user} resp={body_user[:300] if body_user else body_user}")
+
             notify = (
                 "📢 *Nuevo intento de contacto desde Vicky*\n\n"
                 f"👤 Nombre: {profile_name}\n"
                 f"📱 Número: {phone_number}\n"
                 "🧭 Opción: 7️⃣ Contactar con Christian"
             )
-            wa_send_text(ADVISOR_NUMBER, notify)
-            logging.info("📨 Notificación enviada al asesor (opción 7).")
+            ok_adv, sc_adv, body_adv = wa_send_text(ADVISOR_NUMBER, notify)
+            logging.info(f"[FLOW] advisor_notify ok={ok_adv} status={sc_adv} advisor={ADVISOR_NUMBER} resp={body_adv[:300] if body_adv else body_adv}")
+            if ok_adv:
+                logging.info("📨 Notificación enviada al asesor (opción 7).")
+            else:
+                logging.warning("⚠️ Falló el envío al asesor. Revisa status y resp en la línea anterior.")
             return jsonify({"status": "ok"}), 200
 
         if option in {"1", "2", "3", "4", "5", "6"}:
+            logging.info(f"[FLOW] Opción {option} (placeholder)")
             respuestas = {
                 "1": "🚗 *Seguros de Auto*: cotizamos tu póliza con beneficios preferentes. ¿Deseas continuar?",
                 "2": "🧑‍⚕️ *Vida y Salud*: opciones de protección familiar. ¿Deseas continuar?",
@@ -155,6 +182,7 @@ def receive_message():
             wa_send_text(phone_number, respuestas[option])
             return jsonify({"status": "ok"}), 200
 
+        logging.info("[FLOW] Fallback con GPT")
         wa_send_text(phone_number, gpt_fallback(user_text))
         return jsonify({"status": "ok"}), 200
 
@@ -165,3 +193,4 @@ def receive_message():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
+
