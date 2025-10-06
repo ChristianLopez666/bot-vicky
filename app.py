@@ -199,7 +199,7 @@ def receive_message():
                             # Aquí iría tu lógica handle_imss_flow
                             # Por ahora respuesta simple
                             send_message(phone_number, 
-                                "👋 Hola, soy *Vicky*, asistente virtual de Inbursa. "
+                                "👋 Hola, soy *Vicky*, asistente de Christian López de Inbursa. "
                                 "Estamos configurando el sistema. Pronto estaré operativa."
                             )
                             return jsonify({"status": "responded"}), 200
