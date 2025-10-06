@@ -1,13 +1,27 @@
+from flask import Flask, request, jsonify
+import requests
 import re
 from datetime import datetime
-import requests  # Para integración con API de WhatsApp
+import os
+import logging
+
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ✅ INICIALIZAR LA APLICACIÓN FLASK PRIMERO
+app = Flask(__name__)
 
 class VickyBot:
     def __init__(self):
         self.user_sessions = {}
         self.advisor_number = "6682478005"
         
-        # Beneficios de nómina Inbursa (extraídos del PDF)
+        # Configuración de WhatsApp API
+        self.whatsapp_token = os.getenv('WHATSAPP_TOKEN', 'tu_token_aqui')
+        self.whatsapp_phone_id = os.getenv('WHATSAPP_PHONE_ID', 'tu_phone_id_aqui')
+        
+        # Beneficios de nómina Inbursa
         self.nomina_benefits = {
             'rendimiento': "• Rendimiento del 80% de CETES sin saldo mínimo requerido",
             'seguros': "• Seguro de vida con cobertura de $100,000 por muerte accidental",
@@ -20,25 +34,21 @@ class VickyBot:
 
     def detect_campaign(self, initial_message=None, utm_source=None):
         """Detecta la campaña basado en UTM parameters o mensaje inicial"""
+        if not initial_message:
+            return 'general'
+            
         campaign_keywords = {
             'imss': ['imss', 'pensionado', 'jubilado', 'ley 73', 'préstamo imss', 'pensión'],
             'business': ['empresarial', 'empresa', 'crédito empresarial', 'negocio', 'pyme']
         }
         
-        if utm_source:
-            if 'imss' in utm_source.lower():
+        message_lower = initial_message.lower()
+        for keyword in campaign_keywords['imss']:
+            if keyword in message_lower:
                 return 'imss'
-            elif 'business' in utm_source.lower() or 'empresarial' in utm_source.lower():
+        for keyword in campaign_keywords['business']:
+            if keyword in message_lower:
                 return 'business'
-        
-        if initial_message:
-            message_lower = initial_message.lower()
-            for keyword in campaign_keywords['imss']:
-                if keyword in message_lower:
-                    return 'imss'
-            for keyword in campaign_keywords['business']:
-                if keyword in message_lower:
-                    return 'business'
         
         return 'general'
 
@@ -78,6 +88,8 @@ class VickyBot:
 
     def start_conversation(self, user_id, campaign=None, initial_message=None):
         """Inicia la conversación basado en la campaña detectada"""
+        logger.info(f"Iniciando conversación para {user_id}, campaña: {campaign}")
+        
         if user_id not in self.user_sessions:
             self.user_sessions[user_id] = {
                 'campaign': campaign or self.detect_campaign(initial_message),
@@ -97,7 +109,9 @@ class VickyBot:
 
     def handle_imss_flow(self, user_id, user_message):
         """Maneja el flujo completo para préstamos IMSS"""
-        session = self.user_sessions[user_id]
+        session = self.user_sessions.get(user_id)
+        if not session:
+            return "Ocurrió un error. Por favor, inicia la conversación nuevamente."
         
         if session['state'] == 'welcome':
             session['state'] = 'confirm_pensionado'
@@ -152,7 +166,9 @@ class VickyBot:
 
     def handle_business_flow(self, user_id, user_message):
         """Maneja el flujo completo para créditos empresariales"""
-        session = self.user_sessions[user_id]
+        session = self.user_sessions.get(user_id)
+        if not session:
+            return "Ocurrió un error. Por favor, inicia la conversación nuevamente."
         
         if session['state'] == 'welcome':
             session['state'] = 'ask_credit_type'
@@ -224,7 +240,7 @@ class VickyBot:
         alternative_products = [
             "💼 *OTROS PRODUCTOS QUE PODRÍAN INTERESARTE:*",
             "1. Créditos personales",
-            "2. Tarjetas de crédito",
+            "2. Tarjetas de crédito", 
             "3. Seguros de vida y gastos médicos",
             "4. Inversiones a plazo fijo",
             "5. Cuentas de ahorro",
@@ -252,8 +268,8 @@ class VickyBot:
 
     def notify_advisor(self, user_id, campaign_type):
         """Envía notificación al asesor Christian"""
-        session = self.user_sessions[user_id]
-        data = session['data']
+        session = self.user_sessions.get(user_id, {})
+        data = session.get('data', {})
         
         if campaign_type == 'imss':
             message = f"🔥 *NUEVO PROSPECTO PRÉSTAMO IMSS* 🔥\n"
@@ -280,52 +296,97 @@ class VickyBot:
             message += f"🏦 Interés en nómina: {'SÍ' if data.get('nomina_interest') else 'NO'}\n"
             message += f"⏰ Hora: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         
-        # En un entorno real, aquí se enviaría el mensaje via WhatsApp API
-        print(f"NOTIFICACIÓN AL ASESOR ({self.advisor_number}): {message}")
-        # self.send_whatsapp_message(self.advisor_number, message)
+        # Enviar notificación real al asesor
+        logger.info(f"Notificación para asesor: {message}")
+        self.send_whatsapp_message(self.advisor_number, message)
         
         return True
 
     def send_whatsapp_message(self, number, message):
-        """Envía mensaje via WhatsApp Business API"""
-        # Implementación real con WhatsApp Business API
-        # payload = {
-        #     "messaging_product": "whatsapp",
-        #     "to": number,
-        #     "text": {"body": message}
-        # }
-        # headers = {
-        #     "Authorization": "Bearer {TOKEN}",
-        #     "Content-Type": "application/json"
-        # }
-        # response = requests.post(
-        #     "https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages",
-        #     json=payload,
-        #     headers=headers
-        # )
-        # return response.status_code == 200
-        pass
+        """Envía mensaje via WhatsApp Business API - IMPLEMENTACIÓN REAL"""
+        try:
+            url = f"https://graph.facebook.com/v17.0/{self.whatsapp_phone_id}/messages"
+            headers = {
+                "Authorization": f"Bearer {self.whatsapp_token}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": number,
+                "text": {"body": message}
+            }
+            
+            response = requests.post(url, json=payload, headers=headers)
+            logger.info(f"Respuesta WhatsApp API: {response.status_code}")
+            return response.status_code == 200
+            
+        except Exception as e:
+            logger.error(f"Error enviando mensaje WhatsApp: {e}")
+            return False
 
-# Ejemplo de uso
-bot = VickyBot()
+# ✅ INICIALIZAR EL BOT DESPUÉS DE DEFINIR LA CLASE
+vicky = VickyBot()
 
-# Simulación de conversación - Campaña IMSS
-user_id = "5211234567890"
-response1 = bot.start_conversation(user_id, campaign='imss')
-print("Vicky:", response1)
+# ✅ WEBHOOK ENDPOINTS
+@app.route('/')
+def home():
+    return jsonify({"status": "active", "message": "Vicky Bot is running!"})
 
-# Usuario responde que sí es pensionado
-response2 = bot.handle_imss_flow(user_id, "sí")
-print("Vicky:", response2)
+@app.route("/webhook", methods=["GET"])
+def verify_webhook():
+    """Verificación del webhook de WhatsApp"""
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+    
+    verify_token = os.getenv('VERIFY_TOKEN', 'vicky_token_2024')
+    
+    if mode and token:
+        if mode == "subscribe" and token == verify_token:
+            logger.info("Webhook verificado exitosamente")
+            return challenge
+    return "Verification failed", 403
 
-# Usuario proporciona pensión
-response3 = bot.handle_imss_flow(user_id, "15000")
-print("Vicky:", response3)
+@app.route("/webhook", methods=["POST"])
+def handle_webhook():
+    """Maneja los mensajes entrantes de WhatsApp"""
+    try:
+        data = request.get_json()
+        logger.info(f"Datos recibidos: {data}")
+        
+        if data.get("object") == "whatsapp_business_account":
+            for entry in data.get("entry", []):
+                for change in entry.get("changes", []):
+                    value = change.get("value", {})
+                    if "messages" in value:
+                        for msg in value["messages"]:
+                            phone = msg["from"]
+                            text = msg.get("text", {}).get("body", "").strip()
+                            
+                            if text:
+                                # Si es el primer mensaje, iniciar conversación
+                                if phone not in vicky.user_sessions:
+                                    campaign = vicky.detect_campaign(initial_message=text)
+                                    response = vicky.start_conversation(phone, campaign, text)
+                                else:
+                                    # Continuar la conversación existente
+                                    session = vicky.user_sessions[phone]
+                                    if session['campaign'] == 'imss':
+                                        response = vicky.handle_imss_flow(phone, text)
+                                    elif session['campaign'] == 'business':
+                                        response = vicky.handle_business_flow(phone, text)
+                                    else:
+                                        response = vicky.show_general_menu(phone)
+                                
+                                # Enviar respuesta por WhatsApp
+                                vicky.send_whatsapp_message(phone, response)
+        
+        return jsonify({"status": "ok"}), 200
+        
+    except Exception as e:
+        logger.error(f"Error en webhook: {e}")
+        return jsonify({"status": "error"}), 500
 
-# Usuario solicita monto
-response4 = bot.handle_imss_flow(user_id, "200000")
-print("Vicky:", response4)
-
-# Usuario acepta cambiar nómina
-response5 = bot.handle_imss_flow(user_id, "claro que sí")
-print("Vicky:", response5)
+# ✅ EJECUCIÓN SOLO EN ENTORNO LOCAL
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
