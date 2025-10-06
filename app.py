@@ -1,268 +1,331 @@
-# ===============================================================
-# VICKY CAMPAÑAS EN REDES – APP PRINCIPAL (CON GPT)
-# Integración completa con Meta Cloud API + OpenAI GPT
-# Flujos: Préstamos IMSS Ley 73 + Créditos Empresariales + GPT
-# Autor: Christian López | Grupo Financiero Inbursa
-# ===============================================================
-
-import os
-import json
-import logging
-import requests
-import openai
-from flask import Flask, request, jsonify
-from dotenv import load_dotenv
-from datetime import datetime
 import re
+from datetime import datetime
+import requests  # Para integración con API de WhatsApp
 
-# ---------------------------------------------------------------
-# Cargar variables de entorno
-# ---------------------------------------------------------------
-load_dotenv()
+class VickyBot:
+    def __init__(self):
+        self.user_sessions = {}
+        self.advisor_number = "6682478005"
+        
+        # Beneficios de nómina Inbursa (extraídos del PDF)
+        self.nomina_benefits = {
+            'rendimiento': "• Rendimiento del 80% de CETES sin saldo mínimo requerido",
+            'seguros': "• Seguro de vida con cobertura de $100,000 por muerte accidental",
+            'servicio_medico': "• Servicio médico Medical Home con consultas 24/7, asesoría nutricional y emocional",
+            'anticipo': "• Anticipo de nómina hasta 50% de sueldo neto mensual",
+            'descuentos': "• 10% de descuento en restaurantes Sanborns y más de 6,000 establecimientos",
+            'recompensas': "• Programa de recompensas con Puntos Inbursa redimibles en aerolíneas, hoteles y efectivo",
+            'cajeros': "• Red de 11,000 cajeros sin comisión y retiros en tiendas Walmart"
+        }
 
-META_TOKEN = os.getenv("META_TOKEN")
-WABA_PHONE_ID = os.getenv("WABA_PHONE_ID")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    def detect_campaign(self, initial_message=None, utm_source=None):
+        """Detecta la campaña basado en UTM parameters o mensaje inicial"""
+        campaign_keywords = {
+            'imss': ['imss', 'pensionado', 'jubilado', 'ley 73', 'préstamo imss', 'pensión'],
+            'business': ['empresarial', 'empresa', 'crédito empresarial', 'negocio', 'pyme']
+        }
+        
+        if utm_source:
+            if 'imss' in utm_source.lower():
+                return 'imss'
+            elif 'business' in utm_source.lower() or 'empresarial' in utm_source.lower():
+                return 'business'
+        
+        if initial_message:
+            message_lower = initial_message.lower()
+            for keyword in campaign_keywords['imss']:
+                if keyword in message_lower:
+                    return 'imss'
+            for keyword in campaign_keywords['business']:
+                if keyword in message_lower:
+                    return 'business'
+        
+        return 'general'
 
-# Configurar OpenAI
-if OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
-    GPT_ENABLED = True
-    logging.info("✅ GPT integrado y configurado")
-else:
-    GPT_ENABLED = False
-    logging.warning("⚠️ OPENAI_API_KEY no configurada - Modo sin GPT")
+    def gpt_interpret(self, message, context):
+        """Simula interpretación GPT para entender la intención del usuario"""
+        message_lower = message.lower()
+        
+        # Detectar afirmaciones
+        positive_keywords = ['sí', 'si', 'sip', 'claro', 'por supuesto', 'ok', 'vale', 'afirmativo', 'correcto', 'acepto', 'aceptar']
+        negative_keywords = ['no', 'nop', 'negativo', 'para nada', 'nunca', 'no quiero', 'no acepto']
+        
+        if context == 'confirmacion':
+            for keyword in positive_keywords:
+                if keyword in message_lower:
+                    return 'positive'
+            for keyword in negative_keywords:
+                if keyword in message_lower:
+                    return 'negative'
+        
+        # Detectar números (montos)
+        amount_match = re.search(r'(\d{1,3}(?:,\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)', message)
+        if amount_match:
+            return {'type': 'amount', 'value': float(amount_match.group().replace(',', ''))}
+        
+        # Detectar fechas/horas
+        time_patterns = [
+            r'(lunes|martes|miércoles|jueves|viernes|sábado|domingo)',
+            r'\d{1,2}:\d{2}',
+            r'\d{1,2}\s*(am|pm)',
+            r'mañana|tarde|noche'
+        ]
+        for pattern in time_patterns:
+            if re.search(pattern, message_lower):
+                return {'type': 'schedule', 'value': message}
+        
+        return {'type': 'text', 'value': message}
 
-# ---------------------------------------------------------------
-# Configuración de logging
-# ---------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+    def start_conversation(self, user_id, campaign=None, initial_message=None):
+        """Inicia la conversación basado en la campaña detectada"""
+        if user_id not in self.user_sessions:
+            self.user_sessions[user_id] = {
+                'campaign': campaign or self.detect_campaign(initial_message),
+                'state': 'welcome',
+                'data': {},
+                'timestamp': datetime.now()
+            }
+        
+        session = self.user_sessions[user_id]
+        
+        if session['campaign'] == 'imss':
+            return self.handle_imss_flow(user_id, "start")
+        elif session['campaign'] == 'business':
+            return self.handle_business_flow(user_id, "start")
+        else:
+            return self.show_general_menu(user_id)
 
-app = Flask(__name__)
-user_state = {}
-user_data = {}
+    def handle_imss_flow(self, user_id, user_message):
+        """Maneja el flujo completo para préstamos IMSS"""
+        session = self.user_sessions[user_id]
+        
+        if session['state'] == 'welcome':
+            session['state'] = 'confirm_pensionado'
+            return "¡Hola! Bienvenido a Préstamos para Pensionados IMSS Ley 73. ¿Eres pensionado o jubilado del IMSS bajo la Ley 73?"
+        
+        elif session['state'] == 'confirm_pensionado':
+            interpretation = self.gpt_interpret(user_message, 'confirmacion')
+            if interpretation == 'positive':
+                session['state'] = 'ask_pension'
+                return "Excelente. Para calcular tu préstamo, necesito saber: ¿Cuál es tu monto de pensión mensual aproximado?"
+            else:
+                session['state'] = 'not_eligible'
+                return self.show_alternative_products(user_id)
+        
+        elif session['state'] == 'ask_pension':
+            interpretation = self.gpt_interpret(user_message, 'amount')
+            if interpretation['type'] == 'amount':
+                session['data']['pension'] = interpretation['value']
+                session['state'] = 'ask_loan_amount'
+                return "Gracias. ¿Qué monto de préstamo deseas solicitar? (Desde $40,000 hasta $650,000)"
+            else:
+                return "Por favor, ingresa un monto válido para tu pensión mensual."
+        
+        elif session['state'] == 'ask_loan_amount':
+            interpretation = self.gpt_interpret(user_message, 'amount')
+            if interpretation['type'] == 'amount':
+                loan_amount = interpretation['value']
+                if 40000 <= loan_amount <= 650000:
+                    session['data']['loan_amount'] = loan_amount
+                    session['state'] = 'ask_nomina_change'
+                    return f"Perfecto. Para otorgarte las mejores condiciones con un monto de ${loan_amount:,.2f}, ¿estarías dispuesto a cambiar tu nómina a Inbursa?"
+                else:
+                    return "El monto debe estar entre $40,000 y $650,000. Por favor, ingresa un monto válido."
+            else:
+                return "Por favor, ingresa un monto válido para el préstamo."
+        
+        elif session['state'] == 'ask_nomina_change':
+            interpretation = self.gpt_interpret(user_message, 'confirmacion')
+            if interpretation == 'positive':
+                session['data']['nomina_change'] = True
+                session['state'] = 'show_benefits'
+                benefits_message = self.show_nomina_benefits()
+                self.notify_advisor(user_id, 'imss')
+                return f"¡Excelente decisión! {benefits_message}\n\nHemos enviado tu información a nuestro asesor Christian, quien se pondrá en contacto contigo pronto."
+            else:
+                session['data']['nomina_change'] = False
+                session['state'] = 'basic_loan'
+                self.notify_advisor(user_id, 'imss_basic')
+                return "Entendido. Hemos registrado tu solicitud de préstamo y nuestro asesor Christian te contactará pronto."
+        
+        return "Ocurrió un error en el flujo. Por favor, intenta nuevamente."
 
-# ---------------------------------------------------------------
-# NUEVO: FUNCIÓN GPT PARA RESPUESTAS INTELIGENTES
-# ---------------------------------------------------------------
-def get_gpt_response(user_message, phone_number, context=None):
-    """Obtiene respuesta contextual de GPT para conversaciones naturales."""
-    if not GPT_ENABLED:
-        return None
+    def handle_business_flow(self, user_id, user_message):
+        """Maneja el flujo completo para créditos empresariales"""
+        session = self.user_sessions[user_id]
+        
+        if session['state'] == 'welcome':
+            session['state'] = 'ask_credit_type'
+            return "¡Hola! Bienvenido a Créditos Empresariales Inbursa. ¿Qué tipo de crédito necesitas para tu empresa?"
+        
+        elif session['state'] == 'ask_credit_type':
+            session['data']['credit_type'] = user_message
+            session['state'] = 'ask_business_type'
+            return "Entendido. ¿A qué se dedica tu empresa? (Por ejemplo: manufactura, servicios, comercio, etc.)"
+        
+        elif session['state'] == 'ask_business_type':
+            session['data']['business_type'] = user_message
+            session['state'] = 'ask_loan_amount'
+            return "Gracias. ¿Qué monto de crédito necesitas para tu negocio?"
+        
+        elif session['state'] == 'ask_loan_amount':
+            interpretation = self.gpt_interpret(user_message, 'amount')
+            if interpretation['type'] == 'amount':
+                session['data']['loan_amount'] = interpretation['value']
+                session['state'] = 'ask_schedule'
+                return "Perfecto. Para agendar una llamada personalizada, ¿en qué día y hora prefieres que te contactemos?"
+            else:
+                return "Por favor, ingresa un monto válido para el crédito."
+        
+        elif session['state'] == 'ask_schedule':
+            interpretation = self.gpt_interpret(user_message, 'schedule')
+            if interpretation['type'] == 'schedule':
+                session['data']['schedule'] = interpretation['value']
+                session['state'] = 'offer_nomina'
+                nomina_offer = "¿Te interesaría conocer los beneficios de tener la nómina de tus empleados con Inbursa? Incluye rendimientos del 80% de CETES, seguros de vida y servicio médico para tu equipo."
+                return f"Agendado: {interpretation['value']}. {nomina_offer}"
+            else:
+                return "Por favor, proporciona un día y hora específicos para contactarte."
+        
+        elif session['state'] == 'offer_nomina':
+            interpretation = self.gpt_interpret(user_message, 'confirmacion')
+            session['data']['nomina_interest'] = (interpretation == 'positive')
+            self.notify_advisor(user_id, 'business')
+            
+            if interpretation == 'positive':
+                benefits = self.show_nomina_benefits()
+                return f"¡Excelente! {benefits}\n\nNuestro asesor Christian te llamará en el horario indicado para explicarte todos los beneficios."
+            else:
+                return "Entendido. Nuestro asesor Christian te contactará en el horario agendado para hablar sobre tu crédito empresarial."
+        
+        return "Ocurrió un error en el flujo. Por favor, intenta nuevamente."
 
-    try:
-        # Contexto del sistema para Vicky
-        system_prompt = """
-        Eres Vicky, asistente virtual del Grupo Financiero Inbursa. 
-        Eres profesional, amable y especializada en productos financieros.
-        
-        Productos que manejas:
-        - Préstamos para pensionados IMSS (Ley 73)
-        - Créditos empresariales
-        - Seguros de auto, vida y salud
-        - Tarjetas médicas VRIM
-        - Financiamiento personal y empresarial
-        
-        Reglas importantes:
-        - Siempre identifica si el usuario es prospecto para préstamos IMSS o créditos empresariales
-        - Si no entiendes algo, pide clarificación amablemente
-        - Mantén las conversaciones enfocadas en productos financieros
-        - Deriva a flujos estructurados cuando detectes intención clara
-        - Sé concisa pero útil
-        - Usa emojis apropiados para hacer la conversación amigable
-        """
-        
-        # Historial de conversación para contexto
-        conversation_history = []
-        if context:
-            conversation_history.append({"role": "system", "content": context})
-        
-        # Llamada a la API de OpenAI
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                *conversation_history,
-                {"role": "user", "content": user_message}
-            ],
-            max_tokens=150,
-            temperature=0.7
-        )
-        
-        gpt_response = response.choices[0].message.content.strip()
-        logging.info(f"🤖 GPT respuesta: {gpt_response}")
-        return gpt_response
-        
-    except Exception as e:
-        logging.error(f"❌ Error en GPT: {e}")
-        return None
+    def show_nomina_benefits(self):
+        """Muestra los beneficios de cambiar la nómina a Inbursa"""
+        benefits_list = [
+            "🌟 *BENEFICIOS EXCLUSIVOS AL CAMBIAR TU NÓMINA A INBURSA:* 🌟",
+            self.nomina_benefits['rendimiento'],
+            self.nomina_benefits['seguros'],
+            self.nomina_benefits['servicio_medico'],
+            self.nomina_benefits['anticipo'],
+            self.nomina_benefits['descuentos'],
+            self.nomina_benefits['recompensas'],
+            self.nomina_benefits['cajeros'],
+            "",
+            "💡 *Todos estos beneficios son adicionales a tu préstamo/crédito*"
+        ]
+        return "\n".join(benefits_list)
 
-# ---------------------------------------------------------------
-# NUEVO: MANEJADOR DE CONVERSACIÓN NATURAL CON GPT
-# ---------------------------------------------------------------
-def handle_natural_conversation(phone_number, user_message):
-    """Maneja conversaciones naturales usando GPT cuando no hay flujo específico."""
-    
-    # Contexto adicional basado en el estado del usuario
-    user_context = ""
-    if phone_number in user_data:
-        if "pension_mensual" in user_data[phone_number]:
-            user_context = "El usuario ya proporcionó datos de pensión para préstamo IMSS."
-        elif "giro" in user_data[phone_number]:
-            user_context = "El usuario ya proporcionó datos para crédito empresarial."
-    
-    # Obtener respuesta de GPT
-    gpt_response = get_gpt_response(user_message, phone_number, user_context)
-    
-    if gpt_response:
-        send_message(phone_number, gpt_response)
+    def show_alternative_products(self, user_id):
+        """Muestra otros productos cuando el usuario no es elegible"""
+        session = self.user_sessions[user_id]
+        session['state'] = 'alternative_products'
         
-        # Después de respuesta GPT, verificar si debemos iniciar flujo estructurado
-        msg_lower = user_message.lower()
+        alternative_products = [
+            "💼 *OTROS PRODUCTOS QUE PODRÍAN INTERESARTE:*",
+            "1. Créditos personales",
+            "2. Tarjetas de crédito",
+            "3. Seguros de vida y gastos médicos",
+            "4. Inversiones a plazo fijo",
+            "5. Cuentas de ahorro",
+            "",
+            "¿Te interesa alguno de estos productos?"
+        ]
+        return "\n".join(alternative_products)
+
+    def show_general_menu(self, user_id):
+        """Menú general cuando no se detecta campaña específica"""
+        session = self.user_sessions[user_id]
+        session['state'] = 'general_menu'
         
-        # Detectar intención de préstamo IMSS
-        if any(word in msg_lower for word in ["pensión", "jubilado", "imss", "ley 73"]) and "préstamo" in msg_lower:
-            send_message(phone_number, "🔍 Veo que te interesa un préstamo para pensionados. Déjame guiarte por el proceso...")
-            return handle_imss_flow(phone_number, "préstamo imss")
+        menu = [
+            "🏦 *BIENVENIDO A INBURSA* 🏦",
+            "Selecciona una opción:",
+            "1. Préstamos para pensionados IMSS",
+            "2. Créditos empresariales", 
+            "3. Tarjetas de crédito",
+            "4. Seguros",
+            "5. Inversiones",
+            "6. Atención personalizada"
+        ]
+        return "\n".join(menu)
+
+    def notify_advisor(self, user_id, campaign_type):
+        """Envía notificación al asesor Christian"""
+        session = self.user_sessions[user_id]
+        data = session['data']
         
-        # Detectar intención de crédito empresarial
-        elif any(word in msg_lower for word in ["empresa", "negocio", "crédito", "financiamiento"]):
-            send_message(phone_number, "🏢 Entiendo que necesitas financiamiento empresarial. Te ayudo con el proceso...")
-            return handle_empresa_flow(phone_number, "crédito empresarial")
+        if campaign_type == 'imss':
+            message = f"🔥 *NUEVO PROSPECTO PRÉSTAMO IMSS* 🔥\n"
+            message += f"📞 Número: {user_id}\n"
+            message += f"💰 Pensión: ${data.get('pension', 0):,.2f}\n"
+            message += f"💵 Monto solicitado: ${data.get('loan_amount', 0):,.2f}\n"
+            message += f"🏦 Acepta cambiar nómina: {'SÍ' if data.get('nomina_change') else 'NO'}\n"
+            message += f"⏰ Hora: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            
+        elif campaign_type == 'imss_basic':
+            message = f"📋 *PROSPECTO PRÉSTAMO IMSS (SIN NÓMINA)* 📋\n"
+            message += f"📞 Número: {user_id}\n"
+            message += f"💰 Pensión: ${data.get('pension', 0):,.2f}\n"
+            message += f"💵 Monto solicitado: ${data.get('loan_amount', 0):,.2f}\n"
+            message += f"⏰ Hora: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            
+        elif campaign_type == 'business':
+            message = f"🏢 *NUEVO PROSPECTO CRÉDITO EMPRESARIAL* 🏢\n"
+            message += f"📞 Número: {user_id}\n"
+            message += f"📊 Tipo de crédito: {data.get('credit_type', 'No especificado')}\n"
+            message += f"🏭 Giro empresarial: {data.get('business_type', 'No especificado')}\n"
+            message += f"💵 Monto: ${data.get('loan_amount', 0):,.2f}\n"
+            message += f"📅 Horario contacto: {data.get('schedule', 'No especificado')}\n"
+            message += f"🏦 Interés en nómina: {'SÍ' if data.get('nomina_interest') else 'NO'}\n"
+            message += f"⏰ Hora: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        
+        # En un entorno real, aquí se enviaría el mensaje via WhatsApp API
+        print(f"NOTIFICACIÓN AL ASESOR ({self.advisor_number}): {message}")
+        # self.send_whatsapp_message(self.advisor_number, message)
         
         return True
-    
-    return False
 
-# ---------------------------------------------------------------
-# FUNCIÓN ORIGINAL: enviar mensaje por WhatsApp
-# ---------------------------------------------------------------
-def send_message(to, text):
-    """Envía mensajes de texto al usuario vía Meta Cloud API."""
-    try:
-        url = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
-        headers = {
-            "Authorization": f"Bearer {META_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": str(to),
-            "type": "text",
-            "text": {"body": text}
-        }
-        response = requests.post(url, headers=headers, json=payload, timeout=10)
-        if response.status_code not in (200, 201):
-            logging.warning(f"⚠️ Error al enviar mensaje: {response.text}")
-        else:
-            logging.info(f"📩 Mensaje enviado correctamente a {to}")
-    except Exception as e:
-        logging.exception(f"❌ Error en send_message: {e}")
+    def send_whatsapp_message(self, number, message):
+        """Envía mensaje via WhatsApp Business API"""
+        # Implementación real con WhatsApp Business API
+        # payload = {
+        #     "messaging_product": "whatsapp",
+        #     "to": number,
+        #     "text": {"body": message}
+        # }
+        # headers = {
+        #     "Authorization": "Bearer {TOKEN}",
+        #     "Content-Type": "application/json"
+        # }
+        # response = requests.post(
+        #     "https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages",
+        #     json=payload,
+        #     headers=headers
+        # )
+        # return response.status_code == 200
+        pass
 
-# ---------------------------------------------------------------
-# [MANTENER TODAS LAS FUNCIONES ORIGINALES SIN CAMBIOS]
-# handle_imss_flow(), handle_empresa_flow(), extract_number(), 
-# send_main_menu(), verify_webhook(), etc.
-# SE MANTIENEN EXACTAMENTE IGUAL
-# ---------------------------------------------------------------
+# Ejemplo de uso
+bot = VickyBot()
 
-# ---------------------------------------------------------------
-# Endpoint principal ACTUALIZADO con GPT
-# ---------------------------------------------------------------
-@app.route("/webhook", methods=["POST"])
-def receive_message():
-    try:
-        data = request.get_json()
-        logging.info(f"📩 Datos recibidos: {json.dumps(data, ensure_ascii=False)}")
+# Simulación de conversación - Campaña IMSS
+user_id = "5211234567890"
+response1 = bot.start_conversation(user_id, campaign='imss')
+print("Vicky:", response1)
 
-        entry = data.get("entry", [])[0]
-        change = entry.get("changes", [])[0]
-        value = change.get("value", {})
-        messages = value.get("messages", [])
+# Usuario responde que sí es pensionado
+response2 = bot.handle_imss_flow(user_id, "sí")
+print("Vicky:", response2)
 
-        if not messages:
-            return jsonify({"status": "ignored"}), 200
+# Usuario proporciona pensión
+response3 = bot.handle_imss_flow(user_id, "15000")
+print("Vicky:", response3)
 
-        message = messages[0]
-        phone_number = message.get("from")
-        message_type = message.get("type")
+# Usuario solicita monto
+response4 = bot.handle_imss_flow(user_id, "200000")
+print("Vicky:", response4)
 
-        if message_type == "text":
-            user_message = message["text"]["body"].strip()
-
-            # 1. Procesar flujo IMSS (prioridad alta)
-            if handle_imss_flow(phone_number, user_message):
-                return jsonify({"status": "ok"}), 200
-
-            # 2. Procesar flujo empresarial (prioridad alta)
-            if handle_empresa_flow(phone_number, user_message):
-                return jsonify({"status": "ok"}), 200
-
-            # 3. NUEVO: Si está en un flujo activo pero el mensaje no coincide, usar GPT
-            current_state = user_state.get(phone_number)
-            if current_state and current_state not in ["esperando_respuesta_imss", "esperando_tipo_credito"]:
-                # El usuario está en medio de un flujo pero dio una respuesta no esperada
-                gpt_response = get_gpt_response(
-                    f"El usuario está en el estado '{current_state}' pero respondió: {user_message}. ¿Cómo debo proceder?",
-                    phone_number
-                )
-                if gpt_response:
-                    send_message(phone_number, gpt_response)
-                return jsonify({"status": "ok"}), 200
-
-            # 4. NUEVO: Conversación natural con GPT
-            if GPT_ENABLED and handle_natural_conversation(phone_number, user_message):
-                return jsonify({"status": "ok"}), 200
-
-            # 5. Mensaje por defecto (sin GPT o fallback)
-            send_message(phone_number,
-                "👋 Hola, soy *Vicky*, asistente virtual de Inbursa.\n"
-                "Te puedo ayudar con:\n\n"
-                "• 🧓 *Préstamos IMSS* (si eres pensionado)\n" 
-                "• 🏢 *Créditos empresariales*\n"
-                "• 🚗 Seguros de Auto\n"
-                "• 🏥 Seguros de Vida y Salud\n\n"
-                "Escribe *préstamo IMSS* o *crédito empresarial* según te interese 👇"
-            )
-            return jsonify({"status": "ok"}), 200
-
-        else:
-            send_message(phone_number, "Por ahora solo puedo procesar mensajes de texto 📩")
-            return jsonify({"status": "ok"}), 200
-
-    except Exception as e:
-        logging.exception(f"❌ Error en receive_message: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# ---------------------------------------------------------------
-# Endpoint de diagnóstico MEJORADO con info GPT
-# ---------------------------------------------------------------
-@app.route("/debug", methods=["GET"])
-def debug():
-    return jsonify({
-        "status": "online",
-        "service": "Vicky Bot con GPT",
-        "timestamp": datetime.now().isoformat(),
-        "gpt_enabled": GPT_ENABLED,
-        "openai_configured": bool(OPENAI_API_KEY),
-        "active_users": len(user_state),
-        "variables": {
-            "META_TOKEN": bool(META_TOKEN),
-            "WABA_PHONE_ID": bool(WABA_PHONE_ID),
-            "VERIFY_TOKEN": bool(VERIFY_TOKEN),
-            "OPENAI_API_KEY": bool(OPENAI_API_KEY)
-        }
-    }), 200
-
-# ---------------------------------------------------------------
-# [MANTENER health() y __main__ SIN CAMBIOS]
-# ---------------------------------------------------------------
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+# Usuario acepta cambiar nómina
+response5 = bot.handle_imss_flow(user_id, "claro que sí")
+print("Vicky:", response5)
