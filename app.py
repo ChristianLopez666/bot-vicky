@@ -1,4 +1,4 @@
-# app.py — Vicky Campañas (menú fijo + opción 7 robusta)
+# app.py — Vicky (menú corregido + opción 7 robusta)
 # -*- coding: utf-8 -*-
 
 import os
@@ -8,7 +8,6 @@ import requests
 import openai
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-from datetime import datetime
 
 # =========================
 # Carga de variables y setup
@@ -30,11 +29,11 @@ logging.basicConfig(
 
 app = Flask(__name__)
 
-# ==============
-# Utilidades WABA
-# ==============
-def send_message(to, text):
-    """Envia un mensaje de texto por la API de WhatsApp Cloud."""
+# =================
+# Utilidades comunes
+# =================
+def wa_send_text(to: str, body: str) -> bool:
+    """Envía mensaje de texto por WhatsApp Cloud API."""
     try:
         url = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
         headers = {
@@ -45,28 +44,27 @@ def send_message(to, text):
             "messaging_product": "whatsapp",
             "to": str(to),
             "type": "text",
-            "text": {"body": text},
+            "text": {"body": body},
         }
         resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
-        logging.info(f"WA send_message status={resp.status_code} body={resp.text}")
+        logging.info(f"[WA] status={resp.status_code} resp={resp.text[:400]}")
         resp.raise_for_status()
         return True
     except Exception as e:
-        logging.exception(f"Error enviando mensaje a {to}: {e}")
+        logging.exception(f"❌ Error en wa_send_text(to={to}): {e}")
         return False
 
 def clean_option(text: str) -> str:
-    """Normaliza la opción: elimina espacios, emojis de tecla y deja solo dígitos relevantes."""
+    """Normaliza la opción del usuario: extrae primer dígito relevante (maneja 7, 7️⃣, espacios, etc.)."""
     if not text:
         return ""
     t = text.strip()
-    # eliminar variantes de 7️⃣ (u otros) y dejar solo dígitos + separadores básicos
-    # Si hay varios dígitos, tomamos el primero (casos como "7) ...")
+    # Quitar emoji de keycap (ej. 7️⃣) y quedarse con el primer dígito
     digits = "".join(ch for ch in t if ch.isdigit())
-    return digits[:1] if digits else t
+    return digits[:1] if digits else t.lower()
 
-def send_main_menu(phone):
-    """Envía el menú principal (sin comillas sueltas)."""
+def send_main_menu(phone: str) -> None:
+    """Menú principal sin comillas sueltas (string multilínea válido)."""
     menu = (
         "📋 *Otros servicios disponibles:*\n"
         "1️⃣ Seguros de Auto\n"
@@ -79,34 +77,33 @@ def send_main_menu(phone):
         "\n"
         "Escribe el número del servicio que te interese 👇"
     )
-    send_message(phone, menu)
+    wa_send_text(phone, menu)
 
-def gpt_reply(prompt: str) -> str:
-    """Respuesta breve con OpenAI si no se reconoce la opción. Compatible con openai==0.28.1"""
+def gpt_fallback(prompt: str) -> str:
+    """Respuesta breve de respaldo cuando no coincide ninguna opción."""
     try:
         if not OPENAI_API_KEY:
-            return "Puedo ayudarte con cualquiera de nuestros servicios. Elige una opción del menú enviando solo el número."
-
-        completion = openai.ChatCompletion.create(
+            return "Elige una opción del menú enviando *solo el número*. Escribe *MENÚ* para verlo de nuevo."
+        out = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": "Responde breve, claro y en español neutro."},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=150,
+            max_tokens=120,
             temperature=0.4,
         )
-        return completion["choices"][0]["message"]["content"].strip()
+        return out["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        logging.exception(f"Error en OpenAI: {e}")
-        return "Ahora mismo no puedo consultar al asistente. Elige una opción del menú con el número."
+        logging.exception(f"❌ Error en gpt_fallback: {e}")
+        return "Ahora mismo no puedo consultar al asistente. Escribe *MENÚ* para ver opciones."
 
-# ==================
-# Rutas de la aplicación
-# ==================
+# ================
+# Endpoints básicos
+# ================
 @app.route("/", methods=["GET"])
-def root_ok():
-    return jsonify({"status": "ok", "service": "vicky-campaigns"}), 200
+def root():
+    return jsonify({"status": "ok", "service": "vicky"}), 200
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -120,95 +117,85 @@ def verify_webhook():
     challenge = request.args.get("hub.challenge")
 
     if mode == "subscribe" and token == VERIFY_TOKEN:
-        logging.info("Webhook verificado correctamente.")
+        logging.info("✅ Webhook verificado correctamente.")
         return challenge, 200
-    else:
-        logging.warning("Intento de verificación con token inválido.")
-        return "Verification token mismatch", 403
+    logging.warning("🔒 Intento de verificación con token inválido.")
+    return "Verification token mismatch", 403
 
 # Recepción de mensajes (POST)
 @app.route("/webhook", methods=["POST"])
 def receive_message():
     try:
         data = request.get_json(force=True, silent=True) or {}
-        logging.info(f"📩 Entrada webhook: {json.dumps(data)[:1500]}")
+        logging.info(f"📩 Webhook body: {json.dumps(data)[:1500]}")
 
-        entry = data.get("entry", [{}])[0]
-        change = entry.get("changes", [{}])[0]
-        value = change.get("value", {})
+        entry = (data.get("entry") or [{}])[0]
+        changes = (entry.get("changes") or [{}])[0]
+        value = changes.get("value") or {}
 
-        # Validar mensajes (no "statuses")
+        # Ignorar status updates
         if "messages" not in value:
             return jsonify({"ignored": True}), 200
 
         message = value["messages"][0]
-        contacts = value.get("contacts", [{}])
+        contacts = value.get("contacts") or [{}]
         contact = contacts[0] if contacts else {}
         profile_name = contact.get("profile", {}).get("name", "Cliente")
+
+        # Determinar número de usuario
         phone_number = message.get("from") or contact.get("wa_id")
 
-        msg_type = message.get("type")
-        if msg_type != "text":
-            # si no es texto, solo mostrar menú
+        # Solo procesamos texto, para lo demás reenviamos menú
+        if message.get("type") != "text":
             send_main_menu(phone_number)
             return jsonify({"status": "ok"}), 200
 
         user_text = (message.get("text", {}) or {}).get("body", "").strip()
 
-        # Si el usuario escribe "menu" o similar, reenvía el menú
-        if user_text.lower() in {"menu", "menú", "inicio", "hola"}:
+        # Palabras clave para menú
+        if user_text.lower() in {"menu", "menú", "hola", "inicio", "empezar"}:
             send_main_menu(phone_number)
             return jsonify({"status": "ok"}), 200
 
-        # Normalizar opción y decidir flujo
+        # Normalizar opción
         option = clean_option(user_text)
 
-        # --- Opción 7: Contactar con Christian ---
+        # -----------------------------
+        # Opción 7: Contactar Christian
+        # -----------------------------
         if option == "7" or "contactar con christian" in user_text.lower():
-            try:
-                # Confirmación al cliente
-                msg_user = (
-                    "✅ Gracias por tu interés.\n"
-                    "📩 Un asesor se comunicará contigo en breve.\n"
-                    "Mientras tanto, si necesitas algo más, dime *MENÚ*."
-                )
-                send_message(phone_number, msg_user)
-
-                # Notificación interna al asesor
-                notify_text = (
-                    "📢 *Nuevo intento de contacto desde Vicky*\n\n"
-                    f"👤 Nombre: {profile_name}\n"
-                    f"📱 Número: {phone_number}\n"
-                    "🧭 Opción: 7️⃣ Contactar con Christian"
-                )
-                send_message(ADVISOR_NUMBER, notify_text)
-                logging.info("📨 Notificación enviada al asesor correctamente.")
-            except Exception as e:
-                logging.exception(f"❌ Error en notificación al asesor: {e}")
-                # Aviso al usuario de que algo falló, pero sin detallar
-                send_message(phone_number, "Hubo un detalle al notificar al asesor. Intentaré nuevamente.")
+            # Confirmación al cliente
+            wa_send_text(phone_number, "✅ Gracias. Un asesor se comunicará contigo en breve.")
+            # Notificación al asesor
+            notify = (
+                "📢 *Nuevo intento de contacto desde Vicky*\n\n"
+                f"👤 Nombre: {profile_name}\n"
+                f"📱 Número: {phone_number}\n"
+                "🧭 Opción: 7️⃣ Contactar con Christian"
+            )
+            wa_send_text(ADVISOR_NUMBER, notify)
+            logging.info("📨 Notificación enviada al asesor (opción 7).")
             return jsonify({"status": "ok"}), 200
 
-        # Resto de opciones simples como placeholder (1-6)
+        # Opciones 1-6 (placeholders mínimos)
         if option in {"1", "2", "3", "4", "5", "6"}:
             respuestas = {
-                "1": "🚗 *Seguros de Auto*: Cotizamos tu póliza con beneficios preferentes. ¿Deseas continuar?",
-                "2": "🧑‍⚕️ *Vida y Salud*: Te presento opciones de protección familiar. ¿Deseas continuar?",
-                "3": "🩺 *Tarjetas Médicas VRIM*: Atención privada con costo accesible. ¿Deseas continuar?",
-                "4": "💳 *Préstamos IMSS Ley 73*: Mínimo $40,000. Requisitos según manual oficial. ¿Deseas continuar?",
-                "5": "🏢 *Financiamiento Empresarial*: Indícame giro y monto requerido. ¿Deseas continuar?",
-                "6": "💼 *Nómina Empresarial*: Mejora tu banca de nómina con beneficios. ¿Deseas continuar?",
+                "1": "🚗 *Seguros de Auto*: cotizamos tu póliza con beneficios preferentes. ¿Deseas continuar?",
+                "2": "🧑‍⚕️ *Vida y Salud*: opciones de protección familiar. ¿Deseas continuar?",
+                "3": "🩺 *VRIM Médica*: atención privada accesible. ¿Deseas continuar?",
+                "4": "💳 *Préstamos IMSS Ley 73*: mínimo $40,000. ¿Deseas continuar?",
+                "5": "🏢 *Financiamiento Empresarial*: indica giro y monto. ¿Deseas continuar?",
+                "6": "💼 *Nómina Empresarial*: beneficios y migración simple. ¿Deseas continuar?",
             }
-            send_message(phone_number, respuestas.get(option, "¿Deseas continuar?"))
+            wa_send_text(phone_number, respuestas[option])
             return jsonify({"status": "ok"}), 200
 
-        # Si no coincide con una opción 1-7, usar GPT como fallback breve
-        reply = gpt_reply(user_text)
-        send_message(phone_number, reply)
+        # Fallback con GPT o mensaje guía
+        wa_send_text(phone_number, gpt_fallback(user_text))
         return jsonify({"status": "ok"}), 200
 
     except Exception as e:
-        logging.exception(f"❌ Error en webhook: {e}")
+        logging.exception(f"❌ Error en /webhook POST: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
