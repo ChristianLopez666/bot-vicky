@@ -48,23 +48,16 @@ def extract_number(text):
 
 def send_main_menu(phone):
     menu = (
-        "📋 *Otros servicios disponibles:*"
-"
-        "1️⃣ Seguros de Auto
-"
-        "2️⃣ Seguros de Vida y Salud
-"
-        "3️⃣ Tarjetas Médicas VRIM
-"
-        "4️⃣ Financiamiento Empresarial
-"
-        "5️⃣ Préstamos Personales
-"
-        "7️⃣ Contactar con Christian
-
-"
-        "Escribe el número del servicio que te interese 👇"
+        "📋 *Otros servicios disponibles:*\n"
+        "1️⃣ Seguros de Auto\n"
+        "2️⃣ Seguros de Vida y Salud\n"
+        "3️⃣ Tarjetas Médicas VRIM\n"
+        "4️⃣ Préstamos para Pensionados IMSS\n"
+        "5️⃣ Financiamiento Empresarial\n"
+        "6️⃣ Nómina Empresarial\n"
+        "7️⃣ Contactar con Christian\n"
     )
+
     send_message(phone, menu)
 
 def consultar_gpt_respuesta(texto_usuario):
