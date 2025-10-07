@@ -48,7 +48,24 @@ class VickyBot:
         elif session['campaign'] == 'business':
             return self.handle_business_flow(user_id, "start")
         else:
-            return "🏦 INBURSA\n1. Préstamos IMSS\n2. Créditos empresariales"
+            session['state'] = 'menu'
+            return "🏦 INBURSA\n1. Préstamos IMSS\n2. Créditos empresariales\nEscribe el número de tu opción:"
+
+    def handle_general_flow(self, user_id, user_message):
+        session = self.user_sessions.get(user_id)
+        if not session:
+            return self.start_conversation(user_id, user_message)
+
+        if user_message == '1':
+            session['campaign'] = 'imss'
+            session['state'] = 'welcome'
+            return self.handle_imss_flow(user_id, "start")
+        elif user_message == '2':
+            session['campaign'] = 'business'
+            session['state'] = 'welcome'
+            return self.handle_business_flow(user_id, "start")
+        else:
+            return "Por favor selecciona:\n1. Préstamos IMSS\n2. Créditos empresariales"
 
     def handle_imss_flow(self, user_id, user_message):
         session = self.user_sessions.get(user_id)
@@ -57,42 +74,43 @@ class VickyBot:
 
         if session['state'] == 'welcome':
             session['state'] = 'confirm_pensionado'
-            return "¿Eres pensionado IMSS Ley 73?"
+            return "¿Eres pensionado IMSS Ley 73? (sí/no)"
 
         elif session['state'] == 'confirm_pensionado':
             if self.gpt_interpret(user_message) == 'positive':
                 session['state'] = 'ask_pension'
                 return "¿Cuál es tu pensión mensual?"
             else:
-                return "Ofrecemos otros productos. ¿Te interesa?"
+                session['state'] = 'not_eligible'
+                return "Ofrecemos otros productos. Escribe 'menu' para ver opciones."
 
         elif session['state'] == 'ask_pension':
             amount = self.extract_amount(user_message)
             if amount:
                 session['data']['pension'] = amount
                 session['state'] = 'ask_loan_amount'
-                return "¿Qué monto necesitas? ($40k-$650k)"
-            return "Ingresa monto válido."
+                return "¿Qué monto de préstamo necesitas? ($40,000 - $650,000)"
+            return "Por favor ingresa un monto válido para tu pensión."
 
         elif session['state'] == 'ask_loan_amount':
             amount = self.extract_amount(user_message)
             if amount and 40000 <= amount <= 650000:
                 session['data']['loan_amount'] = amount
                 session['state'] = 'ask_nomina_change'
-                return "¿Aceptas cambiar nómina a Inbursa?"
-            return "Monto entre $40k-$650k"
+                return "¿Aceptas cambiar tu nómina a Inbursa? (sí/no)"
+            return "El monto debe estar entre $40,000 y $650,000. Ingresa un monto válido."
 
         elif session['state'] == 'ask_nomina_change':
             if self.gpt_interpret(user_message) == 'positive':
                 session['data']['nomina_change'] = True
                 self.notify_advisor(user_id, 'imss')
-                return "✅ Aprobado. Christian te contactará."
+                return "✅ Perfecto! Christian te contactará pronto con los detalles."
             else:
                 session['data']['nomina_change'] = False
                 self.notify_advisor(user_id, 'imss_basic')
-                return "📞 Registrado. Te contactaremos."
+                return "📞 Hemos registrado tu solicitud. Te contactaremos pronto."
 
-        return "Error en el flujo."
+        return "Error en el flujo. Escribe 'menu' para reiniciar."
 
     def handle_business_flow(self, user_id, user_message):
         session = self.user_sessions.get(user_id)
@@ -111,26 +129,26 @@ class VickyBot:
         elif session['state'] == 'ask_business_type':
             session['data']['business_type'] = user_message
             session['state'] = 'ask_loan_amount'
-            return "¿Qué monto necesitas?"
+            return "¿Qué monto de crédito necesitas?"
 
         elif session['state'] == 'ask_loan_amount':
             amount = self.extract_amount(user_message)
             if amount:
                 session['data']['loan_amount'] = amount
                 session['state'] = 'ask_schedule'
-                return "¿Cuándo podemos llamarte?"
-            return "Ingresa monto válido."
+                return "¿En qué día y hora prefieres que te contactemos?"
+            return "Por favor ingresa un monto válido."
 
         elif session['state'] == 'ask_schedule':
             session['data']['schedule'] = user_message
             self.notify_advisor(user_id, 'business')
-            return "✅ Agendado. Christian te contactará."
+            return "✅ Agendado! Christian te contactará en el horario indicado."
 
-        return "Error en el flujo."
+        return "Error en el flujo. Escribe 'menu' para reiniciar."
 
     def gpt_interpret(self, message):
         message_lower = message.lower()
-        positive_keywords = ['sí', 'si', 'sip', 'claro', 'por supuesto', 'ok', 'vale']
+        positive_keywords = ['sí', 'si', 'sip', 'claro', 'por supuesto', 'ok', 'vale', 'afirmativo']
         negative_keywords = ['no', 'nop', 'negativo', 'para nada']
         
         for keyword in positive_keywords:
@@ -142,7 +160,7 @@ class VickyBot:
         return 'neutral'
 
     def extract_amount(self, message):
-        amount_match = re.search(r'(\d{1,3}(?:,\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)', message)
+        amount_match = re.search(r'(\d{1,3}(?:,\d{3})*(?:\.\d{2,})?|\d+(?:\.\d{2,})?)', message)
         if amount_match:
             return float(amount_match.group().replace(',', ''))
         return None
@@ -152,9 +170,11 @@ class VickyBot:
         data = session.get('data', {})
         
         if campaign_type == 'imss':
-            message = f"🔥 IMSS\n📞 {user_id}\n💰 ${data.get('pension', 0)}\n💵 ${data.get('loan_amount', 0)}\n🏦 {'SÍ' if data.get('nomina_change') else 'NO'}"
+            message = f"🔥 NUEVO PROSPECTO IMSS\n📞 {user_id}\n💰 Pensión: ${data.get('pension', 0):,.2f}\n💵 Préstamo: ${data.get('loan_amount', 0):,.2f}\n🏦 Nómina: {'SÍ' if data.get('nomina_change') else 'NO'}"
+        elif campaign_type == 'imss_basic':
+            message = f"📋 PROSPECTO IMSS BÁSICO\n📞 {user_id}\n💰 Pensión: ${data.get('pension', 0):,.2f}\n💵 Préstamo: ${data.get('loan_amount', 0):,.2f}"
         elif campaign_type == 'business':
-            message = f"🏢 EMPRESARIAL\n📞 {user_id}\n📊 {data.get('credit_type', '')}\n💵 ${data.get('loan_amount', 0)}\n📅 {data.get('schedule', '')}"
+            message = f"🏢 NUEVO PROSPECTO EMPRESARIAL\n📞 {user_id}\n📊 Tipo: {data.get('credit_type', '')}\n🏭 Giro: {data.get('business_type', '')}\n💵 Monto: ${data.get('loan_amount', 0):,.2f}\n📅 Horario: {data.get('schedule', '')}"
         
         self.send_whatsapp_message(self.advisor_number, message)
 
@@ -203,9 +223,17 @@ def handle_webhook():
                 if "messages" in value:
                     for msg in value["messages"]:
                         phone = msg["from"]
-                        text = msg.get("text", {}).get("body", "")
+                        text = msg.get("text", {}).get("body", "").strip()
                         
-                        if phone not in vicky.user_sessions:
+                        if text.lower() == 'menu':
+                            vicky.user_sessions[phone] = {
+                                'campaign': 'general',
+                                'state': 'menu',
+                                'data': {},
+                                'timestamp': datetime.now()
+                            }
+                            response = "🏦 INBURSA\n1. Préstamos IMSS\n2. Créditos empresariales\nEscribe el número de tu opción:"
+                        elif phone not in vicky.user_sessions:
                             response = vicky.start_conversation(phone, text)
                         else:
                             session = vicky.user_sessions[phone]
@@ -214,7 +242,7 @@ def handle_webhook():
                             elif session['campaign'] == 'business':
                                 response = vicky.handle_business_flow(phone, text)
                             else:
-                                response = "🏦 INBURSA\n1. Préstamos IMSS\n2. Créditos empresariales"
+                                response = vicky.handle_general_flow(phone, text)
                         
                         vicky.send_whatsapp_message(phone, response)
         
