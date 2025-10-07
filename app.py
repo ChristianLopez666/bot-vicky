@@ -69,7 +69,7 @@ class VickyBot:
             session['state'] = 'menu'
             return "🏦 INBURSA\n1. Préstamos IMSS\n2. Créditos empresariales\nEscribe el número de tu opción:"
         else:
-            return "Por favor selecciona:\n1. Préstamos IMSS\n2. Crédititos empresariales"
+            return "Por favor selecciona:\n1. Préstamos IMSS\n2. Créditos empresariales"
 
     def handle_imss_flow(self, user_id, user_message):
         session = self.user_sessions.get(user_id)
@@ -87,7 +87,6 @@ class VickyBot:
                 session['state'] = 'ask_loan_amount'
                 return "¿Qué monto de préstamo deseas? ($40,000 - $650,000)"
             elif amount and amount > 0:
-                # aceptar cualquier número menor pero continuar el flujo
                 session['data']['pension'] = amount
                 session['state'] = 'ask_loan_amount'
                 return "¿Qué monto de préstamo deseas? ($40,000 - $650,000)"
@@ -236,12 +235,29 @@ def handle_webhook():
                 if "messages" in value:
                     for msg in value["messages"]:
                         phone = msg["from"]
-                        text = msg.get("text", {}).get("body", "").strip()
+                        text = msg.get("text", {}).get("body", "").strip().lower()
 
-                        # --- NUEVO BLOQUE DE PERSISTENCIA DE ESTADO ---
+                        # --- REFUERZO DE PERSISTENCIA PRE-FLUJO ---
+                        if phone not in vicky.user_sessions:
+                            # Detectar si el mensaje corresponde a préstamo IMSS
+                            if any(word in text for word in ["imss", "pensión", "pensionado", "préstamo", "5"]):
+                                vicky.user_sessions[phone] = {
+                                    'campaign': 'imss',
+                                    'state': 'welcome',
+                                    'data': {},
+                                    'timestamp': datetime.now()
+                                }
+                            elif any(word in text for word in ["empresa", "empresarial", "crédito"]):
+                                vicky.user_sessions[phone] = {
+                                    'campaign': 'business',
+                                    'state': 'welcome',
+                                    'data': {},
+                                    'timestamp': datetime.now()
+                                }
+
+                        # Si el usuario ya está en flujo IMSS
                         if phone in vicky.user_sessions:
                             session = vicky.user_sessions[phone]
-                            # Si ya está en campaña IMSS, mantener el flujo activo
                             if session.get('campaign') == 'imss':
                                 response = vicky.handle_imss_flow(phone, text)
                                 vicky.send_whatsapp_message(phone, response)
