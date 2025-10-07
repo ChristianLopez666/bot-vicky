@@ -4,7 +4,6 @@ import re
 from datetime import datetime
 import os
 import logging
-from openai import OpenAI
 
 app = Flask(__name__)
 
@@ -17,19 +16,6 @@ class VickyBot:
         self.advisor_number = "6682478005"
         self.whatsapp_token = os.getenv('WHATSAPP_TOKEN')
         self.whatsapp_phone_id = os.getenv('WHATSAPP_PHONE_ID')
-        self.openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-
-    def gpt_short_response(self, user_message, context):
-        try:
-            prompt = f"Contexto: {context}. Mensaje: {user_message}. Responde máximo 2 líneas."
-            response = self.openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=100
-            )
-            return response.choices[0].message.content.strip()
-        except:
-            return "Gracias. Continuemos."
 
     def detect_campaign(self, initial_message=None):
         if not initial_message:
@@ -62,7 +48,7 @@ class VickyBot:
         elif session['campaign'] == 'business':
             return self.handle_business_flow(user_id, "start")
         else:
-            return self.gpt_short_response(initial_message, "consulta general")
+            return "🏦 INBURSA\n1. Préstamos IMSS\n2. Créditos empresariales"
 
     def handle_imss_flow(self, user_id, user_message):
         session = self.user_sessions.get(user_id)
@@ -106,7 +92,7 @@ class VickyBot:
                 self.notify_advisor(user_id, 'imss_basic')
                 return "📞 Registrado. Te contactaremos."
 
-        return self.gpt_short_response(user_message, session['state'])
+        return "Error en el flujo."
 
     def handle_business_flow(self, user_id, user_message):
         session = self.user_sessions.get(user_id)
@@ -140,7 +126,7 @@ class VickyBot:
             self.notify_advisor(user_id, 'business')
             return "✅ Agendado. Christian te contactará."
 
-        return self.gpt_short_response(user_message, session['state'])
+        return "Error en el flujo."
 
     def gpt_interpret(self, message):
         message_lower = message.lower()
@@ -228,7 +214,7 @@ def handle_webhook():
                             elif session['campaign'] == 'business':
                                 response = vicky.handle_business_flow(phone, text)
                             else:
-                                response = vicky.gpt_short_response(text, "general")
+                                response = "🏦 INBURSA\n1. Préstamos IMSS\n2. Créditos empresariales"
                         
                         vicky.send_whatsapp_message(phone, response)
         
