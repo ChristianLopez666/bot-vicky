@@ -21,7 +21,7 @@ class VickyBot:
         if not initial_message:
             return 'general'
         message_lower = initial_message.lower()
-        imss_keywords = ['imss', 'pensionado', 'jubilado', 'ley 73', 'préstamo imss', 'pensión']
+        imss_keywords = ['imss', 'pensionado', 'jubilado', 'ley 73', 'préstamo imss', 'pensión', '5']
         business_keywords = ['empresarial', 'empresa', 'crédito empresarial', 'negocio', 'pyme']
         
         for keyword in imss_keywords:
@@ -34,8 +34,9 @@ class VickyBot:
 
     def start_conversation(self, user_id, initial_message=None):
         if user_id not in self.user_sessions:
+            campaign = self.detect_campaign(initial_message)
             self.user_sessions[user_id] = {
-                'campaign': self.detect_campaign(initial_message),
+                'campaign': campaign,
                 'state': 'welcome',
                 'data': {},
                 'timestamp': datetime.now()
@@ -56,7 +57,7 @@ class VickyBot:
         if not session:
             return self.start_conversation(user_id, user_message)
 
-        if user_message == '1':
+        if user_message == '1' or user_message == '5':
             session['campaign'] = 'imss'
             session['state'] = 'welcome'
             return self.handle_imss_flow(user_id, "start")
@@ -77,7 +78,7 @@ class VickyBot:
 
         if session['state'] == 'welcome':
             session['state'] = 'ask_pension'
-            return "¿Cuál es tu pensión mensual aproximada?"
+            return "Préstamos a pensionados IMSS. Monto a partir de $40,000 y hasta $650,000. ¿Cuál es tu pensión mensual aproximada?"
 
         elif session['state'] == 'ask_pension':
             amount = self.extract_amount(user_message)
