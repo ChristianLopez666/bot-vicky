@@ -64,58 +64,55 @@ class VickyBot:
             session['campaign'] = 'business'
             session['state'] = 'welcome'
             return self.handle_business_flow(user_id, "start")
+        elif user_message.lower() == 'menu':
+            session['state'] = 'menu'
+            return "🏦 INBURSA\n1. Préstamos IMSS\n2. Créditos empresariales\nEscribe el número de tu opción:"
         else:
             return "Por favor selecciona:\n1. Préstamos IMSS\n2. Créditos empresariales"
 
     def handle_imss_flow(self, user_id, user_message):
         session = self.user_sessions.get(user_id)
         if not session:
-            return "Error. Reinicia conversación."
+            return "Error. Escribe 'menu' para reiniciar."
 
         if session['state'] == 'welcome':
-            session['state'] = 'confirm_pensionado'
-            return "¿Eres pensionado IMSS Ley 73? (sí/no)"
-
-        elif session['state'] == 'confirm_pensionado':
-            if self.gpt_interpret(user_message) == 'positive':
-                session['state'] = 'ask_pension'
-                return "¿Cuál es tu pensión mensual?"
-            else:
-                session['state'] = 'not_eligible'
-                return "Ofrecemos otros productos. Escribe 'menu' para ver opciones."
+            session['state'] = 'ask_pension'
+            return "¿Cuál es tu pensión mensual aproximada?"
 
         elif session['state'] == 'ask_pension':
             amount = self.extract_amount(user_message)
-            if amount:
+            if amount and amount >= 1000:
                 session['data']['pension'] = amount
                 session['state'] = 'ask_loan_amount'
-                return "¿Qué monto de préstamo necesitas? ($40,000 - $650,000)"
-            return "Por favor ingresa un monto válido para tu pensión."
+                return "¿Qué monto de préstamo deseas? ($40,000 - $650,000)"
+            else:
+                return "Por favor ingresa una pensión válida (mínimo $1,000)."
 
         elif session['state'] == 'ask_loan_amount':
             amount = self.extract_amount(user_message)
             if amount and 40000 <= amount <= 650000:
                 session['data']['loan_amount'] = amount
                 session['state'] = 'ask_nomina_change'
-                return "¿Aceptas cambiar tu nómina a Inbursa? (sí/no)"
-            return "El monto debe estar entre $40,000 y $650,000. Ingresa un monto válido."
+                return f"✅ Para un préstamo de ${amount:,.2f}, ¿aceptas cambiar tu nómina a Inbursa? (sí/no)"
+            else:
+                return "El monto debe estar entre $40,000 y $650,000. Ingresa un monto válido:"
 
         elif session['state'] == 'ask_nomina_change':
             if self.gpt_interpret(user_message) == 'positive':
                 session['data']['nomina_change'] = True
                 self.notify_advisor(user_id, 'imss')
-                return "✅ Perfecto! Christian te contactará pronto con los detalles."
+                return "✅ ¡Excelente! Christian te contactará con los detalles del préstamo y beneficios de nómina Inbursa."
             else:
                 session['data']['nomina_change'] = False
                 self.notify_advisor(user_id, 'imss_basic')
-                return "📞 Hemos registrado tu solicitud. Te contactaremos pronto."
+                return "📞 Hemos registrado tu solicitud. Christian te contactará pronto."
 
         return "Error en el flujo. Escribe 'menu' para reiniciar."
 
     def handle_business_flow(self, user_id, user_message):
         session = self.user_sessions.get(user_id)
         if not session:
-            return "Error. Reinicia conversación."
+            return "Error. Escribe 'menu' para reiniciar."
 
         if session['state'] == 'welcome':
             session['state'] = 'ask_credit_type'
@@ -142,14 +139,14 @@ class VickyBot:
         elif session['state'] == 'ask_schedule':
             session['data']['schedule'] = user_message
             self.notify_advisor(user_id, 'business')
-            return "✅ Agendado! Christian te contactará en el horario indicado."
+            return "✅ ¡Perfecto! Christian te contactará en el horario indicado."
 
         return "Error en el flujo. Escribe 'menu' para reiniciar."
 
     def gpt_interpret(self, message):
         message_lower = message.lower()
-        positive_keywords = ['sí', 'si', 'sip', 'claro', 'por supuesto', 'ok', 'vale', 'afirmativo']
-        negative_keywords = ['no', 'nop', 'negativo', 'para nada']
+        positive_keywords = ['sí', 'si', 'sip', 'claro', 'por supuesto', 'ok', 'vale', 'afirmativo', 'acepto']
+        negative_keywords = ['no', 'nop', 'negativo', 'para nada', 'no acepto']
         
         for keyword in positive_keywords:
             if keyword in message_lower:
