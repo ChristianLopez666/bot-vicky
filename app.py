@@ -1,156 +1,28 @@
-import os
-import logging
-import re
-from datetime import datetime
 from flask import Flask, request, jsonify
+import os
+import re
+import logging
+from datetime import datetime
 import requests
-
-# Configuración logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Variables de entorno
-WHATSAPP_TOKEN = os.environ.get('WHATSAPP_TOKEN')
-WHATSAPP_PHONE_ID = os.environ.get('WHATSAPP_PHONE_ID')
-VERIFY_TOKEN = os.environ.get('VERIFY_TOKEN')
-ADVISOR_WHATSAPP = os.environ.get('ADVISOR_WHATSAPP')
+# ---------------------- Config & Logging ----------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+logger = logging.getLogger("vicky-fsm-imss")
 
-# Estado en memoria
-user_sessions = {}
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+ADVISOR_WHATSAPP = os.getenv("ADVISOR_WHATSAPP")  # E.164 (e.g., 5216682478005)
 
-# Endpoint Graph API
-GRAPH_URL = f"https://graph.facebook.com/v17.0/{WHATSAPP_PHONE_ID}/messages"
+# ---------------------- Messages (copy) ----------------------
+START_MSG = """👋 ¡Hola! Soy Vicky.
+¿Buscas un *préstamo para pensionados IMSS (Ley 73)*? Responde *sí* o *no*."""
 
-# Headers para requests
-HEADERS = {
-    "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-    "Content-Type": "application/json"
-}
+REPROMPT_YES_NO = """Para continuar, responde *sí* si buscas préstamo IMSS o *no* si te interesa otro producto."""
 
-TIMEOUT = 15
-
-def extract_amounts(text):
-    """Extrae todos los números del texto, ignorando $ y comas"""
-    numbers = []
-    # Busca patrones como 1,000, 1000, $1000, $1,000
-    matches = re.findall(r'[\$]?[\d,]+\.?\d*', text)
-    for match in matches:
-        try:
-            # Limpia caracteres no numéricos excepto punto decimal
-            cleaned = re.sub(r'[^\d.]', '', match)
-            if cleaned:
-                num = float(cleaned) if '.' in cleaned else int(cleaned)
-                numbers.append(num)
-        except ValueError:
-            continue
-    return sorted(numbers)
-
-def extract_amount(text):
-    """Extrae el primer número del texto"""
-    amounts = extract_amounts(text)
-    return amounts[0] if amounts else None
-
-def send_whatsapp_message(to, message):
-    """Envía mensaje de texto por WhatsApp"""
-    data = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "text": {"body": message}
-    }
-    
-    try:
-        response = requests.post(GRAPH_URL, json=data, headers=HEADERS, timeout=TIMEOUT)
-        if response.status_code != 200:
-            logger.error(f"Error enviando mensaje: {response.status_code} - {response.text}")
-        else:
-            logger.info(f"Mensaje enviado a {to}")
-    except Exception as e:
-        logger.error(f"Excepción enviando mensaje: {str(e)}")
-
-def get_user_session(user_id):
-    """Obtiene o crea sesión del usuario"""
-    now = datetime.now()
-    
-    # Limpieza de sesiones antiguas (más de 1 hora)
-    expired_users = []
-    for uid, session in user_sessions.items():
-        if (now - session['timestamp']).total_seconds() > 3600:
-            expired_users.append(uid)
-    
-    for uid in expired_users:
-        del user_sessions[uid]
-    
-    # Crear nueva sesión si no existe
-    if user_id not in user_sessions:
-        user_sessions[user_id] = {
-            'campaign': 'general',
-            'state': 'init',
-            'data': {},
-            'timestamp': now
-        }
-        logger.info(f"Nueva sesión creada para {user_id}")
-    
-    user_sessions[user_id]['timestamp'] = now
-    return user_sessions[user_id]
-
-def send_welcome_message(user_id):
-    """Envía mensaje de bienvenida y pregunta por IMSS"""
-    message = """¡Hola! Soy Vicky. ¿Estás interesado en préstamos para pensionados IMSS? (sí/no)"""
-    
-    send_whatsapp_message(user_id, message)
-    
-    # Actualizar estado
-    session = get_user_session(user_id)
-    session['state'] = 'ask_imss_interest'
-    logger.info(f"Usuario {user_id} en estado: ask_imss_interest")
-
-def handle_imss_interest(user_id, text):
-    """Procesa respuesta sobre interés en IMSS"""
-    session = get_user_session(user_id)
-    text_lower = text.lower().strip()
-    
-    # Detectar sí
-    positive_responses = ['sí', 'si', 'sip', 'yes', 'y', 'claro', 'acepto', 'ok', 'dale', 'por supuesto', 'afirmativo']
-    negative_responses = ['no', 'nop', 'nope', 'negativo', 'na', 'non', 'para nada']
-    
-    if text_lower in positive_responses:
-        # Iniciar flujo IMSS
-        send_imss_initial_message(user_id)
-        
-    elif text_lower in negative_responses:
-        # Preguntar por otro producto
-        session['state'] = 'ask_product'
-        message = "Entiendo. ¿Qué producto te interesa?"
-        send_whatsapp_message(user_id, message)
-        logger.info(f"Usuario {user_id} no interesado en IMSS, preguntando por otro producto")
-        
-    else:
-        # Respuesta no reconocida
-        message = "Por favor responde con sí o no. ¿Estás interesado en préstamos para pensionados IMSS?"
-        send_whatsapp_message(user_id, message)
-
-def handle_product_interest(user_id, text):
-    """Procesa respuesta sobre otro producto de interés"""
-    session = get_user_session(user_id)
-    
-    # Guardar el producto de interés
-    session['data']['product_interest'] = text
-    session['state'] = 'completed'
-    
-    # Notificar al asesor
-    notify_advisor_general(user_id, text)
-    
-    message = "Perfecto, he registrado tu interés. Christian te contactará para brindarte más información."
-    send_whatsapp_message(user_id, message)
-    logger.info(f"Usuario {user_id} interesado en: {text}")
-
-def send_imss_initial_message(user_id):
-    """Envía mensaje inicial con información del préstamo IMSS"""
-    message = """👋 ¡Perfecto! Te ayudo con tu préstamo IMSS.
-
-🏦 *Préstamos a Pensionados IMSS (Ley 73)*
+IMSS_BENEFITS = """🏦 *Préstamos a Pensionados IMSS (Ley 73)*
 • Monto desde *$40,000* hasta *$650,000*
 • ✅ Sin aval
 • ✅ Sin revisión en Buró
@@ -164,216 +36,225 @@ def send_imss_initial_message(user_id):
 
 ℹ️ Para activar *estos beneficios adicionales* es necesario *cambiar tu nómina a Inbursa*.
 
-Para comenzar, dime tu *pensión mensual aproximada* (ej. 7500)."""
-    
-    send_whatsapp_message(user_id, message)
-    
-    # Actualizar estado
-    session = get_user_session(user_id)
-    session['state'] = 'ask_pension'
-    session['campaign'] = 'imss'
-    logger.info(f"Usuario {user_id} en estado IMSS: ask_pension")
+Dime tu *pensión mensual aproximada* (solo números, ej. 7500)."""
 
-def handle_pension_response(user_id, text):
-    """Procesa respuesta del usuario con su pensión"""
-    session = get_user_session(user_id)
-    amounts = extract_amounts(text)
-    
-    # Caso especial: dos números en el primer mensaje
-    if len(amounts) >= 2:
-        pension = min(amounts)
-        loan_amount = max(amounts)
-        
-        # Validar rango del préstamo
-        loan_amount = max(40000, min(650000, loan_amount))
-        
-        session['data']['pension'] = pension
-        session['data']['loan_amount'] = loan_amount
-        session['state'] = 'ask_nomina'
-        
-        message = f"Perfecto 👍 Detecté pensión de ${pension:,.0f} y monto de préstamo de ${loan_amount:,.0f}. Para un préstamo de ${loan_amount:,.0f} es requisito cambiar tu nómina a Inbursa. ¿Aceptas cambiar tu nómina? (sí/no)"
-        send_whatsapp_message(user_id, message)
-        logger.info(f"Usuario {user_id} atajo - Pensión: {pension}, Préstamo: {loan_amount}")
-        return
-    
-    # Caso normal: un solo número
-    pension = extract_amount(text)
-    
-    if not pension or pension <= 0:
-        message = "Por favor, ingresa un monto válido para tu pensión mensual (ej. 7500)."
-        send_whatsapp_message(user_id, message)
-        return
-    
-    session['data']['pension'] = pension
-    session['state'] = 'ask_loan_amount'
-    
-    message = f"Perfecto 👍 ¿Qué monto de préstamo deseas? (entre $40,000 y $650,000)"
-    send_whatsapp_message(user_id, message)
-    logger.info(f"Usuario {user_id} pensión: {pension}")
+ASK_PENSION = """Por favor, comparte tu *pensión mensual aproximada* (solo números, ej. 7500):"""
 
-def handle_loan_amount_response(user_id, text):
-    """Procesa respuesta del usuario con el monto del préstamo"""
-    session = get_user_session(user_id)
-    loan_amount = extract_amount(text)
-    
-    if not loan_amount or loan_amount < 40000 or loan_amount > 650000:
-        message = "Por favor, ingresa un monto válido entre $40,000 y $650,000."
-        send_whatsapp_message(user_id, message)
-        return
-    
-    session['data']['loan_amount'] = loan_amount
-    session['state'] = 'ask_nomina'
-    
-    message = f"Excelente ✅ para un préstamo de ${loan_amount:,.0f} es requisito cambiar tu nómina a Inbursa. ¿Aceptas cambiar tu nómina? (sí/no)"
-    send_whatsapp_message(user_id, message)
-    logger.info(f"Usuario {user_id} préstamo: {loan_amount}")
+ASK_LOAN = """Perfecto 👍 ¿Qué *monto de préstamo* deseas solicitar? (entre $40,000 y $650,000)"""
 
-def handle_nomina_response(user_id, text):
-    """Procesa respuesta sobre cambio de nómina"""
-    session = get_user_session(user_id)
-    text_lower = text.lower().strip()
-    
-    # Detectar sí
-    positive_responses = ['sí', 'si', 'sip', 'yes', 'y', 'claro', 'acepto', 'ok', 'dale', 'por supuesto']
-    negative_responses = ['no', 'nop', 'nope', 'negativo', 'na', 'non']
-    
-    if text_lower in positive_responses:
-        session['data']['nomina_change'] = True
-        session['state'] = 'completed'
-        
-        message = "✅ ¡Listo! Christian te contactará para confirmar tu préstamo y tus beneficios de Nómina Inbursa."
-        send_whatsapp_message(user_id, message)
-        notify_advisor_imss(user_id, True)
-        logger.info(f"Usuario {user_id} ACEPTA nómina")
-        
-    elif text_lower in negative_responses:
-        session['data']['nomina_change'] = False
-        session['state'] = 'completed'
-        
-        message = "Perfecto 👍 registré tu interés. Christian te contactará con opciones."
-        send_whatsapp_message(user_id, message)
-        notify_advisor_imss(user_id, False)
-        logger.info(f"Usuario {user_id} RECHAZA nómina")
-        
-    else:
-        message = "Por favor responde con sí o no. ¿Aceptas cambiar tu nómina a Inbursa?"
-        send_whatsapp_message(user_id, message)
+ASK_NOMINA_TEMPLATE = """Excelente ✅ para un préstamo de *${:,.0f}* es requisito *cambiar tu nómina a Inbursa*.
+¿Aceptas cambiar tu nómina? (*sí/no*)"""
 
-def notify_advisor_imss(user_id, accepts_nomina):
-    """Envía notificación al asesor para IMSS"""
-    session = get_user_session(user_id)
-    pension = session['data'].get('pension', 0)
-    loan_amount = session['data'].get('loan_amount', 0)
-    
-    if accepts_nomina:
-        message = f"""🔥 NUEVO PROSPECTO IMSS
-📞 {user_id}
-💰 Pensión: ${pension:,.0f}
-💵 Préstamo: ${loan_amount:,.0f}
-🏦 Nómina: SÍ"""
-    else:
-        message = f"""📋 PROSPECTO IMSS BÁSICO
-📞 {user_id}
-💰 Pensión: ${pension:,.0f}
-💵 Préstamo: ${loan_amount:,.0f}
-🏦 Nómina: NO"""
-    
-    send_whatsapp_message(ADVISOR_WHATSAPP, message)
-    logger.info(f"Notificación IMSS enviada al asesor para {user_id}")
+CONFIRM_OK = """✅ ¡Listo! Christian te contactará para confirmar tu préstamo y tus *beneficios de Nómina Inbursa*."""
+CONFIRM_NO = """Perfecto 👍 registré tu interés. Christian te contactará con opciones (*IMSS básico*)."""
 
-def notify_advisor_general(user_id, product_interest):
-    """Envía notificación al asesor para consulta general"""
-    message = f"""🔔 NUEVA CONSULTA
-📞 {user_id}
-💬 {product_interest}"""
-    
-    send_whatsapp_message(ADVISOR_WHATSAPP, message)
-    logger.info(f"Notificación general enviada al asesor para {user_id}")
+ASK_OTHER_PRODUCT = """¿Qué producto te interesa? (por ejemplo: seguros, tarjetas médicas, financiamiento empresarial)"""
+CONFIRM_OTHER_TEMPLATE = """Gracias. Avisaré a Christian para que te contacte sobre: *{}*."""
 
-def handle_user_message(user_id, message_text):
-    """Maneja el mensaje del usuario según su estado actual"""
-    session = get_user_session(user_id)
-    
-    logger.info(f"Procesando mensaje para {user_id} en estado: {session['state']}")
-    
-    if session['state'] == 'init':
-        send_welcome_message(user_id)
-        
-    elif session['state'] == 'ask_imss_interest':
-        handle_imss_interest(user_id, message_text)
-        
-    elif session['state'] == 'ask_product':
-        handle_product_interest(user_id, message_text)
-        
-    elif session['campaign'] == 'imss':
-        # Flujo IMSS
-        if session['state'] == 'ask_pension':
-            handle_pension_response(user_id, message_text)
-            
-        elif session['state'] == 'ask_loan_amount':
-            handle_loan_amount_response(user_id, message_text)
-            
-        elif session['state'] == 'ask_nomina':
-            handle_nomina_response(user_id, message_text)
-            
-        elif session['state'] == 'completed':
-            # Si ya completó el flujo, reiniciar
-            send_welcome_message(user_id)
+RESTART_MSG = """Ocurrió un detalle. Escribe *hola* para comenzar de nuevo."""
 
-@app.route('/webhook', methods=['GET'])
-def webhook_verify():
-    """Verificación webhook Meta"""
-    mode = request.args.get('hub.mode')
-    token = request.args.get('hub.verify_token')
-    challenge = request.args.get('hub.challenge')
-    
-    if mode and token:
-        if mode == 'subscribe' and token == VERIFY_TOKEN:
-            logger.info("Webhook verificado exitosamente")
-            return challenge
-        else:
-            logger.warning("Token de verificación inválido")
-            return 'Forbidden', 403
-    
-    return 'Bad Request', 400
+# ---------------------- FSM ----------------------
+# States: start, ask_yes_no_reprompt, imss_benefits, ask_pension, ask_loan, ask_nomina, ask_other_product, notify_yes, notify_no, notify_other, done
+SESSIONS = {}
 
-@app.route('/webhook', methods=['POST'])
-def webhook_events():
-    """Maneja eventos entrantes de WhatsApp"""
+def reset_session(user_id: str):
+    SESSIONS[user_id] = {
+        "state": "start",
+        "data": {},
+        "timestamp": datetime.utcnow(),
+    }
+
+def ensure_session(user_id: str):
+    if user_id not in SESSIONS:
+        reset_session(user_id)
+    return SESSIONS[user_id]
+
+# ---------------------- Helpers ----------------------
+YES_WORDS = {"sí", "si", "sip", "claro", "ok", "vale", "acepto", "afirmativo", "por supuesto"}
+NO_WORDS = {"no", "nop", "negativo", "no acepto", "para nada"}
+
+def is_yes(text: str) -> bool:
+    t = (text or "").lower().strip()
+    return any(w in t for w in YES_WORDS)
+
+def is_no(text: str) -> bool:
+    t = (text or "").lower().strip()
+    return any(w in t for w in NO_WORDS)
+
+def extract_numbers(text: str):
+    if not text:
+        return []
+    clean = text.replace(",", "").replace("$", "")
+    return [float(n) for n in re.findall(r"(\d{2,7})(?:\.\d+)?", clean)]
+
+def send_whatsapp(to: str, body: str) -> bool:
     try:
-        data = request.get_json()
-        logger.info(f"Evento recibido: {data}")
-        
-        if not data or 'object' not in data or data['object'] != 'whatsapp_business_account':
-            return 'Not Found', 404
-        
-        entries = data.get('entry', [])
-        for entry in entries:
-            changes = entry.get('changes', [])
-            for change in changes:
-                value = change.get('value', {})
-                messages = value.get('messages', [])
-                
-                for message in messages:
-                    if message.get('type') == 'text':
-                        user_id = message['from']
-                        message_text = message['text']['body']
-                        
-                        logger.info(f"Mensaje de {user_id}: {message_text}")
-                        
-                        # Manejar el mensaje según el estado del usuario
-                        handle_user_message(user_id, message_text)
-        
-        return 'OK', 200
-        
+        url = f"https://graph.facebook.com/v17.0/{WHATSAPP_PHONE_ID}/messages"
+        headers = {
+            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "text": {"body": body},
+        }
+        r = requests.post(url, json=payload, headers=headers, timeout=15)
+        ok = 200 <= r.status_code < 300
+        if not ok:
+            logger.error("WhatsApp send error %s: %s", r.status_code, r.text)
+        return ok
     except Exception as e:
-        logger.error(f"Error procesando webhook: {str(e)}")
-        return 'OK', 200  # Siempre retornar 200 a Meta
+        logger.error("WhatsApp send exception: %s", e)
+        return False
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Endpoint de health check"""
-    return jsonify({"status": "ok"})
+def notify_advisor_imss(pension: float, loan: float, nomina_yes: bool):
+    if not ADVISOR_WHATSAPP:
+        logger.warning("ADVISOR_WHATSAPP no configurado; se omite notificación.")
+        return
+    if nomina_yes:
+        body = (
+            "🔥 NUEVO PROSPECTO IMSS\n"
+            f"💰 Pensión: ${pension:,.0f}\n"
+            f"💵 Préstamo: ${loan:,.0f}\n"
+            "🏦 Nómina: SÍ"
+        )
+    else:
+        body = (
+            "📋 PROSPECTO IMSS BÁSICO\n"
+            f"💰 Pensión: ${pension:,.0f}\n"
+            f"💵 Préstamo: ${loan:,.0f}\n"
+            "🏦 Nómina: NO"
+        )
+    send_whatsapp(ADVISOR_WHATSAPP, body)
+
+def notify_advisor_other(topic: str):
+    if not ADVISOR_WHATSAPP:
+        logger.warning("ADVISOR_WHATSAPP no configurado; se omite notificación.")
+        return
+    body = f"📌 Interés en otro producto: {topic}"
+    send_whatsapp(ADVISOR_WHATSAPP, body)
+
+# ---------------------- Core Handler ----------------------
+def handle_user_message(user_id: str, text: str) -> str:
+    s = ensure_session(user_id)
+    t = (text or "").strip()
+
+    # Comandos globales
+    if t.lower() in {"hola", "menu"}:
+        reset_session(user_id)
+        return START_MSG
+
+    if s["state"] == "start":
+        if is_yes(t):
+            s["state"] = "imss_benefits"
+            return IMSS_BENEFITS
+        if is_no(t):
+            s["state"] = "ask_other_product"
+            return ASK_OTHER_PRODUCT
+        s["state"] = "ask_yes_no_reprompt"
+        return REPROMPT_YES_NO
+
+    if s["state"] == "ask_yes_no_reprompt":
+        if is_yes(t):
+            s["state"] = "imss_benefits"
+            return IMSS_BENEFITS
+        if is_no(t):
+            s["state"] = "ask_other_product"
+            return ASK_OTHER_PRODUCT
+        return REPROMPT_YES_NO
+
+    if s["state"] == "imss_benefits":
+        s["state"] = "ask_pension"
+        return ASK_PENSION
+
+    if s["state"] == "ask_pension":
+        nums = extract_numbers(t)
+        if len(nums) >= 2:
+            pension, loan = sorted(nums)[:2]
+            # clamp loan to range
+            loan = max(40000, min(650000, loan))
+            s["data"]["pension"] = pension
+            s["data"]["loan"] = loan
+            s["state"] = "ask_nomina"
+            return ASK_NOMINA_TEMPLATE.format(loan)
+        if len(nums) == 1:
+            s["data"]["pension"] = nums[0]
+            s["state"] = "ask_loan"
+            return ASK_LOAN
+        return ASK_PENSION
+
+    if s["state"] == "ask_loan":
+        nums = extract_numbers(t)
+        if len(nums) == 0:
+            return "Por favor escribe solo el monto numérico que deseas solicitar (ej. 120000):"
+        loan = nums[0]
+        if not (40000 <= loan <= 650000):
+            return "El monto debe estar entre $40,000 y $650,000. Ingresa un monto válido:"
+        s["data"]["loan"] = loan
+        s["state"] = "ask_nomina"
+        return ASK_NOMINA_TEMPLATE.format(loan)
+
+    if s["state"] == "ask_nomina":
+        if is_yes(t):
+            s["state"] = "done"
+            notify_advisor_imss(s["data"].get("pension", 0), s["data"].get("loan", 0), True)
+            return CONFIRM_OK
+        if is_no(t):
+            s["state"] = "done"
+            notify_advisor_imss(s["data"].get("pension", 0), s["data"].get("loan", 0), False)
+            return CONFIRM_NO
+        return "Por favor responde *sí* o *no*."
+
+    if s["state"] == "ask_other_product":
+        topic = t if t else "Sin detalle"
+        s["data"]["topic"] = topic
+        s["state"] = "done"
+        notify_advisor_other(topic)
+        return CONFIRM_OTHER_TEMPLATE.format(topic)
+
+    if s["state"] == "done":
+        if t.lower() == "hola":
+            reset_session(user_id)
+            return START_MSG
+        return "¿Necesitas algo más? Escribe *hola* para comenzar de nuevo."
+
+    # Fallback de seguridad
+    reset_session(user_id)
+    return RESTART_MSG
+
+# ---------------------- Flask Routes ----------------------
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok"}), 200
+
+@app.get("/webhook")
+def verify_webhook():
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        return challenge, 200
+    return "Verification failed", 403
+
+@app.post("/webhook")
+def webhook():
+    try:
+        data = request.get_json() or {}
+        for entry in data.get("entry", []):
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
+                for msg in value.get("messages", []):
+                    user_id = msg.get("from")
+                    text = (msg.get("text", {}) or {}).get("body", "")
+                    if not user_id:
+                        continue
+                    reply = handle_user_message(user_id, text)
+                    send_whatsapp(user_id, reply)
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        logger.error("Webhook error: %s", e)
+        return jsonify({"status": "error"}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
