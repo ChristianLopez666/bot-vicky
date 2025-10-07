@@ -69,57 +69,68 @@ class VickyBot:
             session['state'] = 'menu'
             return "🏦 INBURSA\n1. Préstamos IMSS\n2. Créditos empresariales\nEscribe el número de tu opción:"
         else:
+            # Si detecta un número, asumir que es para IMSS
+            if self.extract_amount(user_message):
+                session['campaign'] = 'imss'
+                session['state'] = 'welcome'
+                return self.handle_imss_flow(user_id, "start")
             return "Por favor selecciona:\n1. Préstamos IMSS\n2. Créditos empresariales"
 
     def handle_imss_flow(self, user_id, user_message):
         session = self.user_sessions.get(user_id)
         if not session:
-            return "Error. Escribe 'menu' para reiniciar."
+            session = self.user_sessions[user_id] = {
+                'campaign': 'imss',
+                'state': 'welcome',
+                'data': {},
+                'timestamp': datetime.now()
+            }
 
-        if session['state'] == 'welcome':
+        # Si es el inicio del flujo, mostrar mensaje de bienvenida
+        if user_message == "start":
             session['state'] = 'ask_pension'
             return "Préstamos a pensionados IMSS. Monto a partir de $40,000 y hasta $650,000. ¿Cuál es tu pensión mensual aproximada?"
 
-        elif session['state'] == 'ask_pension':
+        # Estado: Preguntar pensión mensual
+        if session['state'] == 'ask_pension':
             amount = self.extract_amount(user_message)
-            if amount and amount >= 1000:
-                session['data']['pension'] = amount
-                session['state'] = 'ask_loan_amount'
-                return "¿Qué monto de préstamo deseas? ($40,000 - $650,000)"
-            elif amount and amount > 0:
+            if amount:
                 session['data']['pension'] = amount
                 session['state'] = 'ask_loan_amount'
                 return "¿Qué monto de préstamo deseas? ($40,000 - $650,000)"
             else:
-                return "Por favor ingresa una pensión válida (mínimo $1,000)."
+                return "Por favor ingresa tu pensión mensual (solo el monto numérico):"
 
+        # Estado: Preguntar monto del préstamo
         elif session['state'] == 'ask_loan_amount':
             amount = self.extract_amount(user_message)
-            if amount and 40000 <= amount <= 650000:
-                session['data']['loan_amount'] = amount
-                session['state'] = 'ask_nomina_change'
-                return f"✅ Para un préstamo de ${amount:,.2f}, ¿aceptas cambiar tu nómina a Inbursa? (sí/no)"
-            elif amount and amount < 40000:
-                session['data']['loan_amount'] = amount
-                session['state'] = 'ask_nomina_change'
-                return f"⚠️ Los préstamos comienzan a partir de $40,000, pero puedo registrar tu interés. ¿Aceptarías cambiar tu nómina a Inbursa? (sí/no)"
+            if amount:
+                if 40000 <= amount <= 650000:
+                    session['data']['loan_amount'] = amount
+                    session['state'] = 'ask_nomina_change'
+                    return f"✅ Para un préstamo de ${amount:,.2f}, ¿aceptas cambiar tu nómina a Inbursa? (sí/no)"
+                else:
+                    return "El monto debe estar entre $40,000 y $650,000. Ingresa un monto válido:"
             else:
-                return "El monto debe estar entre $40,000 y $650,000. Ingresa un monto válido:"
+                return "Por favor ingresa un monto válido para el préstamo ($40,000 - $650,000):"
 
+        # Estado: Confirmar cambio de nómina
         elif session['state'] == 'ask_nomina_change':
-            intent = self.gpt_interpret(user_message)
-            if intent == 'positive':
+            response_type = self.gpt_interpret(user_message)
+            if response_type == 'positive':
                 session['data']['nomina_change'] = True
                 self.notify_advisor(user_id, 'imss')
                 return "✅ ¡Excelente! Christian te contactará con los detalles del préstamo y beneficios de nómina Inbursa."
-            elif intent == 'negative':
+            elif response_type == 'negative':
                 session['data']['nomina_change'] = False
                 self.notify_advisor(user_id, 'imss_basic')
                 return "📞 Hemos registrado tu solicitud. Christian te contactará pronto."
             else:
-                return "Por favor responde 'sí' o 'no' para continuar."
+                return "Por favor responde con 'sí' o 'no': ¿aceptas cambiar tu nómina a Inbursa?"
 
-        return "Error en el flujo. Escribe 'menu' para reiniciar."
+        # Si por algún motivo no está en un estado reconocido, reiniciar
+        session['state'] = 'ask_pension'
+        return "Préstamos a pensionados IMSS. ¿Cuál es tu pensión mensual aproximada?"
 
     def handle_business_flow(self, user_id, user_message):
         session = self.user_sessions.get(user_id)
@@ -169,11 +180,13 @@ class VickyBot:
         return 'neutral'
 
     def extract_amount(self, message):
-        amount_match = re.search(r'(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d+)', message)
+        # Buscar números con comas opcionales y punto decimal opcional
+        amount_match = re.search(r'(\d{1,3}(?:,\d{3})*(?:\.\d{2,})?|\d+(?:\.\d{2,})?)', message)
         if amount_match:
+            amount_str = amount_match.group().replace(',', '')
             try:
-                return float(amount_match.group().replace(',', ''))
-            except:
+                return float(amount_str)
+            except ValueError:
                 return None
         return None
 
@@ -235,39 +248,8 @@ def handle_webhook():
                 if "messages" in value:
                     for msg in value["messages"]:
                         phone = msg["from"]
-                        text = msg.get("text", {}).get("body", "").strip().lower()
-
-                        # --- REFUERZO DE PERSISTENCIA PRE-FLUJO ---
-                        if phone not in vicky.user_sessions:
-                            # Detectar si el mensaje corresponde a préstamo IMSS
-                            if any(word in text for word in ["imss", "pensión", "pensionado", "préstamo", "5"]):
-                                vicky.user_sessions[phone] = {
-                                    'campaign': 'imss',
-                                    'state': 'welcome',
-                                    'data': {},
-                                    'timestamp': datetime.now()
-                                }
-                            elif any(word in text for word in ["empresa", "empresarial", "crédito"]):
-                                vicky.user_sessions[phone] = {
-                                    'campaign': 'business',
-                                    'state': 'welcome',
-                                    'data': {},
-                                    'timestamp': datetime.now()
-                                }
-
-                        # Si el usuario ya está en flujo IMSS
-                        if phone in vicky.user_sessions:
-                            session = vicky.user_sessions[phone]
-                            if session.get('campaign') == 'imss':
-                                response = vicky.handle_imss_flow(phone, text)
-                                vicky.send_whatsapp_message(phone, response)
-                                continue
-                            elif session.get('campaign') == 'business':
-                                response = vicky.handle_business_flow(phone, text)
-                                vicky.send_whatsapp_message(phone, response)
-                                continue
-                        # -------------------------------------------------
-
+                        text = msg.get("text", {}).get("body", "").strip()
+                        
                         if text.lower() == 'menu':
                             vicky.user_sessions[phone] = {
                                 'campaign': 'general',
