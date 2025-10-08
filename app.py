@@ -74,7 +74,7 @@ def extract_number(text):
     if not text:
         return None
     clean = text.replace(',', '').replace('$', '')
-    match = re.search(r'(\d{1,7})(?:\.\d+)?\b', clean)
+    match = re.search(r'(\d{1,9})(?:\.\d+)?\b', clean)  # Aumentado para permitir hasta 9 dígitos
     if match:
         try:
             if ':' in text:
@@ -146,7 +146,7 @@ def handle_menu_command(phone_number):
     send_message(phone_number, menu_text)
 
 # ---------------------------------------------------------------
-# BLOQUE PRINCIPAL: FLUJO PRÉSTAMO IMSS LEY 73
+# BLOQUE PRINCIPAL: FLUJO PRÉSTAMO IMSS LEY 73 - CORREGIDO
 # ---------------------------------------------------------------
 def handle_imss_flow(phone_number, user_message):
     """Gestiona el flujo completo del préstamo IMSS Ley 73."""
@@ -158,8 +158,7 @@ def handle_imss_flow(phone_number, user_message):
     # Paso 1: activación inicial por palabras clave
     if any(keyword in msg for keyword in imss_keywords):
         current_state = user_state.get(phone_number)
-        if current_state not in ["esperando_respuesta_imss", "esperando_monto_pension", 
-                               "esperando_monto_solicitado", "esperando_respuesta_nomina"]:
+        if current_state not in ["esperando_respuesta_imss", "esperando_monto_solicitado", "esperando_respuesta_nomina"]:
             send_message(phone_number,
                 "👋 ¡Hola! Antes de continuar, necesito confirmar algo importante.\n\n"
                 "¿Eres pensionado o jubilado del IMSS bajo la Ley 73? (Responde *sí* o *no*)"
@@ -167,7 +166,7 @@ def handle_imss_flow(phone_number, user_message):
             user_state[phone_number] = "esperando_respuesta_imss"
         return True
 
-    # Paso 2: validación de respuesta IMSS
+    # Paso 2: validación de respuesta IMSS - CORREGIDO: ELIMINADA PREGUNTA DE PENSIÓN
     if user_state.get(phone_number) == "esperando_respuesta_imss":
         intent = interpret_response(msg)
         if intent == 'negative':
@@ -178,54 +177,23 @@ def handle_imss_flow(phone_number, user_message):
             send_main_menu(phone_number)
             user_state.pop(phone_number, None)
         elif intent == 'positive':
+            # ✅ CORRECCIÓN: ELIMINADA PREGUNTA SOBRE MONTO DE PENSIÓN
             send_message(phone_number,
-                "Excelente 👏\n\n¿Cuánto recibes al mes por concepto de pensión? (Ejemplo: 8500)"
+                "Excelente 👏\n\n¿Qué monto de préstamo deseas solicitar? (desde $40,000 hasta $650,000)"
             )
-            user_state[phone_number] = "esperando_monto_pension"
+            user_state[phone_number] = "esperando_monto_solicitado"
         else:
             send_message(phone_number, "Por favor responde *sí* o *no* para continuar.")
         return True
 
-    # Paso 3: monto de pensión - VALIDACIÓN MÍNIMO $5,000
-    if user_state.get(phone_number) == "esperando_monto_pension":
-        # ✅ DETECTAR AGRADECIMIENTOS DURANTE EL FLUJO
-        if is_thankyou_message(msg):
-            send_message(phone_number,
-                "¡De nada! 😊\n\n"
-                "Continuemos con tu solicitud...\n\n"
-                "¿Cuánto recibes al mes por concepto de pensión? (Ejemplo: 8500)"
-            )
-            return True
-            
-        pension_monto = extract_number(msg)
-        if pension_monto is not None:
-            if pension_monto < 5000:
-                send_message(phone_number,
-                    "Para acceder al préstamo IMSS Ley 73 es necesario recibir una pensión mínima de $5,000 mensuales. 💵\n\n"
-                    "Si tu pensión es mayor, por favor ingresa el monto correcto. "
-                    "O si prefieres, puedo mostrarte otras opciones que podrían interesarte:"
-                )
-                send_main_menu(phone_number)
-                user_state.pop(phone_number, None)
-            else:
-                user_data[phone_number] = {"pension_mensual": pension_monto}
-                send_message(phone_number,
-                    f"Perfecto 💰 Pensión registrada: ${pension_monto:,.0f}\n\n"
-                    "¿Qué monto deseas solicitar? (El mínimo es de $40,000 MXN)"
-                )
-                user_state[phone_number] = "esperando_monto_solicitado"
-        else:
-            send_message(phone_number, "Por favor ingresa una cantidad válida, ejemplo: 8500")
-        return True
-
-    # Paso 4: monto solicitado - VALIDACIÓN MÍNIMO $40,000
+    # Paso 3: monto solicitado - VALIDACIÓN MÍNIMO $40,000
     if user_state.get(phone_number) == "esperando_monto_solicitado":
         # ✅ DETECTAR AGRADECIMIENTOS DURANTE EL FLUJO
         if is_thankyou_message(msg):
             send_message(phone_number,
                 "¡Por nada! 😊\n\n"
                 "Sigamos con tu solicitud...\n\n"
-                "¿Qué monto deseas solicitar? (El mínimo es de $40,000 MXN)"
+                "¿Qué monto deseas solicitar? (desde $40,000 hasta $650,000)"
             )
             return True
             
@@ -239,14 +207,17 @@ def handle_imss_flow(phone_number, user_message):
                 )
                 send_main_menu(phone_number)
                 user_state.pop(phone_number, None)
+            elif monto > 650000:
+                send_message(phone_number,
+                    "El monto máximo para préstamos IMSS Ley 73 es de $650,000 MXN. 💵\n\n"
+                    "Por favor ingresa un monto dentro del rango permitido:"
+                )
             else:
-                user_data[phone_number]["monto_solicitado"] = monto
+                user_data[phone_number] = {"monto_solicitado": monto}
                 
                 # MOSTRAR BENEFICIOS INMEDIATAMENTE Y PREGUNTAR POR NÓMINA
                 send_message(phone_number,
-                    "🎉 *¡FELICIDADES!* Cumples con todos los requisitos para el préstamo IMSS Ley 73\n\n"
-                    f"✅ Pensionado IMSS Ley 73\n"
-                    f"✅ Pensión mensual: ${user_data[phone_number]['pension_mensual']:,.0f}\n"
+                    "🎉 *¡FELICIDADES!* Cumples con los requisitos para el préstamo IMSS Ley 73\n\n"
                     f"✅ Monto solicitado: ${monto:,.0f}\n\n"
                     "🌟 *BENEFICIOS DE TU PRÉSTAMO:*\n"
                     "• Monto desde $40,000 hasta $650,000\n"
@@ -273,7 +244,7 @@ def handle_imss_flow(phone_number, user_message):
             send_message(phone_number, "Por favor indica el monto deseado, ejemplo: 65000")
         return True
 
-    # Paso 5: validación nómina - NO DETENER PROCESO SI RESPONDE NO
+    # Paso 4: validación nómina - NO DETENER PROCESO SI RESPONDE NO
     if user_state.get(phone_number) == "esperando_respuesta_nomina":
         # ✅ DETECTAR AGRADECIMIENTOS DURANTE EL FLUJO
         if is_thankyou_message(msg):
@@ -288,7 +259,6 @@ def handle_imss_flow(phone_number, user_message):
         
         # OBTENER DATOS PARA NOTIFICACIÓN
         data = user_data.get(phone_number, {})
-        pension = data.get('pension_mensual', 'N/D')
         monto_solicitado = data.get('monto_solicitado', 'N/D')
         
         if intent == 'positive':
@@ -305,7 +275,6 @@ def handle_imss_flow(phone_number, user_message):
             mensaje_asesor = (
                 f"🔥 *NUEVO PROSPECTO IMSS LEY 73 - NÓMINA ACEPTADA*\n\n"
                 f"📞 Número: {phone_number}\n"
-                f"💰 Pensión mensual: ${pension:,.0f}\n"
                 f"💵 Monto solicitado: ${monto_solicitado:,.0f}\n"
                 f"🏦 Nómina Inbursa: ✅ *ACEPTADA*\n"
                 f"🎯 *Cliente interesado en beneficios adicionales*"
@@ -327,7 +296,6 @@ def handle_imss_flow(phone_number, user_message):
             mensaje_asesor = (
                 f"📋 *NUEVO PROSPECTO IMSS LEY 73*\n\n"
                 f"📞 Número: {phone_number}\n"
-                f"💰 Pensión mensual: ${pension:,.0f}\n"
                 f"💵 Monto solicitado: ${monto_solicitado:,.0f}\n"
                 f"🏦 Nómina Inbursa: ❌ *No por ahora*\n"
                 f"💡 *Cliente cumple requisitos - Contactar para préstamo básico*"
@@ -349,7 +317,7 @@ def handle_imss_flow(phone_number, user_message):
     return False
 
 # ---------------------------------------------------------------
-# BLOQUE: FLUJO CRÉDITO EMPRESARIAL - EMBUDO COMPLETO
+# BLOQUE: FLUJO CRÉDITO EMPRESARIAL - EMBUDO COMPLETO CORREGIDO
 # ---------------------------------------------------------------
 def handle_business_flow(phone_number, user_message):
     """Gestiona el flujo completo de crédito empresarial."""
@@ -360,7 +328,7 @@ def handle_business_flow(phone_number, user_message):
         send_message(phone_number,
             "🏢 *Financiamiento Empresarial Inbursa*\n\n"
             "Impulsa el crecimiento de tu negocio con:\n\n"
-            "✅ Créditos desde $100,000 hasta $5,000,000\n"
+            "✅ Créditos desde $100,000 hasta $100,000,000\n"  # ✅ CORREGIDO: MONTO MÁXIMO ACTUALIZADO
             "✅ Tasas preferenciales\n"
             "✅ Plazos flexibles\n"
             "✅ Asesoría especializada\n\n"
@@ -389,12 +357,13 @@ def handle_business_flow(phone_number, user_message):
         send_message(phone_number,
             "💼 ¿Qué monto de crédito necesitas?\n\n"
             "Monto mínimo: $100,000 MXN\n"
+            "Monto máximo: $100,000,000 MXN\n"  # ✅ CORREGIDO: MONTO MÁXIMO ACTUALIZADO
             "Ejemplo: 250000"
         )
         user_state[phone_number] = "esperando_monto_empresarial"
         return True
 
-    # Paso 4: Capturar monto solicitado
+    # Paso 4: Capturar monto solicitado - CON VALIDACIÓN DE MONTO MÁXIMO
     if user_state.get(phone_number) == "esperando_monto_empresarial":
         monto = extract_number(msg)
         if monto is not None:
@@ -402,6 +371,12 @@ def handle_business_flow(phone_number, user_message):
                 send_message(phone_number,
                     "El monto mínimo para crédito empresarial es de $100,000 MXN. 💰\n\n"
                     "Si deseas solicitar un monto mayor, por favor ingrésalo:"
+                )
+                return True
+            elif monto > 100000000:  # ✅ CORREGIDO: VALIDACIÓN DE MONTO MÁXIMO
+                send_message(phone_number,
+                    "El monto máximo para crédito empresarial es de $100,000,000 MXN. 💰\n\n"
+                    "Por favor ingresa un monto dentro del rango permitido:"
                 )
                 return True
             else:
@@ -589,8 +564,7 @@ def receive_message():
                 return jsonify({"status": "ok"}), 200
 
             # ✅ PRIMERO: Procesar flujo IMSS si está activo
-            if user_state.get(phone_number) in ["esperando_respuesta_imss", "esperando_monto_pension", 
-                                              "esperando_monto_solicitado", "esperando_respuesta_nomina"]:
+            if user_state.get(phone_number) in ["esperando_respuesta_imss", "esperando_monto_solicitado", "esperando_respuesta_nomina"]:
                 if handle_imss_flow(phone_number, user_message):
                     return jsonify({"status": "ok"}), 200
 
