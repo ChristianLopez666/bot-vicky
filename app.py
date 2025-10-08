@@ -99,7 +99,19 @@ def interpret_response(text):
     return 'neutral'
 
 # ---------------------------------------------------------------
-# MENÚ PRINCIPAL MEJORADO - CORREGIDO
+# Función: detectar agradecimientos - NUEVA
+# ---------------------------------------------------------------
+def is_thankyou_message(text):
+    """Detecta mensajes de agradecimiento."""
+    text_lower = text.lower().strip()
+    thankyou_keywords = [
+        'gracias', 'grac', 'gracia', 'thank', 'thanks', 'agradecido', 
+        'agradecida', 'agradecimiento', 'te lo agradezco', 'mil gracias'
+    ]
+    return any(keyword in text_lower for keyword in thankyou_keywords)
+
+# ---------------------------------------------------------------
+# MENÚ PRINCIPAL MEJORADO
 # ---------------------------------------------------------------
 def send_main_menu(phone):
     menu = (
@@ -114,7 +126,7 @@ def send_main_menu(phone):
     send_message(phone, menu)
 
 # ---------------------------------------------------------------
-# Función: manejar comando menu - MEJORADA
+# Función: manejar comando menu
 # ---------------------------------------------------------------
 def handle_menu_command(phone_number):
     """Maneja el comando menu para reiniciar la conversación"""
@@ -176,6 +188,15 @@ def handle_imss_flow(phone_number, user_message):
 
     # Paso 3: monto de pensión - VALIDACIÓN MÍNIMO $5,000
     if user_state.get(phone_number) == "esperando_monto_pension":
+        # ✅ DETECTAR AGRADECIMIENTOS DURANTE EL FLUJO
+        if is_thankyou_message(msg):
+            send_message(phone_number,
+                "¡De nada! 😊\n\n"
+                "Continuemos con tu solicitud...\n\n"
+                "¿Cuánto recibes al mes por concepto de pensión? (Ejemplo: 8500)"
+            )
+            return True
+            
         pension_monto = extract_number(msg)
         if pension_monto is not None:
             if pension_monto < 5000:
@@ -199,6 +220,15 @@ def handle_imss_flow(phone_number, user_message):
 
     # Paso 4: monto solicitado - VALIDACIÓN MÍNIMO $40,000
     if user_state.get(phone_number) == "esperando_monto_solicitado":
+        # ✅ DETECTAR AGRADECIMIENTOS DURANTE EL FLUJO
+        if is_thankyou_message(msg):
+            send_message(phone_number,
+                "¡Por nada! 😊\n\n"
+                "Sigamos con tu solicitud...\n\n"
+                "¿Qué monto deseas solicitar? (El mínimo es de $40,000 MXN)"
+            )
+            return True
+            
         monto = extract_number(msg)
         if monto is not None:
             if monto < 40000:
@@ -245,6 +275,15 @@ def handle_imss_flow(phone_number, user_message):
 
     # Paso 5: validación nómina - NO DETENER PROCESO SI RESPONDE NO
     if user_state.get(phone_number) == "esperando_respuesta_nomina":
+        # ✅ DETECTAR AGRADECIMIENTOS DURANTE EL FLUJO
+        if is_thankyou_message(msg):
+            send_message(phone_number,
+                "¡De nada! 😊\n\n"
+                "Para continuar, por favor responde *sí* o *no*:\n\n"
+                "¿Aceptas cambiar tu nómina a Inbursa para acceder a beneficios adicionales?"
+            )
+            return True
+            
         intent = interpret_response(msg)
         
         # OBTENER DATOS PARA NOTIFICACIÓN
@@ -310,7 +349,7 @@ def handle_imss_flow(phone_number, user_message):
     return False
 
 # ---------------------------------------------------------------
-# FLUJO PARA OPCIONES DEL MENÚ - NUEVA FUNCIÓN
+# FLUJO PARA OPCIONES DEL MENÚ
 # ---------------------------------------------------------------
 def handle_menu_options(phone_number, user_message):
     """Maneja las opciones del menú principal."""
@@ -413,7 +452,7 @@ def verify_webhook():
     return "Forbidden", 403
 
 # ---------------------------------------------------------------
-# Endpoint principal para recepción de mensajes - COMPLETAMENTE REESTRUCTURADO
+# Endpoint principal para recepción de mensajes - CON DETECCIÓN DE AGRADECIMIENTOS
 # ---------------------------------------------------------------
 @app.route("/webhook", methods=["POST"])
 def receive_message():
@@ -441,6 +480,15 @@ def receive_message():
             # ✅ DETECCIÓN MEJORADA DE COMANDO MENU (CON TILDES Y VARIANTES)
             if user_message.lower() in ["menu", "menú", "men", "opciones", "servicios"]:
                 handle_menu_command(phone_number)
+                return jsonify({"status": "ok"}), 200
+
+            # ✅ DETECCIÓN DE AGRADECIMIENTOS - ANTES DE LOS FLUJOS PRINCIPALES
+            if is_thankyou_message(user_message):
+                send_message(phone_number,
+                    "¡De nada! 😊\n\n"
+                    "Quedo a tus órdenes para cualquier otra cosa.\n\n"
+                    "¿Hay algo más en lo que pueda ayudarte?"
+                )
                 return jsonify({"status": "ok"}), 200
 
             # ✅ PRIMERO: Procesar flujo IMSS si está activo
