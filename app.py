@@ -99,7 +99,7 @@ def interpret_response(text):
     return 'neutral'
 
 # ---------------------------------------------------------------
-# Función: detectar agradecimientos - NUEVA
+# Función: detectar agradecimientos
 # ---------------------------------------------------------------
 def is_thankyou_message(text):
     """Detecta mensajes de agradecimiento."""
@@ -349,7 +349,110 @@ def handle_imss_flow(phone_number, user_message):
     return False
 
 # ---------------------------------------------------------------
-# FLUJO PARA OPCIONES DEL MENÚ
+# BLOQUE: FLUJO CRÉDITO EMPRESARIAL - EMBUDO COMPLETO
+# ---------------------------------------------------------------
+def handle_business_flow(phone_number, user_message):
+    """Gestiona el flujo completo de crédito empresarial."""
+    msg = user_message.lower()
+
+    # Paso 1: Inicio del flujo empresarial
+    if user_state.get(phone_number) == "inicio_empresarial":
+        send_message(phone_number,
+            "🏢 *Financiamiento Empresarial Inbursa*\n\n"
+            "Impulsa el crecimiento de tu negocio con:\n\n"
+            "✅ Créditos desde $100,000 hasta $5,000,000\n"
+            "✅ Tasas preferenciales\n"
+            "✅ Plazos flexibles\n"
+            "✅ Asesoría especializada\n\n"
+            "Para comenzar, ¿qué tipo de crédito necesitas?\n\n"
+            "• Capital de trabajo\n"
+            "• Maquinaria y equipo\n" 
+            "• Remodelación de local\n"
+            "• Expansión de negocio\n"
+            "• Otro (especifica)"
+        )
+        user_state[phone_number] = "esperando_tipo_credito"
+        return True
+
+    # Paso 2: Capturar tipo de crédito
+    if user_state.get(phone_number) == "esperando_tipo_credito":
+        user_data[phone_number] = {"tipo_credito": user_message}
+        send_message(phone_number,
+            "📊 Perfecto. ¿A qué se dedica tu empresa? (giro o actividad principal)"
+        )
+        user_state[phone_number] = "esperando_giro_empresa"
+        return True
+
+    # Paso 3: Capturar giro de la empresa
+    if user_state.get(phone_number) == "esperando_giro_empresa":
+        user_data[phone_number]["giro_empresa"] = user_message
+        send_message(phone_number,
+            "💼 ¿Qué monto de crédito necesitas?\n\n"
+            "Monto mínimo: $100,000 MXN\n"
+            "Ejemplo: 250000"
+        )
+        user_state[phone_number] = "esperando_monto_empresarial"
+        return True
+
+    # Paso 4: Capturar monto solicitado
+    if user_state.get(phone_number) == "esperando_monto_empresarial":
+        monto = extract_number(msg)
+        if monto is not None:
+            if monto < 100000:
+                send_message(phone_number,
+                    "El monto mínimo para crédito empresarial es de $100,000 MXN. 💰\n\n"
+                    "Si deseas solicitar un monto mayor, por favor ingrésalo:"
+                )
+                return True
+            else:
+                user_data[phone_number]["monto_solicitado"] = monto
+                send_message(phone_number,
+                    f"✅ Monto registrado: ${monto:,.0f}\n\n"
+                    "📅 ¿Qué día y horario prefieres para que te contacte un especialista?\n\n"
+                    "Ejemplo: Lunes a viernes de 9am a 2pm"
+                )
+                user_state[phone_number] = "esperando_contacto_empresarial"
+        else:
+            send_message(phone_number, "Por favor ingresa un monto válido, ejemplo: 250000")
+        return True
+
+    # Paso 5: Capturar horario de contacto y finalizar
+    if user_state.get(phone_number) == "esperando_contacto_empresarial":
+        user_data[phone_number]["horario_contacto"] = user_message
+        
+        # Obtener datos para notificación
+        data = user_data.get(phone_number, {})
+        
+        send_message(phone_number,
+            "🎉 *¡Excelente!* Hemos registrado tu solicitud de financiamiento empresarial.\n\n"
+            "📞 *Un especialista en negocios te contactará* en el horario indicado para:\n\n"
+            "• Analizar tu proyecto a detalle\n"
+            "• Explicarte las mejores opciones de crédito\n"
+            "• Orientarte sobre los requisitos y documentación\n\n"
+            "¡Gracias por considerar a Inbursa para impulsar tu empresa! 🏢"
+        )
+
+        # Notificar al asesor
+        mensaje_asesor = (
+            f"🏢 *NUEVO PROSPECTO EMPRESARIAL*\n\n"
+            f"📞 Número: {phone_number}\n"
+            f"📊 Tipo de crédito: {data.get('tipo_credito', 'N/D')}\n"
+            f"🏭 Giro empresa: {data.get('giro_empresa', 'N/D')}\n"
+            f"💵 Monto solicitado: ${data.get('monto_solicitado', 'N/D'):,.0f}\n"
+            f"📅 Horario contacto: {data.get('horario_contacto', 'N/D')}\n"
+            f"🎯 *Cliente potencial para crédito empresarial*"
+        )
+        send_message(ADVISOR_NUMBER, mensaje_asesor)
+        
+        # Limpiar sesión
+        user_state.pop(phone_number, None)
+        user_data.pop(phone_number, None)
+        return True
+
+    return False
+
+# ---------------------------------------------------------------
+# FLUJO PARA OPCIONES DEL MENÚ - ACTUALIZADO CON FLUJO EMPRESARIAL
 # ---------------------------------------------------------------
 def handle_menu_options(phone_number, user_message):
     """Maneja las opciones del menú principal."""
@@ -379,7 +482,9 @@ def handle_menu_options(phone_number, user_message):
         'financiamiento empresarial': 'empresarial',
         'empresa': 'empresarial',
         'negocio': 'empresarial',
-        'pyme': 'empresarial'
+        'pyme': 'empresarial',
+        'crédito empresarial': 'empresarial',
+        'credito empresarial': 'empresarial'
     }
     
     option = menu_options.get(msg)
@@ -423,17 +528,9 @@ def handle_menu_options(phone_number, user_message):
         send_message(ADVISOR_NUMBER, f"💳 NUEVO INTERESADO EN TARJETAS VRIM\n📞 {phone_number}")
         return True
     elif option == 'empresarial':
-        send_message(phone_number,
-            "🏢 *Financiamiento Empresarial Inbursa*\n\n"
-            "Impulsa tu negocio con:\n\n"
-            "✅ Créditos para capital de trabajo\n"
-            "✅ Financiamiento para maquinaria\n"
-            "✅ Líneas de crédito\n"
-            "✅ Planes de inversión\n\n"
-            "📞 Un asesor se comunicará contigo para analizar tu proyecto."
-        )
-        send_message(ADVISOR_NUMBER, f"🏢 NUEVO INTERESADO EN FINANCIAMIENTO EMPRESARIAL\n📞 {phone_number}")
-        return True
+        # INICIAR FLUJO EMPRESARIAL COMPLETO
+        user_state[phone_number] = "inicio_empresarial"
+        return handle_business_flow(phone_number, "inicio")
     
     return False
 
@@ -452,7 +549,7 @@ def verify_webhook():
     return "Forbidden", 403
 
 # ---------------------------------------------------------------
-# Endpoint principal para recepción de mensajes - CON DETECCIÓN DE AGRADECIMIENTOS
+# Endpoint principal para recepción de mensajes - ACTUALIZADO
 # ---------------------------------------------------------------
 @app.route("/webhook", methods=["POST"])
 def receive_message():
@@ -477,7 +574,7 @@ def receive_message():
             
             logging.info(f"📱 Mensaje de {phone_number}: '{user_message}'")
 
-            # ✅ DETECCIÓN MEJORADA DE COMANDO MENU (CON TILDES Y VARIANTES)
+            # ✅ DETECCIÓN MEJORADA DE COMANDO MENU
             if user_message.lower() in ["menu", "menú", "men", "opciones", "servicios"]:
                 handle_menu_command(phone_number)
                 return jsonify({"status": "ok"}), 200
@@ -497,11 +594,18 @@ def receive_message():
                 if handle_imss_flow(phone_number, user_message):
                     return jsonify({"status": "ok"}), 200
 
-            # ✅ SEGUNDO: Procesar opciones del menú principal
+            # ✅ SEGUNDO: Procesar flujo EMPRESARIAL si está activo
+            if user_state.get(phone_number) in ["inicio_empresarial", "esperando_tipo_credito", 
+                                              "esperando_giro_empresa", "esperando_monto_empresarial", 
+                                              "esperando_contacto_empresarial"]:
+                if handle_business_flow(phone_number, user_message):
+                    return jsonify({"status": "ok"}), 200
+
+            # ✅ TERCERO: Procesar opciones del menú principal
             if handle_menu_options(phone_number, user_message):
                 return jsonify({"status": "ok"}), 200
 
-            # ✅ TERCERO: Manejar saludos y mensajes no reconocidos
+            # ✅ CUARTO: Manejar saludos y mensajes no reconocidos
             if user_message.lower() in ["hola", "hi", "hello", "buenas", "buenos días", "buenas tardes"]:
                 send_message(phone_number,
                     "👋 ¡Hola! Soy *Vicky*, tu asistente virtual de Inbursa.\n\n"
