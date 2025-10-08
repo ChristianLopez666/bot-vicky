@@ -67,19 +67,16 @@ def send_message(to, text):
         logging.exception(f"❌ Error en send_message: {e}")
 
 # ---------------------------------------------------------------
-# Función auxiliar: extraer número de texto - CORREGIDA
+# Función auxiliar: extraer número de texto
 # ---------------------------------------------------------------
 def extract_number(text):
     """Extrae el primer número encontrado dentro del texto."""
     if not text:
         return None
-    # Solo eliminar comas para números grandes, mantener puntos para decimales
     clean = text.replace(',', '').replace('$', '')
-    # Buscar números (enteros o decimales) pero evitar horas como "11:10"
     match = re.search(r'(\d{1,7})(?:\.\d+)?\b', clean)
     if match:
         try:
-            # Si parece una hora (contiene :), no es un monto válido
             if ':' in text:
                 return None
             return float(match.group(1))
@@ -102,7 +99,7 @@ def interpret_response(text):
     return 'neutral'
 
 # ---------------------------------------------------------------
-# Menú principal (para usuarios no elegibles)
+# MENÚ PRINCIPAL MEJORADO - CORREGIDO
 # ---------------------------------------------------------------
 def send_main_menu(phone):
     menu = (
@@ -112,12 +109,12 @@ def send_main_menu(phone):
         "3️⃣ Seguros de Vida y Salud\n"
         "4️⃣ Tarjetas Médicas VRIM\n"
         "5️⃣ Financiamiento Empresarial\n\n"
-        "Escribe el número del servicio que te interese 👇"
+        "Escribe el *número* o el *nombre* del servicio que te interesa:"
     )
     send_message(phone, menu)
 
 # ---------------------------------------------------------------
-# Función: manejar comando menu
+# Función: manejar comando menu - MEJORADA
 # ---------------------------------------------------------------
 def handle_menu_command(phone_number):
     """Maneja el comando menu para reiniciar la conversación"""
@@ -125,30 +122,29 @@ def handle_menu_command(phone_number):
     user_data.pop(phone_number, None)
     
     menu_text = (
-        "🔄 Conversación reiniciada\n\n"
+        "🔄 *Conversación reiniciada*\n\n"
         "🏦 *INBURSA - SERVICIOS DISPONIBLES*\n\n"
         "1️⃣ Préstamos IMSS Ley 73\n"
         "2️⃣ Seguros de Auto\n"
         "3️⃣ Seguros de Vida y Salud\n"
         "4️⃣ Tarjetas Médicas VRIM\n"
         "5️⃣ Financiamiento Empresarial\n\n"
-        "Escribe el número o el nombre del servicio que te interesa:"
+        "Escribe el *número* o el *nombre* del servicio que te interesa:"
     )
     send_message(phone_number, menu_text)
 
 # ---------------------------------------------------------------
-# BLOQUE PRINCIPAL: FLUJO PRÉSTAMO IMSS LEY 73 - MODIFICADO SEGÚN REQUERIMIENTOS
+# BLOQUE PRINCIPAL: FLUJO PRÉSTAMO IMSS LEY 73
 # ---------------------------------------------------------------
 def handle_imss_flow(phone_number, user_message):
     """Gestiona el flujo completo del préstamo IMSS Ley 73."""
     msg = user_message.lower()
 
-    # Detección mejorada de palabras clave IMSS
+    # Detección mejorada de palabras clave IMSS - INCLUYE NÚMERO 1
     imss_keywords = ["préstamo", "prestamo", "imss", "pensión", "pension", "ley 73", "1"]
     
     # Paso 1: activación inicial por palabras clave
     if any(keyword in msg for keyword in imss_keywords):
-        # Si ya está en flujo IMSS, no reiniciar
         current_state = user_state.get(phone_number)
         if current_state not in ["esperando_respuesta_imss", "esperando_monto_pension", 
                                "esperando_monto_solicitado", "esperando_respuesta_nomina"]:
@@ -216,7 +212,7 @@ def handle_imss_flow(phone_number, user_message):
             else:
                 user_data[phone_number]["monto_solicitado"] = monto
                 
-                # ✅ MODIFICACIÓN: MOSTRAR BENEFICIOS INMEDIATAMENTE Y PREGUNTAR POR NÓMINA
+                # MOSTRAR BENEFICIOS INMEDIATAMENTE Y PREGUNTAR POR NÓMINA
                 send_message(phone_number,
                     "🎉 *¡FELICIDADES!* Cumples con todos los requisitos para el préstamo IMSS Ley 73\n\n"
                     f"✅ Pensionado IMSS Ley 73\n"
@@ -247,7 +243,7 @@ def handle_imss_flow(phone_number, user_message):
             send_message(phone_number, "Por favor indica el monto deseado, ejemplo: 65000")
         return True
 
-    # Paso 5: validación nómina - ✅ MODIFICACIÓN: NO DETENER PROCESO SI RESPONDE NO
+    # Paso 5: validación nómina - NO DETENER PROCESO SI RESPONDE NO
     if user_state.get(phone_number) == "esperando_respuesta_nomina":
         intent = interpret_response(msg)
         
@@ -278,7 +274,7 @@ def handle_imss_flow(phone_number, user_message):
             send_message(ADVISOR_NUMBER, mensaje_asesor)
             
         elif intent == 'negative':
-            # ✅ MODIFICACIÓN: CLIENTE NO ACEPTA NÓMINA PERO SIGUE EL PROCESO
+            # CLIENTE NO ACEPTA NÓMINA PERO SIGUE EL PROCESO
             send_message(phone_number,
                 "✅ *¡Perfecto!* Entiendo que por el momento prefieres mantener tu nómina actual.\n\n"
                 "📞 *Christian te contactará en breve* para:\n"
@@ -314,6 +310,95 @@ def handle_imss_flow(phone_number, user_message):
     return False
 
 # ---------------------------------------------------------------
+# FLUJO PARA OPCIONES DEL MENÚ - NUEVA FUNCIÓN
+# ---------------------------------------------------------------
+def handle_menu_options(phone_number, user_message):
+    """Maneja las opciones del menú principal."""
+    msg = user_message.lower().strip()
+    
+    # Mapeo de opciones del menú
+    menu_options = {
+        '1': 'imss',
+        'préstamo': 'imss',
+        'prestamo': 'imss',
+        'imss': 'imss',
+        'ley 73': 'imss',
+        '2': 'seguro_auto',
+        'seguro auto': 'seguro_auto',
+        'seguros de auto': 'seguro_auto',
+        'auto': 'seguro_auto',
+        '3': 'seguro_vida',
+        'seguro vida': 'seguro_vida',
+        'seguros de vida': 'seguro_vida',
+        'seguro salud': 'seguro_vida',
+        'vida': 'seguro_vida',
+        '4': 'vrim',
+        'tarjetas médicas': 'vrim',
+        'tarjetas medicas': 'vrim',
+        'vrim': 'vrim',
+        '5': 'empresarial',
+        'financiamiento empresarial': 'empresarial',
+        'empresa': 'empresarial',
+        'negocio': 'empresarial',
+        'pyme': 'empresarial'
+    }
+    
+    option = menu_options.get(msg)
+    
+    if option == 'imss':
+        return handle_imss_flow(phone_number, "préstamo")
+    elif option == 'seguro_auto':
+        send_message(phone_number,
+            "🚗 *Seguros de Auto Inbursa*\n\n"
+            "Protege tu auto con las mejores coberturas:\n\n"
+            "✅ Cobertura amplia contra todo riesgo\n"
+            "✅ Asistencia vial las 24 horas\n"
+            "✅ Responsabilidad civil\n"
+            "✅ Robo total y parcial\n\n"
+            "📞 Un asesor se comunicará contigo para cotizar tu seguro."
+        )
+        send_message(ADVISOR_NUMBER, f"🚗 NUEVO INTERESADO EN SEGURO DE AUTO\n📞 {phone_number}")
+        return True
+    elif option == 'seguro_vida':
+        send_message(phone_number,
+            "🏥 *Seguros de Vida y Salud Inbursa*\n\n"
+            "Protege a tu familia y tu salud:\n\n"
+            "✅ Seguro de vida\n"
+            "✅ Gastos médicos mayores\n"
+            "✅ Hospitalización\n"
+            "✅ Atención médica las 24 horas\n\n"
+            "📞 Un asesor se comunicará contigo para explicarte las coberturas."
+        )
+        send_message(ADVISOR_NUMBER, f"🏥 NUEVO INTERESADO EN SEGURO VIDA/SALUD\n📞 {phone_number}")
+        return True
+    elif option == 'vrim':
+        send_message(phone_number,
+            "💳 *Tarjetas Médicas VRIM*\n\n"
+            "Accede a la mejor atención médica:\n\n"
+            "✅ Consultas médicas ilimitadas\n"
+            "✅ Especialistas y estudios de laboratorio\n"
+            "✅ Medicamentos con descuento\n"
+            "✅ Atención dental y oftalmológica\n\n"
+            "📞 Un asesor se comunicará contigo para explicarte los beneficios."
+        )
+        send_message(ADVISOR_NUMBER, f"💳 NUEVO INTERESADO EN TARJETAS VRIM\n📞 {phone_number}")
+        return True
+    elif option == 'empresarial':
+        send_message(phone_number,
+            "🏢 *Financiamiento Empresarial Inbursa*\n\n"
+            "Impulsa tu negocio con:\n\n"
+            "✅ Créditos para capital de trabajo\n"
+            "✅ Financiamiento para maquinaria\n"
+            "✅ Líneas de crédito\n"
+            "✅ Planes de inversión\n\n"
+            "📞 Un asesor se comunicará contigo para analizar tu proyecto."
+        )
+        send_message(ADVISOR_NUMBER, f"🏢 NUEVO INTERESADO EN FINANCIAMIENTO EMPRESARIAL\n📞 {phone_number}")
+        return True
+    
+    return False
+
+# ---------------------------------------------------------------
 # Endpoint de verificación de Meta Webhook
 # ---------------------------------------------------------------
 @app.route("/webhook", methods=["GET"])
@@ -328,7 +413,7 @@ def verify_webhook():
     return "Forbidden", 403
 
 # ---------------------------------------------------------------
-# Endpoint principal para recepción de mensajes
+# Endpoint principal para recepción de mensajes - COMPLETAMENTE REESTRUCTURADO
 # ---------------------------------------------------------------
 @app.route("/webhook", methods=["POST"])
 def receive_message():
@@ -353,44 +438,52 @@ def receive_message():
             
             logging.info(f"📱 Mensaje de {phone_number}: '{user_message}'")
 
-            # ✅ MANEJO DE COMANDO MENU
-            if user_message.lower() == "menu":
+            # ✅ DETECCIÓN MEJORADA DE COMANDO MENU (CON TILDES Y VARIANTES)
+            if user_message.lower() in ["menu", "menú", "men", "opciones", "servicios"]:
                 handle_menu_command(phone_number)
                 return jsonify({"status": "ok"}), 200
 
-            # Procesar flujo IMSS
-            if handle_imss_flow(phone_number, user_message):
+            # ✅ PRIMERO: Procesar flujo IMSS si está activo
+            if user_state.get(phone_number) in ["esperando_respuesta_imss", "esperando_monto_pension", 
+                                              "esperando_monto_solicitado", "esperando_respuesta_nomina"]:
+                if handle_imss_flow(phone_number, user_message):
+                    return jsonify({"status": "ok"}), 200
+
+            # ✅ SEGUNDO: Procesar opciones del menú principal
+            if handle_menu_options(phone_number, user_message):
                 return jsonify({"status": "ok"}), 200
 
-            # ✅ MEJOR RESPUESTA PARA "HOLA" Y MENSAJES NO RECONOCIDOS
-            if user_message.lower() in ["hola", "hi", "hello", "buenas"]:
+            # ✅ TERCERO: Manejar saludos y mensajes no reconocidos
+            if user_message.lower() in ["hola", "hi", "hello", "buenas", "buenos días", "buenas tardes"]:
                 send_message(phone_number,
                     "👋 ¡Hola! Soy *Vicky*, tu asistente virtual de Inbursa.\n\n"
-                    "Puedo ayudarte con:\n"
-                    "• 📋 **Préstamos IMSS Ley 73** (escribe 'préstamo' o '1')\n"  
-                    "• 🚗 **Seguros de Auto** ('seguro auto' o '2')\n"
-                    "• 🏥 **Seguros de Vida y Salud** ('seguro vida' o '3')\n"
-                    "• 💳 **Tarjetas Médicas VRIM** ('vrim' o '4')\n"
-                    "• 🏢 **Financiamiento Empresarial** ('empresa' o '5')\n\n"
-                    "¿En qué te puedo ayudar? 🙂"
+                    "🏦 *SERVICIOS DISPONIBLES:*\n"
+                    "1️⃣ Préstamos IMSS Ley 73\n"
+                    "2️⃣ Seguros de Auto\n"
+                    "3️⃣ Seguros de Vida y Salud\n"
+                    "4️⃣ Tarjetas Médicas VRIM\n"
+                    "5️⃣ Financiamiento Empresarial\n\n"
+                    "Escribe el *número* o el *nombre* del servicio que te interesa.\n\n"
+                    "También puedes escribir *menú* en cualquier momento."
                 )
             else:
                 send_message(phone_number,
                     "👋 Hola, soy *Vicky*, tu asistente de Inbursa.\n\n"
-                    "No entendí tu mensaje. Puedo ayudarte con:\n"
-                    "• Préstamos IMSS (escribe 'préstamo')\n"  
-                    "• Seguros de Auto ('seguro auto')\n"
-                    "• Seguros de Vida ('seguro vida')\n"
-                    "• Tarjetas Médicas VRIM ('vrim')\n"
-                    "• Financiamiento Empresarial ('empresa')\n\n"
-                    "O escribe *menu* para ver todas las opciones organizadas."
+                    "No entendí tu mensaje. Te puedo ayudar con:\n\n"
+                    "🏦 *SERVICIOS DISPONIBLES:*\n"
+                    "• Préstamos IMSS (escribe '1' o 'préstamo')\n"  
+                    "• Seguros de Auto ('2' o 'seguro auto')\n"
+                    "• Seguros de Vida ('3' o 'seguro vida')\n"
+                    "• Tarjetas Médicas VRIM ('4' o 'vrim')\n"
+                    "• Financiamiento Empresarial ('5' o 'empresa')\n\n"
+                    "Escribe *menú* para ver todas las opciones organizadas."
                 )
             return jsonify({"status": "ok"}), 200
 
         else:
             send_message(phone_number, 
                 "Por ahora solo puedo procesar mensajes de texto 📩\n\n"
-                "Escribe *menu* para ver los servicios disponibles."
+                "Escribe *menú* para ver los servicios disponibles."
             )
             return jsonify({"status": "ok"}), 200
 
