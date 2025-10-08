@@ -60,7 +60,7 @@ def send_message(to, text):
         }
         response = requests.post(url, headers=headers, json=payload)
         if response.status_code not in (200, 201):
-            logging.warning(f"⚠️ Error al enviar mensaje: {response.text}")
+            logging.warning(f"⚠️ Error al enviar mensaje: {response.status_code} - {response.text}")
         else:
             logging.info(f"📩 Mensaje enviado correctamente a {to}")
     except Exception as e:
@@ -78,53 +78,19 @@ def extract_number(text):
     return float(match.group(1)) if match else None
 
 # ---------------------------------------------------------------
-# Función: interpretar respuesta sí/no
-# ---------------------------------------------------------------
-def interpret_response(text):
-    """Interpreta respuestas afirmativas/negativas."""
-    text_lower = (text or '').lower()
-    positive_keywords = ['sí', 'si', 'sip', 'claro', 'por supuesto', 'ok', 'vale', 'afirmativo', 'acepto', 'yes']
-    negative_keywords = ['no', 'nop', 'negativo', 'para nada', 'no acepto', 'not']
-    if any(k in text_lower for k in positive_keywords):
-        return 'positive'
-    if any(k in text_lower for k in negative_keywords):
-        return 'negative'
-    return 'neutral'
-
-# ---------------------------------------------------------------
-# Menú principal (para usuarios no elegibles o reinicio)
+# Menú principal (para usuarios no elegibles)
 # ---------------------------------------------------------------
 def send_main_menu(phone):
     menu = (
-        "🏦 *INBURSA - SERVICIOS DISPONIBLES*\n\n"
-        "1️⃣ Préstamos IMSS Ley 73\n"
-        "2️⃣ Seguros de Auto\n"
-        "3️⃣ Seguros de Vida y Salud\n"
-        "4️⃣ Tarjetas Médicas VRIM\n"
-        "5️⃣ Financiamiento Empresarial\n\n"
+        "📋 *Otros servicios disponibles:*\n"
+        "1️⃣ Seguros de Auto\n"
+        "2️⃣ Seguros de Vida y Salud\n"
+        "3️⃣ Tarjetas Médicas VRIM\n"
+        "4️⃣ Financiamiento Empresarial\n"
+        "5️⃣ Préstamos Personales\n\n"
         "Escribe el número del servicio que te interese 👇"
     )
     send_message(phone, menu)
-
-# ---------------------------------------------------------------
-# Función: manejar comando menu
-# ---------------------------------------------------------------
-def handle_menu_command(phone_number):
-    """Maneja el comando menu para reiniciar la conversación"""
-    user_state.pop(phone_number, None)
-    user_data.pop(phone_number, None)
-    
-    menu_text = (
-        "🔄 Conversación reiniciada\n\n"
-        "🏦 *INBURSA - SERVICIOS DISPONIBLES*\n\n"
-        "1️⃣ Préstamos IMSS Ley 73\n"
-        "2️⃣ Seguros de Auto\n"
-        "3️⃣ Seguros de Vida y Salud\n"
-        "4️⃣ Tarjetas Médicas VRIM\n"
-        "5️⃣ Financiamiento Empresarial\n\n"
-        "Escribe el número o el nombre del servicio que te interesa:"
-    )
-    send_message(phone_number, menu_text)
 
 # ---------------------------------------------------------------
 # BLOQUE PRINCIPAL: FLUJO PRÉSTAMO IMSS LEY 73
@@ -133,38 +99,31 @@ def handle_imss_flow(phone_number, user_message):
     """Gestiona el flujo completo del préstamo IMSS Ley 73."""
     msg = user_message.lower()
 
-    # Detección mejorada de palabras clave IMSS
-    imss_keywords = ["préstamo", "prestamo", "imss", "pensión", "pension", "ley 73", "1", "5"]
-    
-    # Paso 1: activación inicial por palabras clave o números
-    if any(keyword in msg for keyword in imss_keywords) or extract_number(msg) is not None:
-        # Si ya está en flujo IMSS, no reiniciar
-        if user_state.get(phone_number) not in ["esperando_respuesta_imss", "esperando_monto_pension", 
-                                              "esperando_monto_solicitado", "esperando_respuesta_nomina"]:
-            send_message(phone_number,
-                "👋 ¡Hola! Antes de continuar, necesito confirmar algo importante.\n\n"
-                "¿Eres pensionado o jubilado del IMSS bajo la Ley 73? (Responde *sí* o *no*)"
-            )
-            user_state[phone_number] = "esperando_respuesta_imss"
+    # Paso 1: activación inicial
+    if any(x in msg for x in ["préstamo", "prestamo", "imss", "pensión", "pension", "ley 73"]):
+        send_message(phone_number,
+            "👋 ¡Hola! Antes de continuar, necesito confirmar algo importante.\n\n"
+            "¿Eres pensionado o jubilado del IMSS bajo la Ley 73? (Responde *sí* o *no*)"
+        )
+        user_state[phone_number] = "esperando_respuesta_imss"
         return True
 
     # Paso 2: validación de respuesta IMSS
     if user_state.get(phone_number) == "esperando_respuesta_imss":
-        intent = interpret_response(msg)
-        if intent == 'negative':
+        if "no" in msg:
             send_message(phone_number,
-                "Entiendo. Para el préstamo IMSS Ley 73 es necesario ser pensionado del IMSS. 😔\n\n"
-                "Pero tengo otros servicios que pueden interesarte:"
+                "Desafortunadamente no eres prospecto para este tipo de préstamo por la naturaleza del producto. 😔\n\n"
+                "Pero tengo otros servicios que pueden interesarte 👇"
             )
             send_main_menu(phone_number)
             user_state.pop(phone_number, None)
-        elif intent == 'positive':
+        elif "sí" in msg or "si" in msg:
             send_message(phone_number,
                 "Excelente 👏\n\n¿Cuánto recibes al mes por concepto de pensión?"
             )
             user_state[phone_number] = "esperando_monto_pension"
         else:
-            send_message(phone_number, "Por favor responde *sí* o *no* para continuar.")
+            send_message(phone_number, "Por favor responde *sí* o *no*.")
         return True
 
     # Paso 3: monto de pensión
@@ -173,7 +132,7 @@ def handle_imss_flow(phone_number, user_message):
         if pension_monto:
             user_data[phone_number] = {"pension_mensual": pension_monto}
             send_message(phone_number,
-                "Perfecto 💰\n\n¿Qué monto deseas solicitar? (El mínimo es de $40,000 MXN)"
+                "Perfecto 💰\n\n¿Qué monto deseas solicitar? (El mínimo es de $40 000 MXN)"
             )
             user_state[phone_number] = "esperando_monto_solicitado"
         else:
@@ -186,9 +145,9 @@ def handle_imss_flow(phone_number, user_message):
         if monto:
             if monto < 40000:
                 send_message(phone_number,
-                    "Por el momento el monto mínimo para aplicar al préstamo es de $40,000 MXN. 💵\n\n"
+                    "Por el momento el monto mínimo para aplicar al préstamo es de $40 000 MXN. 💵\n\n"
                     "Si deseas solicitar una cantidad mayor, puedo continuar con tu registro ✅\n"
-                    "O si prefieres, puedo mostrarte otras opciones que podrían interesarte:"
+                    "O si prefieres, puedo mostrarte otras opciones que podrían interesarte 👇"
                 )
                 send_main_menu(phone_number)
                 user_state.pop(phone_number, None)
@@ -200,8 +159,7 @@ def handle_imss_flow(phone_number, user_message):
                 )
                 send_message(phone_number,
                     "💳 ¿Tienes tu pensión depositada en Inbursa o estarías dispuesto a cambiarla?\n\n"
-                    "👉 No necesitas cancelar tu cuenta actual y puedes regresar después de tres meses si no estás conforme.\n\n"
-                    "Responde *sí* o *no*:"
+                    "👉 No necesitas cancelar tu cuenta actual y puedes regresar después de tres meses si no estás conforme."
                 )
                 user_state[phone_number] = "esperando_respuesta_nomina"
         else:
@@ -210,8 +168,7 @@ def handle_imss_flow(phone_number, user_message):
 
     # Paso 5: validación nómina y beneficios
     if user_state.get(phone_number) == "esperando_respuesta_nomina":
-        intent = interpret_response(msg)
-        if intent == 'positive':
+        if "sí" in msg or "si" in msg or "dispuesto" in msg:
             send_message(phone_number,
                 "🌟 ¡Excelente! Cambiar tu nómina a Inbursa te da acceso a beneficios exclusivos:"
             )
@@ -228,25 +185,21 @@ def handle_imss_flow(phone_number, user_message):
 
             data = user_data.get(phone_number, {})
             mensaje_asesor = (
-                f"🔥 NUEVO PROSPECTO IMSS LEY 73\n\n"
+                f"📢 *Nuevo prospecto IMSS Ley 73*\n\n"
                 f"📞 Número: {phone_number}\n"
-                f"💰 Pensión mensual: ${data.get('pension_mensual', 'N/D'):,.0f}\n"
-                f"💵 Monto solicitado: ${data.get('monto_solicitado', 'N/D'):,.0f}\n"
+                f"💰 Pensión mensual: ${data.get('pension_mensual', 'N/D')}\n"
+                f"💵 Monto solicitado: ${data.get('monto_solicitado', 'N/D')}\n"
                 f"🏦 Acepta cambiar nómina a Inbursa ✅"
             )
             send_message(ADVISOR_NUMBER, mensaje_asesor)
             user_state.pop(phone_number, None)
-            user_data.pop(phone_number, None)
-        elif intent == 'negative':
+        else:
             send_message(phone_number,
                 "Entiendo, sin cambiar la nómina no es posible acceder al préstamo IMSS Ley 73. 😔\n\n"
-                "Pero puedo mostrarte otros productos que pueden interesarte:"
+                "Pero puedo mostrarte otros productos que pueden interesarte 👇"
             )
             send_main_menu(phone_number)
             user_state.pop(phone_number, None)
-            user_data.pop(phone_number, None)
-        else:
-            send_message(phone_number, "Por favor responde *sí* o *no* para continuar.")
         return True
 
     return False
@@ -274,49 +227,33 @@ def receive_message():
         data = request.get_json()
         logging.info(f"📩 Datos recibidos: {json.dumps(data, ensure_ascii=False)}")
 
-        entry = data.get("entry", [])[0]
-        change = entry.get("changes", [])[0]
-        value = change.get("value", {})
-        messages = value.get("messages", [])
+        # Iterar sobre todas las entradas y cambios
+        for entry in data.get("entry", []):
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
+                messages = value.get("messages", [])
+                for message in messages:
+                    phone_number = message.get("from")
+                    message_type = message.get("type")
 
-        if not messages:
-            return jsonify({"status": "ignored"}), 200
+                    if message_type == "text":
+                        user_message = message["text"]["body"].strip()
+                        logging.info(f"📱 Mensaje de {phone_number}: {user_message}")
 
-        message = messages[0]
-        phone_number = message.get("from")
-        message_type = message.get("type")
+                        # Procesar flujo IMSS
+                        if handle_imss_flow(phone_number, user_message):
+                            continue
 
-        if message_type == "text":
-            user_message = message["text"]["body"].strip()
+                        # Si no aplica flujo IMSS, mostrar menú general
+                        send_message(phone_number,
+                            "👋 Hola, soy *Vicky*, asistente virtual de Inbursa.\n"
+                            "Te puedo ayudar con préstamos, seguros o tarjetas médicas.\n\n"
+                            "Escribe *préstamo IMSS* si eres pensionado o *menú* para ver todas las opciones."
+                        )
+                    else:
+                        send_message(phone_number, "Por ahora solo puedo procesar mensajes de texto 📩")
 
-            # ✅ MANEJO DE COMANDO MENU
-            if user_message.lower() == "menu":
-                handle_menu_command(phone_number)
-                return jsonify({"status": "ok"}), 200
-
-            # Procesar flujo IMSS
-            if handle_imss_flow(phone_number, user_message):
-                return jsonify({"status": "ok"}), 200
-
-            # ✅ MEJOR RESPUESTA PARA MENSAJES NO RECONOCIDOS
-            send_message(phone_number,
-                "👋 Hola, soy *Vicky*, tu asistente virtual de Inbursa.\n\n"
-                "Puedo ayudarte con:\n"
-                "• 📋 **Préstamos IMSS** (escribe 'préstamo' o '1')\n"  
-                "• 🚗 **Seguros de Auto** ('seguro auto' o '2')\n"
-                "• 🏥 **Seguros de Vida y Salud** ('seguro vida' o '3')\n"
-                "• 💳 **Tarjetas Médicas VRIM** ('vrim' o '4')\n"
-                "• 🏢 **Financiamiento Empresarial** ('empresa' o '5')\n\n"
-                "También puedes escribir *menu* en cualquier momento para ver todas las opciones organizadas."
-            )
-            return jsonify({"status": "ok"}), 200
-
-        else:
-            send_message(phone_number, 
-                "Por ahora solo puedo procesar mensajes de texto 📩\n\n"
-                "Escribe *menu* para ver los servicios disponibles."
-            )
-            return jsonify({"status": "ok"}), 200
+        return jsonify({"status": "ok"}), 200
 
     except Exception as e:
         logging.exception(f"❌ Error en receive_message: {e}")
@@ -327,12 +264,11 @@ def receive_message():
 # ---------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "Vicky Bot Inbursa"}), 200
+    return jsonify({"status": "ok"}), 200
 
 # ---------------------------------------------------------------
 # Ejecución principal
 # ---------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    logging.info(f"🚀 Iniciando Vicky Bot en puerto {port}")
     app.run(host="0.0.0.0", port=port)
