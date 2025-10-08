@@ -29,6 +29,7 @@ WHATSAPP_TOKEN = os.getenv("META_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 ADVISOR_WHATSAPP = os.getenv("ADVISOR_WHATSAPP", "5216682478005")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+IMSS_PDF_DRIVE_ID = os.getenv("IMSS_PDF_DRIVE_ID")  # Para consultas documentación
 
 # Google Drive base
 def _drive_service():
@@ -47,9 +48,6 @@ PROCESSED_MESSAGE_IDS = {}
 GREETED_USERS = {}
 LAST_INTENT = {}
 USER_CONTEXT = {}
-IMSS_MANUAL_CACHE = {"ts": None, "text": None}
-
-# Nuevo: Estados para flujos específicos
 USER_FLOWS = {}
 
 MSG_TTL = 600
@@ -170,122 +168,249 @@ def notify_advisor(prospect_data, flow_type):
         return False
     
     if flow_type == "imss":
-        message = f"🎯 NUEVO PROSPECTO - PRÉSTAMO IMSS\n\n"
-        message += f"• Nombre: {prospect_data.get('nombre', 'Por confirmar')}\n"
-        message += f"• Teléfono: {prospect_data.get('phone')}\n"
-        message += f"• Edad: {prospect_data.get('edad')} años\n"
-        message += f"• Antigüedad IMSS: {prospect_data.get('antiguedad')} años\n"
-        message += f"• Nómina Inbursa: {'Sí' if prospect_data.get('nomina_inbursa') else 'No'}\n"
-        message += f"• Cumple requisitos: Sí ✅"
+        message = f"🎯 *NUEVO PROSPECTO CALIFICADO - CRÉDITO IMSS*\n\n"
+        message += f"• 📞 Teléfono: {prospect_data.get('phone')}\n"
+        message += f"• 👤 Nombre: {prospect_data.get('nombre', 'Por confirmar')}\n"
+        message += f"• 🎂 Edad: {prospect_data.get('edad')} años\n"
+        message += f"• 📊 Tipo: {prospect_data.get('tipo_cliente')}\n"
+        message += f"• 💰 Capacidad pago: ${prospect_data.get('capacidad_pago', 'Por confirmar')}\n"
+        message += f"• 🏦 Nómina Inbursa: {'Sí' if prospect_data.get('nomina_inbursa') else 'No'}\n"
+        message += f"• ✅ Cumple requisitos: Sí\n\n"
+        message += f"*ACCION REQUERIDA:* Contactar para proceder con trámite"
     
     elif flow_type == "empresarial":
-        message = f"🏢 NUEVO PROSPECTO - CRÉDITO EMPRESARIAL\n\n"
-        message += f"• Nombre: {prospect_data.get('nombre')}\n"
-        message += f"• Empresa: {prospect_data.get('empresa')}\n"
-        message += f"• Giro: {prospect_data.get('giro')}\n"
-        message += f"• Monto: ${prospect_data.get('monto')}\n"
-        message += f"• Tiempo operando: {prospect_data.get('tiempo_operacion')}\n"
-        message += f"• Teléfono: {prospect_data.get('phone')}\n"
-        message += f"• Cita: {prospect_data.get('cita')}"
+        message = f"🏢 *NUEVO PROSPECTO - CRÉDITO EMPRESARIAL*\n\n"
+        message += f"• 👤 Nombre: {prospect_data.get('nombre')}\n"
+        message += f"• 🏢 Empresa: {prospect_data.get('empresa')}\n"
+        message += f"• 📊 Giro: {prospect_data.get('giro')}\n"
+        message += f"• 💰 Monto: ${prospect_data.get('monto')}\n"
+        message += f"• ⏳ Tiempo operando: {prospect_data.get('tiempo_operacion')}\n"
+        message += f"• 📞 Teléfono: {prospect_data.get('phone')}\n"
+        message += f"• 📅 Cita: {prospect_data.get('cita')}\n\n"
+        message += f"*ACCION REQUERIDA:* Contactar para reunión empresarial"
     
     return vx_wa_send_text(ADVISOR_WHATSAPP, message)
 
-# Flujo Préstamos IMSS Corregido
-def start_imss_flow(phone, campaign_source="general"):
+# =============================================================================
+# FLUJO CRÉDITO IMSS MEJORADO (Basado en documento oficial)
+# =============================================================================
+
+def start_imss_flow(phone, campaign_source="redes_sociales"):
+    """Inicia flujo de Crédito IMSS con beneficios de nómina Inbursa"""
     USER_FLOWS[phone] = {
         "flow": "imss",
-        "step": "benefits_explanation",
-        "data": {"campaign": campaign_source},
-        "timestamp": datetime.now()
+        "step": "welcome_benefits",
+        "data": {
+            "campaign": campaign_source,
+            "timestamp": datetime.now()
+        }
     }
     
-    benefits_text = """🏥 *Préstamo IMSS Ley 73* 
+    welcome_text = """🏥 *CRÉDITO IMSS - INBURSA*
 
-Al cambiar tu nómina o pensión a Inbursa, obtienes *beneficios exclusivos*:
+¡Te damos la bienvenida! Somos tu entidad financiera autorizada por el IMSS.
 
-✓ *Tasas de interés preferentes*
-✓ *Sin comisiones* por manejo de cuenta  
-✓ *Dinero disponible inmediatamente*
-✓ *Seguro de vida incluido* sin costo adicional
+*🌟 BENEFICIOS EXCLUSIVOS con nómina Inbursa:*
 
-*¿Te gustaría domiciliar tu pensión en Inbursa para acceder a estos beneficios?*
+✓ *Tasa preferencial 30.9% CAT* (la más competitiva)
+✓ *Seguro de vida incluido* sin costo adicional  
+✓ *Sin comisiones* por apertura o manejo de cuenta
+✓ *Plazos hasta 60 meses* con pagos fijos
+✓ *Dinero en tu cuenta en 24-72 horas* después de aprobado
+✓ *Sin penalización* por pagos adelantados
 
-💡 Recuerda que:
-• No es necesario cerrar tu cuenta actual
-• Si lo deseas, después de 3 meses puedes regresar tu nómina sin problema"""
+*📋 REQUISITOS IMSS:*
+• Ser pensionado Ley 73, jubilado o activo IMSS
+• Edad + plazo no mayor a 78 años
+• Capacidad de crédito en portal IMSS
 
-    return vx_wa_send_interactive(phone, benefits_text, 
-                                ["Sí, quiero los beneficios", "No, prefiero no cambiar"])
+*¿Te interesa conocer tu crédito preaprobado?*"""
+    
+    return vx_wa_send_interactive(phone, welcome_text, 
+                                ["Sí, quiero mi crédito", "Necesito más información"])
 
 def handle_imss_response(phone, message, user_flow):
+    """Maneja las respuestas del flujo IMSS"""
     step = user_flow["step"]
     data = user_flow["data"]
     
-    if step == "benefits_explanation":
+    if step == "welcome_benefits":
         if "sí" in message.lower() or "si" in message.lower() or "quiero" in message.lower():
-            user_flow["step"] = "check_requirements"
-            user_flow["data"]["nomina_inbursa"] = True
-            vx_wa_send_text(phone, "¡Excelente decisión! Ahora verifiquemos que cumples con los requisitos...")
-            vx_wa_send_text(phone, "¿Cuál es tu edad?")
+            user_flow["step"] = "ask_nomina"
+            nomina_text = """💳 *BENEFICIO NÓMINA INBURSA*
+
+Al tener tu pensión/nómina con nosotros, obtienes:
+• *Tasa 30.9% CAT* vs 36%-59% de otros bancos
+• *Atención preferente* y procesos más rápidos
+• *Seguros adicionales* sin costo
+
+*¿Tienes tu pensión en Inbursa o te gustaría cambiarla?*
+
+💡 *Ventajas del cambio:*
+- No cierras tu cuenta actual
+- Puedes regresar después de 3 meses si no estás conforme
+- Acceso inmediato a mejores condiciones"""
+            
+            vx_wa_send_interactive(phone, nomina_text, 
+                                 ["Sí, tengo Inbursa", "Quiero cambiarme", "Prefiero no cambiar"])
         
         else:
-            user_flow["step"] = "alternative_products"
-            alternative_text = """Entiendo perfectamente. La oferta seguirá disponible por si cambias de opinión.
+            user_flow["step"] = "more_info"
+            info_text = """📚 *INFORMACIÓN CRÉDITO IMSS*
 
-Mientras tanto, ¿te interesa conocer otros productos disponibles?
+*Tipos de Crédito Disponibles:*
+1. *Nuevos* - Si es tu primer crédito o tienes capacidad disponible
+2. *Segundos créditos* - Si tienes crédito vigente pero capacidad disponible  
+3. *Renovaciones* - Si tienes crédito Inbursa con +24 pagos
+4. *Compras de cartera* - Si tienes crédito con otro banco
 
-• 🚗 Seguros de Auto
-• 🏥 Seguros de Vida y Salud  
-• 💳 Tarjetas Médicas VRIM
+*Montos:* Desde $5,000 hasta $650,000
+*Plazos:* 6, 12, 18, 24, 30, 36, 42, 48, 54, 60 meses
 
-Responde con el número de tu interés:
-1. Seguros de Auto
-2. Seguros de Vida
-3. Tarjetas VRIM"""
-            vx_wa_send_text(phone, alternative_text)
+*¿Te interesa alguno de estos productos?*"""
+            
+            vx_wa_send_interactive(phone, info_text, 
+                                 ["Crédito nuevo", "Compra de cartera", "Renovación"])
     
-    elif step == "check_requirements":
-        if "edad" not in data:
-            try:
-                edad = int(message)
-                if 18 <= edad <= 70:
-                    data["edad"] = edad
-                    vx_wa_send_text(phone, "¿Cuántos años de antigüedad tienes en el IMSS?")
-                else:
-                    vx_wa_send_text(phone, "La edad debe estar entre 18 y 70 años. Por favor, ingresa tu edad nuevamente:")
-            except:
-                vx_wa_send_text(phone, "Por favor, ingresa tu edad en números:")
+    elif step == "ask_nomina":
+        if "sí" in message.lower() or "tengo" in message.lower() or "cambiarme" in message.lower():
+            data["nomina_inbursa"] = True
+            user_flow["step"] = "ask_client_type"
+            vx_wa_send_text(phone, "✅ *Excelente elección* - Obtendrás la tasa preferencial 30.9% CAT")
+            
+            type_text = """👤 *¿A cuál de estos grupos perteneces?*
+
+1. *Pensionado Ley 73* (vejez, viudez, cesantía)
+2. *Jubilado del IMSS* (ex trabajador)  
+3. *Activo IMSS* (Mando, Estatuto A, Confianza A)
+
+Responde con el número de tu opción:"""
+            vx_wa_send_text(phone, type_text)
         
-        elif "antiguedad" not in data:
-            try:
-                antiguedad = int(message)
-                if antiguedad >= 1:
-                    data["antiguedad"] = antiguedad
-                    data["phone"] = phone
-                    
-                    # Prospecto calificado - notificar asesor
-                    notify_advisor(data, "imss")
-                    
-                    success_text = f"""✅ *¡Perfecto! Cumples con todos los requisitos*
+        else:
+            data["nomina_inbursa"] = False
+            user_flow["step"] = "ask_client_type"
+            vx_wa_send_text(phone, "Entendido. Continuemos con la evaluación...")
+            
+            type_text = """👤 *¿A cuál de estos grupos perteneces?*
 
-• Edad: {data['edad']} años ✓
-• Antigüedad IMSS: {data['antiguedad']} años ✓  
-• Nómina Inbursa: Confirmada ✓
+1. *Pensionado Ley 73* (vejez, viudez, cesantía)
+2. *Jubilado del IMSS* (ex trabajador)  
+3. *Activo IMSS* (Mando, Estatuto A, Confianza A)
 
-*En este momento notificaré a tu asesor* para que se ponga en contacto contigo y continúe con tu trámite.
+Responde con el número:"""
+            vx_wa_send_text(phone, type_text)
+    
+    elif step == "ask_client_type":
+        tipo_map = {"1": "Pensionado Ley 73", "2": "Jubilado IMSS", "3": "Activo IMSS"}
+        if message in ["1", "2", "3"]:
+            data["tipo_cliente"] = tipo_map[message]
+            user_flow["step"] = "ask_age"
+            vx_wa_send_text(phone, "🎂 *¿Cuál es tu edad?*")
+        else:
+            vx_wa_send_text(phone, "Por favor, responde con 1, 2 o 3:")
+    
+    elif step == "ask_age":
+        try:
+            edad = int(message)
+            if edad < 18 or edad > 78:
+                vx_wa_send_text(phone, "❌ La edad debe estar entre 18 y 78 años. Ingresa tu edad nuevamente:")
+            else:
+                data["edad"] = edad
+                
+                # Calcular plazo máximo según edad
+                plazo_maximo = 78 - edad
+                if plazo_maximo > 60:
+                    plazo_maximo = 60
+                
+                data["plazo_maximo"] = plazo_maximo
+                user_flow["step"] = "ask_capacity"
+                
+                capacity_text = f"""💳 *CAPACIDAD DE CRÉDITO*
 
-📞 Te contactaremos al número: {vx_last10(phone)}"""
-                    
-                    vx_wa_send_text(phone, success_text)
-                    USER_FLOWS.pop(phone, None)  # Finalizar flujo
-                    
-                else:
-                    vx_wa_send_text(phone, "Se requiere al menos 1 año de antigüedad. ¿Cuántos años tienes en el IMSS?")
-            except:
-                vx_wa_send_text(phone, "Por favor, ingresa los años de antigüedad en números:")
+Para verificar tu elegibilidad, necesito que consultes tu capacidad en el portal del IMSS:
 
-# Flujo Créditos Empresariales
-def start_empresarial_flow(phone, campaign_source="general"):
+*Portal según tu tipo:*
+• *Pensionados Ley 73:* https://mc1.imss.gob.mx/mclpe/auth/login
+• *Jubilados/Activos:* https://swap.imss.gob.mx/suap/auth/login
+
+*¿Cuál es el monto máximo que te aprueba el sistema del IMSS?* (ingresa solo números)"""
+                
+                vx_wa_send_text(phone, capacity_text)
+        except:
+            vx_wa_send_text(phone, "Por favor, ingresa tu edad en números:")
+    
+    elif step == "ask_capacity":
+        try:
+            capacidad = float(message.replace("$", "").replace(",", ""))
+            data["capacidad_pago"] = capacidad
+            
+            # Verificar requisitos mínimos
+            if capacidad >= 5000:  # Monto mínimo según documento
+                user_flow["step"] = "get_name"
+                data["cumple_requisitos"] = True
+                
+                vx_wa_send_text(phone, f"✅ *¡Excelente! Tienes capacidad aprobada por: ${capacidad:,.2f}*")
+                vx_wa_send_text(phone, "👤 *Para continuar, ingresa tu nombre completo:*")
+            else:
+                data["cumple_requisitos"] = False
+                reject_text = f"""❌ *Capacidad insuficiente*
+
+El monto mínimo requerido es $5,000. Tu capacidad actual es ${capacidad:,.2f}.
+
+*Recomendaciones:*
+• Esperar hasta día 15 del mes (actualización IMSS)
+• Verificar que tu ingreso mensual sea mayor a $10,000
+• Intentar nuevamente el próximo mes
+
+¿Deseas que te contactemos cuando tengas mayor capacidad?"""
+                
+                vx_wa_send_interactive(phone, reject_text, 
+                                      ["Sí, contactarme", "No, gracias"])
+                
+        except:
+            vx_wa_send_text(phone, "Por favor, ingresa solo el monto en números:")
+    
+    elif step == "get_name":
+        data["nombre"] = message
+        data["phone"] = phone
+        
+        # PROSPECTO CALIFICADO - Notificar asesor
+        notify_advisor(data, "imss")
+        
+        success_text = f"""🎉 *¡FELICIDADES! ESTÁS PRE-APROBADO*
+
+*Resumen de tu crédito:*
+• 👤 Nombre: {data['nombre']}
+• 📞 Teléfono: {vx_last10(phone)}
+• 🎂 Edad: {data['edad']} años ✓
+• 📊 Tipo: {data['tipo_cliente']} ✓
+• 💰 Capacidad: ${data['capacidad_pago']:,.2f} ✓
+• 🏦 Nómina Inbursa: {'Sí' if data.get('nomina_inbursa') else 'No'} ✓
+• 📅 Plazo máximo: {data['plazo_maximo']} meses ✓
+
+*📍 PRÓXIMOS PASOS:*
+1. *Notificaré inmediatamente a tu asesor*
+2. *Te contactará en menos de 24 horas*
+3. *Reunir documentación requerida*
+4. *Firma digital y desembolso*
+
+*📋 Documentación necesaria:*
+• INE vigente
+• Comprobante de domicilio 
+• Estado de cuenta (donde recibes pensión)
+• Video selfie testimonial
+
+*Tu asesor se pondrá en contacto contigo pronto.*"""
+        
+        vx_wa_send_text(phone, success_text)
+        USER_FLOWS.pop(phone, None)  # Finalizar flujo
+
+# =============================================================================
+# FLUJO CRÉDITOS EMPRESARIALES
+# =============================================================================
+
+def start_empresarial_flow(phone, campaign_source="redes_sociales"):
     USER_FLOWS[phone] = {
         "flow": "empresarial", 
         "step": "get_name",
@@ -293,11 +418,17 @@ def start_empresarial_flow(phone, campaign_source="general"):
         "timestamp": datetime.now()
     }
     
-    welcome_text = """🏢 *Créditos Empresariales*
+    welcome_text = """🏢 *CRÉDITOS EMPRESARIALES*
 
-¡Excelente! Vamos a crear un plan *a la medida* de las necesidades de tu negocio.
+¡Excelente! Creamos planes *a la medida* para tu negocio.
 
-Para empezar, por favor ingresa tu *nombre completo*:"""
+*Líneas disponibles:*
+• Capital de trabajo
+• Maquinaria y equipo  
+• Remodelación y expansión
+• Tecnología e innovación
+
+*👤 Para empezar, ingresa tu nombre completo:*"""
     
     return vx_wa_send_text(phone, welcome_text)
 
@@ -308,30 +439,30 @@ def handle_empresarial_response(phone, message, user_flow):
     if step == "get_name":
         data["nombre"] = message
         user_flow["step"] = "get_company"
-        vx_wa_send_text(phone, "¿Cuál es el *nombre de tu empresa*?")
+        vx_wa_send_text(phone, "🏢 *¿Cuál es el nombre de tu empresa?*")
     
     elif step == "get_company":
         data["empresa"] = message
         user_flow["step"] = "get_industry" 
-        vx_wa_send_text(phone, "¿A qué *giro* se dedica tu negocio?")
+        vx_wa_send_text(phone, "📊 *¿A qué giro se dedica tu negocio?*")
     
     elif step == "get_industry":
         data["giro"] = message
         user_flow["step"] = "get_amount"
-        vx_wa_send_text(phone, "¿Qué *monto aproximado* requieres para tu negocio?")
+        vx_wa_send_text(phone, "💰 *¿Qué monto aproximado requieres?*")
     
     elif step == "get_amount":
         data["monto"] = message
         user_flow["step"] = "get_experience"
-        vx_wa_send_text(phone, "¿Cuánto *tiempo tiene operando* tu negocio (en años)?")
+        vx_wa_send_text(phone, "⏳ *¿Cuánto tiempo tiene operando tu negocio (en años)?*")
     
     elif step == "get_experience":
         data["tiempo_operacion"] = message
         user_flow["step"] = "schedule_appointment"
         
-        schedule_text = """📅 *Agendemos tu cita con nuestro especialista*
+        schedule_text = """📅 *AGENDEMOS TU CITA CON ESPECIALISTA*
 
-Nuestro asesor analizará tu caso específico y diseñará un plan financiero personalizado.
+Nuestro asesor analizará tu caso y diseñará un plan financiero personalizado.
 
 *Horarios disponibles:*
 1. Lunes - 10:00 AM
@@ -340,7 +471,7 @@ Nuestro asesor analizará tu caso específico y diseñará un plan financiero pe
 4. Jueves - 11:00 AM
 5. Viernes - 3:00 PM
 
-Responde con el *número* de tu horario preferido:"""
+*Responde con el número de tu horario preferido:*"""
         
         vx_wa_send_text(phone, schedule_text)
     
@@ -360,29 +491,33 @@ Responde con el *número* de tu horario preferido:"""
             # Notificar al asesor
             notify_advisor(data, "empresarial")
             
-            confirmation_text = f"""✅ *Cita confirmada*
+            confirmation_text = f"""✅ *CITA CONFIRMADA*
 
 📅 *Fecha:* {data['cita']}
 👨‍💼 *Especialista:* Asesor Empresarial
 📞 *Contacto:* {vx_last10(phone)}
 
-*Nuestro asesor se contactará contigo* en el horario agendado para:
+*Tu asesor se contactará contigo* para:
 • Analizar tu caso específico
-• Diseñar tu plan financiero personalizado
-• Explicarte todas las opciones disponibles
+• Diseñar plan financiero personalizado
+• Explicarte todas las opciones
 
-💼 *Recomendación:* Ten a la mano documentación de tu empresa para la reunión."""
+💼 *Recomendación:* Ten a la mano documentación de tu empresa."""
             
             vx_wa_send_text(phone, confirmation_text)
             USER_FLOWS.pop(phone, None)  # Finalizar flujo
         else:
             vx_wa_send_text(phone, "Por favor, elige una opción del 1 al 5:")
 
-# Manejo de mensajes principal
+# =============================================================================
+# MANEJADOR PRINCIPAL DE MENSAJES
+# =============================================================================
+
 def handle_incoming_message(phone, message):
-    # Detectar campañas desde redes sociales
-    message_lower = message.lower()
+    """Maneja todos los mensajes entrantes"""
+    message_lower = message.lower().strip()
     
+    # Detectar campañas desde redes sociales
     if "préstamoimss" in message_lower or "prestamoimss" in message_lower:
         return start_imss_flow(phone, "redes_sociales")
     
@@ -399,28 +534,41 @@ def handle_incoming_message(phone, message):
             handle_empresarial_response(phone, message, user_flow)
         return
     
-    # Menú principal para mensajes no dirigidos a campañas específicas
-    menu_text = """¡Hola! Soy Vicky, tu asistente virtual de Inbursa. 🌟
+    # Menú principal para mensajes no dirigidos
+    menu_text = """👋 ¡Hola! Soy tu asistente de *Inbursa*
 
-¿En qué te puedo ayudar today?
+Estamos aquí para ayudarte con:
 
-• 🏥 *Préstamos IMSS* - Con beneficios exclusivos
-• 🏢 *Créditos Empresariales* - Planes a la medida  
-• 📋 *Otros productos* - Seguros, tarjetas y más
+🏥 *CRÉDITO IMSS*
+- Pensionados Ley 73, Jubilados y Activos
+- Tasas preferenciales 30.9% CAT
+- Hasta $650,000 y 60 meses
 
-Responde con el número de tu interés:
-1. Préstamos IMSS
-2. Créditos Empresariales  
+🏢 *CRÉDITO EMPRESARIAL*  
+- Capital de trabajo y expansión
+- Planes a la medida de tu negocio
+- Asesoría especializada
+
+💳 *OTROS PRODUCTOS*
+- Terminales punto de venta
+- Seguros y tarjetas
+- Inversiones
+
+*Responde con el número de tu interés:*
+1. Crédito IMSS
+2. Crédito Empresarial
 3. Otros productos"""
     
     vx_wa_send_text(phone, menu_text)
 
-# Endpoint salud
+# =============================================================================
+# ENDPOINTS FLASK
+# =============================================================================
+
 @app.route("/ext/health")
 def ext_health():
     return jsonify({"status": "ok"})
 
-# Endpoint send-promo consolidado
 @app.route("/ext/send-promo", methods=["POST"])
 def ext_send_promo():
     data = request.get_json(force=True, silent=True) or {}
@@ -467,7 +615,6 @@ def ext_send_promo():
     threading.Thread(target=_worker, daemon=True).start()
     return jsonify({"accepted": True, "count": len(targets)}), 202
 
-# Webhook de WhatsApp
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     mode = request.args.get("hub.mode")
@@ -492,7 +639,6 @@ def webhook():
                     value = change.get("value", {})
                     if "messages" in value:
                         for msg in value["messages"]:
-                            # Procesar solo mensajes de texto
                             if msg.get("type") == "text":
                                 phone = msg.get("from")
                                 message = msg.get("text", {}).get("body", "").strip()
