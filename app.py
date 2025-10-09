@@ -401,11 +401,28 @@ Responde con el *número* de tu horario preferido:"""
         else:
             vx_wa_send_text(phone, "Por favor, elige una opción del 1 al 5:")
 
-# Manejo de mensajes principal
+# Manejo de mensajes principal CORREGIDO
 def handle_incoming_message(phone, message):
-    # Detectar campañas desde redes sociales
-    message_lower = message.lower()
+    message_lower = message.lower().strip()
     
+    # Comando menu
+    if message_lower in ["menu", "menú", "mend"]:
+        USER_FLOWS.pop(phone, None)
+        menu_text = """¡Hola! Soy Vicky, tu asistente virtual de Inbursa. 🌟
+
+🏦 *SERVICIOS DISPONIBLES:*
+
+1️⃣ Préstamos IMSS Ley 73  
+2️⃣ Seguros de Auto  
+3️⃣ Seguros de Vida y Salud  
+4️⃣ Tarjetas Médicas VRIM  
+5️⃣ Financiamiento Empresarial
+
+Escribe el *número* o el *nombre* del servicio que te interesa."""
+        vx_wa_send_text(phone, menu_text)
+        return
+    
+    # Detectar campañas desde redes sociales
     if "préstamoimss" in message_lower or "prestamoimss" in message_lower:
         return start_imss_flow(phone, "redes_sociales")
     
@@ -422,21 +439,43 @@ def handle_incoming_message(phone, message):
             handle_empresarial_response(phone, message, user_flow)
         return
     
-    # Menú principal para mensajes no dirigidos a campañas específicas
-    menu_text = """¡Hola! Soy Vicky, tu asistente virtual de Inbursa. 🌟
-
-¿En qué te puedo ayudar today?
-
-• 🏥 *Préstamos IMSS* - Con beneficios exclusivos
-• 🏢 *Créditos Empresariales* - Planes a la medida  
-• 📋 *Otros productos* - Seguros, tarjetas y más
-
-Responde con el número de tu interés:
-1. Préstamos IMSS
-2. Créditos Empresariales  
-3. Otros productos"""
+    # Manejar opciones del menú principal
+    if message_lower in ["1", "préstamos imss", "prestamos imss", "imss", "ley 73"]:
+        start_imss_flow(phone)
     
-    vx_wa_send_text(phone, menu_text)
+    elif message_lower in ["2", "seguros de auto", "seguro auto", "auto"]:
+        vx_wa_send_text(phone, "🚗 *Seguros de Auto Inbursa*\n\nProtege tu auto con las mejores coberturas:\n\n✅ Cobertura amplia contra todo riesgo\n✅ Asistencia vial las 24 horas\n✅ Responsabilidad civil\n✅ Robo total y parcial\n\n📞 Un asesor se comunicará contigo para cotizar tu seguro.")
+        vx_wa_send_text(ADVISOR_WHATSAPP, f"🚗 NUEVO INTERESADO EN SEGURO DE AUTO\n📞 {phone}")
+    
+    elif message_lower in ["3", "seguros de vida y salud", "seguro vida", "seguro salud", "vida"]:
+        vx_wa_send_text(phone, "🏥 *Seguros de Vida y Salud Inbursa*\n\nProtege a tu familia y tu salud:\n\n✅ Seguro de vida\n✅ Gastos médicos mayores\n✅ Hospitalización\n✅ Atención médica las 24 horas\n\n📞 Un asesor se comunicará contigo para explicarte las coberturas.")
+        vx_wa_send_text(ADVISOR_WHATSAPP, f"🏥 NUEVO INTERESADO EN SEGURO VIDA/SALUD\n📞 {phone}")
+    
+    elif message_lower in ["4", "tarjetas médicas vrim", "tarjetas medicas vrim", "vrim"]:
+        vx_wa_send_text(phone, "💳 *Tarjetas Médicas VRIM*\n\nAccede a la mejor atención médica:\n\n✅ Consultas médicas ilimitadas\n✅ Especialistas y estudios de laboratorio\n✅ Medicamentos con descuento\n✅ Atención dental y oftalmológica\n\n📞 Un asesor se comunicará contigo para explicarte los beneficios.")
+        vx_wa_send_text(ADVISOR_WHATSAPP, f"💳 NUEVO INTERESADO EN TARJETAS VRIM\n📞 {phone}")
+    
+    elif message_lower in ["5", "financiamiento empresarial", "empresarial", "empresa", "negocio", "pyme"]:
+        start_empresarial_flow(phone)
+    
+    elif message_lower in ["hola", "hi", "hello", "buenas", "buenos días", "buenas tardes"]:
+        menu_text = """👋 ¡Hola! Soy *Vicky*, tu asistente virtual de Inbursa.
+
+🏦 *SERVICIOS DISPONIBLES:*
+
+1️⃣ Préstamos IMSS Ley 73  
+2️⃣ Seguros de Auto  
+3️⃣ Seguros de Vida y Salud  
+4️⃣ Tarjetas Médicas VRIM  
+5️⃣ Financiamiento Empresarial
+
+Escribe el *número* o el *nombre* del servicio que te interesa.
+
+También puedes escribir *menú* en cualquier momento."""
+        vx_wa_send_text(phone, menu_text)
+    
+    else:
+        vx_wa_send_text(phone, "No entendí tu mensaje. Por favor escribe *menú* para ver las opciones disponibles.")
 
 # Endpoint salud
 @app.route("/ext/health")
