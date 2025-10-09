@@ -74,7 +74,7 @@ def extract_number(text):
     if not text:
         return None
     clean = text.replace(',', '').replace('$', '')
-    match = re.search(r'(\d{1,9})(?:\.\d+)?\b', clean)  # Aumentado para permitir hasta 9 dígitos
+    match = re.search(r'(\d{1,9})(?:\.\d+)?\b', clean)
     if match:
         try:
             if ':' in text:
@@ -109,6 +109,29 @@ def is_thankyou_message(text):
         'agradecida', 'agradecimiento', 'te lo agradezco', 'mil gracias'
     ]
     return any(keyword in text_lower for keyword in thankyou_keywords)
+
+# ---------------------------------------------------------------
+# Función: validar nombre
+# ---------------------------------------------------------------
+def is_valid_name(text):
+    """Valida que el texto sea un nombre válido."""
+    if not text or len(text.strip()) < 2:
+        return False
+    # Verificar que contenga solo letras, espacios y algunos caracteres especiales comunes en nombres
+    if re.match(r'^[a-zA-ZáéíóúÁÉÍÓÚñÑüÜ\s\.\-]+$', text.strip()):
+        return True
+    return False
+
+# ---------------------------------------------------------------
+# Función: validar teléfono
+# ---------------------------------------------------------------
+def is_valid_phone(text):
+    """Valida que el texto sea un teléfono válido."""
+    if not text:
+        return False
+    # Limpiar y verificar formato de teléfono
+    clean_phone = re.sub(r'[\s\-\(\)\+]', '', text)
+    return re.match(r'^\d{10,15}$', clean_phone) is not None
 
 # ---------------------------------------------------------------
 # MENÚ PRINCIPAL MEJORADO
@@ -146,7 +169,7 @@ def handle_menu_command(phone_number):
     send_message(phone_number, menu_text)
 
 # ---------------------------------------------------------------
-# BLOQUE PRINCIPAL: FLUJO PRÉSTAMO IMSS LEY 73 - CORREGIDO
+# BLOQUE PRINCIPAL: FLUJO PRÉSTAMO IMSS LEY 73
 # ---------------------------------------------------------------
 def handle_imss_flow(phone_number, user_message):
     """Gestiona el flujo completo del préstamo IMSS Ley 73."""
@@ -166,7 +189,7 @@ def handle_imss_flow(phone_number, user_message):
             user_state[phone_number] = "esperando_respuesta_imss"
         return True
 
-    # Paso 2: validación de respuesta IMSS - CORREGIDO: ELIMINADA PREGUNTA DE PENSIÓN
+    # Paso 2: validación de respuesta IMSS
     if user_state.get(phone_number) == "esperando_respuesta_imss":
         intent = interpret_response(msg)
         if intent == 'negative':
@@ -177,7 +200,6 @@ def handle_imss_flow(phone_number, user_message):
             send_main_menu(phone_number)
             user_state.pop(phone_number, None)
         elif intent == 'positive':
-            # ✅ CORRECCIÓN: ELIMINADA PREGUNTA SOBRE MONTO DE PENSIÓN
             send_message(phone_number,
                 "Excelente 👏\n\n¿Qué monto de préstamo deseas solicitar? (desde $40,000 hasta $650,000)"
             )
@@ -188,7 +210,6 @@ def handle_imss_flow(phone_number, user_message):
 
     # Paso 3: monto solicitado - VALIDACIÓN MÍNIMO $40,000
     if user_state.get(phone_number) == "esperando_monto_solicitado":
-        # ✅ DETECTAR AGRADECIMIENTOS DURANTE EL FLUJO
         if is_thankyou_message(msg):
             send_message(phone_number,
                 "¡Por nada! 😊\n\n"
@@ -215,7 +236,6 @@ def handle_imss_flow(phone_number, user_message):
             else:
                 user_data[phone_number] = {"monto_solicitado": monto}
                 
-                # MOSTRAR BENEFICIOS INMEDIATAMENTE Y PREGUNTAR POR NÓMINA
                 send_message(phone_number,
                     "🎉 *¡FELICIDADES!* Cumples con los requisitos para el préstamo IMSS Ley 73\n\n"
                     f"✅ Monto solicitado: ${monto:,.0f}\n\n"
@@ -246,7 +266,6 @@ def handle_imss_flow(phone_number, user_message):
 
     # Paso 4: validación nómina - NO DETENER PROCESO SI RESPONDE NO
     if user_state.get(phone_number) == "esperando_respuesta_nomina":
-        # ✅ DETECTAR AGRADECIMIENTOS DURANTE EL FLUJO
         if is_thankyou_message(msg):
             send_message(phone_number,
                 "¡De nada! 😊\n\n"
@@ -257,12 +276,10 @@ def handle_imss_flow(phone_number, user_message):
             
         intent = interpret_response(msg)
         
-        # OBTENER DATOS PARA NOTIFICACIÓN
         data = user_data.get(phone_number, {})
         monto_solicitado = data.get('monto_solicitado', 'N/D')
         
         if intent == 'positive':
-            # CLIENTE ACEPTA CAMBIAR NÓMINA
             send_message(phone_number,
                 "✅ *¡Excelente decisión!* Al cambiar tu nómina a Inbursa accederás a todos los beneficios adicionales.\n\n"
                 "📞 *Christian te contactará en breve* para:\n"
@@ -282,7 +299,6 @@ def handle_imss_flow(phone_number, user_message):
             send_message(ADVISOR_NUMBER, mensaje_asesor)
             
         elif intent == 'negative':
-            # CLIENTE NO ACEPTA NÓMINA PERO SIGUE EL PROCESO
             send_message(phone_number,
                 "✅ *¡Perfecto!* Entiendo que por el momento prefieres mantener tu nómina actual.\n\n"
                 "📞 *Christian te contactará en breve* para:\n"
@@ -309,7 +325,6 @@ def handle_imss_flow(phone_number, user_message):
             )
             return True
 
-        # LIMPIAR SESIÓN DESPUÉS DE NOTIFICAR
         user_state.pop(phone_number, None)
         user_data.pop(phone_number, None)
         return True
@@ -317,7 +332,7 @@ def handle_imss_flow(phone_number, user_message):
     return False
 
 # ---------------------------------------------------------------
-# BLOQUE: FLUJO CRÉDITO EMPRESARIAL - EMBUDO COMPLETO CORREGIDO
+# BLOQUE: FLUJO CRÉDITO EMPRESARIAL - MEJORADO CON DATOS DE CONTACTO
 # ---------------------------------------------------------------
 def handle_business_flow(phone_number, user_message):
     """Gestiona el flujo completo de crédito empresarial."""
@@ -328,7 +343,7 @@ def handle_business_flow(phone_number, user_message):
         send_message(phone_number,
             "🏢 *Financiamiento Empresarial Inbursa*\n\n"
             "Impulsa el crecimiento de tu negocio con:\n\n"
-            "✅ Créditos desde $100,000 hasta $100,000,000\n"  # ✅ CORREGIDO: MONTO MÁXIMO ACTUALIZADO
+            "✅ Créditos desde $100,000 hasta $100,000,000\n"
             "✅ Tasas preferenciales\n"
             "✅ Plazos flexibles\n"
             "✅ Asesoría especializada\n\n"
@@ -357,13 +372,13 @@ def handle_business_flow(phone_number, user_message):
         send_message(phone_number,
             "💼 ¿Qué monto de crédito necesitas?\n\n"
             "Monto mínimo: $100,000 MXN\n"
-            "Monto máximo: $100,000,000 MXN\n"  # ✅ CORREGIDO: MONTO MÁXIMO ACTUALIZADO
+            "Monto máximo: $100,000,000 MXN\n"
             "Ejemplo: 250000"
         )
         user_state[phone_number] = "esperando_monto_empresarial"
         return True
 
-    # Paso 4: Capturar monto solicitado - CON VALIDACIÓN DE MONTO MÁXIMO
+    # Paso 4: Capturar monto solicitado
     if user_state.get(phone_number) == "esperando_monto_empresarial":
         monto = extract_number(msg)
         if monto is not None:
@@ -373,7 +388,7 @@ def handle_business_flow(phone_number, user_message):
                     "Si deseas solicitar un monto mayor, por favor ingrésalo:"
                 )
                 return True
-            elif monto > 100000000:  # ✅ CORREGIDO: VALIDACIÓN DE MONTO MÁXIMO
+            elif monto > 100000000:
                 send_message(phone_number,
                     "El monto máximo para crédito empresarial es de $100,000,000 MXN. 💰\n\n"
                     "Por favor ingresa un monto dentro del rango permitido:"
@@ -383,19 +398,45 @@ def handle_business_flow(phone_number, user_message):
                 user_data[phone_number]["monto_solicitado"] = monto
                 send_message(phone_number,
                     f"✅ Monto registrado: ${monto:,.0f}\n\n"
-                    "📅 ¿Qué día y horario prefieres para que te contacte un especialista?\n\n"
-                    "Ejemplo: Lunes a viernes de 9am a 2pm"
+                    "👤 *Datos de contacto*\n\n"
+                    "¿Cuál es tu nombre completo?"
                 )
-                user_state[phone_number] = "esperando_contacto_empresarial"
+                user_state[phone_number] = "esperando_nombre_empresarial"
         else:
             send_message(phone_number, "Por favor ingresa un monto válido, ejemplo: 250000")
         return True
 
-    # Paso 5: Capturar horario de contacto y finalizar
+    # ✅ NUEVO PASO 5: Capturar nombre completo
+    if user_state.get(phone_number) == "esperando_nombre_empresarial":
+        if is_valid_name(user_message):
+            user_data[phone_number]["nombre_contacto"] = user_message.title()
+            send_message(phone_number,
+                f"✅ Nombre registrado: {user_message.title()}\n\n"
+                "🏙️ ¿En qué ciudad se encuentra tu empresa?"
+            )
+            user_state[phone_number] = "esperando_ciudad_empresarial"
+        else:
+            send_message(phone_number,
+                "Por favor ingresa un nombre válido (solo letras y espacios):\n\n"
+                "Ejemplo: Juan Pérez García"
+            )
+        return True
+
+    # ✅ NUEVO PASO 6: Capturar ciudad
+    if user_state.get(phone_number) == "esperando_ciudad_empresarial":
+        user_data[phone_number]["ciudad_empresa"] = user_message.title()
+        send_message(phone_number,
+            f"✅ Ciudad registrada: {user_message.title()}\n\n"
+            "📅 ¿Qué día y horario prefieres para que te contacte un especialista?\n\n"
+            "Ejemplo: Lunes a viernes de 9am a 2pm"
+        )
+        user_state[phone_number] = "esperando_contacto_empresarial"
+        return True
+
+    # Paso 7: Capturar horario de contacto y finalizar
     if user_state.get(phone_number) == "esperando_contacto_empresarial":
         user_data[phone_number]["horario_contacto"] = user_message
         
-        # Obtener datos para notificación
         data = user_data.get(phone_number, {})
         
         send_message(phone_number,
@@ -407,19 +448,20 @@ def handle_business_flow(phone_number, user_message):
             "¡Gracias por considerar a Inbursa para impulsar tu empresa! 🏢"
         )
 
-        # Notificar al asesor
+        # Notificar al asesor con información completa
         mensaje_asesor = (
-            f"🏢 *NUEVO PROSPECTO EMPRESARIAL*\n\n"
-            f"📞 Número: {phone_number}\n"
+            f"🏢 *NUEVO PROSPECTO EMPRESARIAL - INFORMACIÓN COMPLETA*\n\n"
+            f"👤 Nombre: {data.get('nombre_contacto', 'N/D')}\n"
+            f"📞 Teléfono: {phone_number}\n"
+            f"🏙️ Ciudad: {data.get('ciudad_empresa', 'N/D')}\n"
             f"📊 Tipo de crédito: {data.get('tipo_credito', 'N/D')}\n"
             f"🏭 Giro empresa: {data.get('giro_empresa', 'N/D')}\n"
             f"💵 Monto solicitado: ${data.get('monto_solicitado', 'N/D'):,.0f}\n"
-            f"📅 Horario contacto: {data.get('horario_contacto', 'N/D')}\n"
+            f"📅 Horario contacto: {data.get('horario_contacto', 'N/D')}\n\n"
             f"🎯 *Cliente potencial para crédito empresarial*"
         )
         send_message(ADVISOR_NUMBER, mensaje_asesor)
         
-        # Limpiar sesión
         user_state.pop(phone_number, None)
         user_data.pop(phone_number, None)
         return True
@@ -427,13 +469,12 @@ def handle_business_flow(phone_number, user_message):
     return False
 
 # ---------------------------------------------------------------
-# FLUJO PARA OPCIONES DEL MENÚ - ACTUALIZADO CON FLUJO EMPRESARIAL
+# FLUJO PARA OPCIONES DEL MENÚ
 # ---------------------------------------------------------------
 def handle_menu_options(phone_number, user_message):
     """Maneja las opciones del menú principal."""
     msg = user_message.lower().strip()
     
-    # Mapeo de opciones del menú
     menu_options = {
         '1': 'imss',
         'préstamo': 'imss',
@@ -503,7 +544,6 @@ def handle_menu_options(phone_number, user_message):
         send_message(ADVISOR_NUMBER, f"💳 NUEVO INTERESADO EN TARJETAS VRIM\n📞 {phone_number}")
         return True
     elif option == 'empresarial':
-        # INICIAR FLUJO EMPRESARIAL COMPLETO
         user_state[phone_number] = "inicio_empresarial"
         return handle_business_flow(phone_number, "inicio")
     
@@ -524,7 +564,7 @@ def verify_webhook():
     return "Forbidden", 403
 
 # ---------------------------------------------------------------
-# Endpoint principal para recepción de mensajes - ACTUALIZADO
+# Endpoint principal para recepción de mensajes
 # ---------------------------------------------------------------
 @app.route("/webhook", methods=["POST"])
 def receive_message():
@@ -549,12 +589,10 @@ def receive_message():
             
             logging.info(f"📱 Mensaje de {phone_number}: '{user_message}'")
 
-            # ✅ DETECCIÓN MEJORADA DE COMANDO MENU
             if user_message.lower() in ["menu", "menú", "men", "opciones", "servicios"]:
                 handle_menu_command(phone_number)
                 return jsonify({"status": "ok"}), 200
 
-            # ✅ DETECCIÓN DE AGRADECIMIENTOS - ANTES DE LOS FLUJOS PRINCIPALES
             if is_thankyou_message(user_message):
                 send_message(phone_number,
                     "¡De nada! 😊\n\n"
@@ -563,23 +601,20 @@ def receive_message():
                 )
                 return jsonify({"status": "ok"}), 200
 
-            # ✅ PRIMERO: Procesar flujo IMSS si está activo
             if user_state.get(phone_number) in ["esperando_respuesta_imss", "esperando_monto_solicitado", "esperando_respuesta_nomina"]:
                 if handle_imss_flow(phone_number, user_message):
                     return jsonify({"status": "ok"}), 200
 
-            # ✅ SEGUNDO: Procesar flujo EMPRESARIAL si está activo
             if user_state.get(phone_number) in ["inicio_empresarial", "esperando_tipo_credito", 
-                                              "esperando_giro_empresa", "esperando_monto_empresarial", 
+                                              "esperando_giro_empresa", "esperando_monto_empresarial",
+                                              "esperando_nombre_empresarial", "esperando_ciudad_empresarial",
                                               "esperando_contacto_empresarial"]:
                 if handle_business_flow(phone_number, user_message):
                     return jsonify({"status": "ok"}), 200
 
-            # ✅ TERCERO: Procesar opciones del menú principal
             if handle_menu_options(phone_number, user_message):
                 return jsonify({"status": "ok"}), 200
 
-            # ✅ CUARTO: Manejar saludos y mensajes no reconocidos
             if user_message.lower() in ["hola", "hi", "hello", "buenas", "buenos días", "buenas tardes"]:
                 send_message(phone_number,
                     "👋 ¡Hola! Soy *Vicky*, tu asistente virtual de Inbursa.\n\n"
