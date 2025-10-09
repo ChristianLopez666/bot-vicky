@@ -169,7 +169,7 @@ def handle_menu_command(phone_number):
     send_message(phone_number, menu_text)
 
 # ---------------------------------------------------------------
-# BLOQUE PRINCIPAL: FLUJO PRÉSTAMO IMSS LEY 73
+# BLOQUE PRINCIPAL: FLUJO PRÉSTAMO IMSS LEY 73 - MODIFICADO
 # ---------------------------------------------------------------
 def handle_imss_flow(phone_number, user_message):
     """Gestiona el flujo completo del préstamo IMSS Ley 73."""
@@ -181,7 +181,7 @@ def handle_imss_flow(phone_number, user_message):
     # Paso 1: activación inicial por palabras clave
     if any(keyword in msg for keyword in imss_keywords):
         current_state = user_state.get(phone_number)
-        if current_state not in ["esperando_respuesta_imss", "esperando_monto_solicitado", "esperando_respuesta_nomina"]:
+        if current_state not in ["esperando_respuesta_imss", "esperando_monto_solicitado", "esperando_respuesta_nomina", "esperando_nombre_imss", "esperando_telefono_imss", "esperando_ciudad_imss"]:
             send_message(phone_number,
                 "👋 ¡Hola! Antes de continuar, necesito confirmar algo importante.\n\n"
                 "¿Eres pensionado o jubilado del IMSS bajo la Ley 73? (Responde *sí* o *no*)"
@@ -201,70 +201,57 @@ def handle_imss_flow(phone_number, user_message):
             user_state.pop(phone_number, None)
         elif intent == 'positive':
             send_message(phone_number,
-                "Excelente 👏\n\n¿Qué monto de préstamo deseas solicitar? (desde $40,000 hasta $650,000)"
+                "Excelente 👏\n\n¿Qué monto de préstamo deseas solicitar?"
             )
             user_state[phone_number] = "esperando_monto_solicitado"
         else:
             send_message(phone_number, "Por favor responde *sí* o *no* para continuar.")
         return True
 
-    # Paso 3: monto solicitado - VALIDACIÓN MÍNIMO $40,000
+    # ✅ PASO 3 MODIFICADO: monto solicitado - ELIMINAR VALIDACIONES
     if user_state.get(phone_number) == "esperando_monto_solicitado":
         if is_thankyou_message(msg):
             send_message(phone_number,
                 "¡Por nada! 😊\n\n"
                 "Sigamos con tu solicitud...\n\n"
-                "¿Qué monto deseas solicitar? (desde $40,000 hasta $650,000)"
+                "¿Qué monto deseas solicitar?"
             )
             return True
             
         monto = extract_number(msg)
         if monto is not None:
-            if monto < 40000:
-                send_message(phone_number,
-                    "Por el momento el monto mínimo para aplicar al préstamo es de $40,000 MXN. 💵\n\n"
-                    "Si deseas solicitar una cantidad mayor, puedo continuar con tu registro ✅\n"
-                    "O si prefieres, puedo mostrarte otras opciones que podrían interesarte:"
-                )
-                send_main_menu(phone_number)
-                user_state.pop(phone_number, None)
-            elif monto > 650000:
-                send_message(phone_number,
-                    "El monto máximo para préstamos IMSS Ley 73 es de $650,000 MXN. 💵\n\n"
-                    "Por favor ingresa un monto dentro del rango permitido:"
-                )
-            else:
-                user_data[phone_number] = {"monto_solicitado": monto}
-                
-                send_message(phone_number,
-                    "🎉 *¡FELICIDADES!* Cumples con los requisitos para el préstamo IMSS Ley 73\n\n"
-                    f"✅ Monto solicitado: ${monto:,.0f}\n\n"
-                    "🌟 *BENEFICIOS DE TU PRÉSTAMO:*\n"
-                    "• Monto desde $40,000 hasta $650,000\n"
-                    "• Sin aval\n• Sin revisión en Buró\n"
-                    "• Descuento directo de tu pensión\n"
-                    "• Tasa preferencial"
-                )
-                
-                send_message(phone_number,
-                    "💳 *PARA ACCEDER A BENEFICIOS ADICIONALES EXCLUSIVOS*:\n\n"
-                    "¿Tienes tu pensión depositada en Inbursa o estarías dispuesto a cambiarla?\n\n"
-                    "🌟 *BENEFICIOS ADICIONALES CON NÓMINA INBURSA:*\n"
-                    "• Rendimientos del 80% de Cetes\n"
-                    "• Devolución del 20% de intereses por pago puntual\n"
-                    "• Anticipo de nómina hasta el 50%\n"
-                    "• Seguro de vida y Medicall Home (telemedicina 24/7)\n"
-                    "• Descuentos en Sanborns y 6,000 comercios\n"
-                    "• Retiros sin comisión en +28,000 puntos\n\n"
-                    "💡 *No necesitas cancelar tu cuenta actual*\n"
-                    "👉 ¿Aceptas cambiar tu nómina a Inbursa? (sí/no)"
-                )
-                user_state[phone_number] = "esperando_respuesta_nomina"
+            # ✅ ACEPTAR CUALQUIER MONTO SIN VALIDACIONES
+            user_data[phone_number] = {"monto_solicitado": monto}
+            
+            send_message(phone_number,
+                "🎉 *¡FELICIDADES!* Cumples con los requisitos para el préstamo IMSS Ley 73\n\n"
+                f"✅ Monto solicitado: ${monto:,.0f}\n\n"
+                "🌟 *BENEFICIOS DE TU PRÉSTAMO:*\n"
+                "• Monto desde $40,000 hasta $650,000\n"
+                "• Sin aval\n• Sin revisión en Buró\n"
+                "• Descuento directo de tu pensión\n"
+                "• Tasa preferencial"
+            )
+            
+            send_message(phone_number,
+                "💳 *PARA ACCEDER A BENEFICIOS ADICIONALES EXCLUSIVOS*:\n\n"
+                "¿Tienes tu pensión depositada en Inbursa o estarías dispuesto a cambiarla?\n\n"
+                "🌟 *BENEFICIOS ADICIONALES CON NÓMINA INBURSA:*\n"
+                "• Rendimientos del 80% de Cetes\n"
+                "• Devolución del 20% de intereses por pago puntual\n"
+                "• Anticipo de nómina hasta el 50%\n"
+                "• Seguro de vida y Medicall Home (telemedicina 24/7)\n"
+                "• Descuentos en Sanborns y 6,000 comercios\n"
+                "• Retiros sin comisión en +28,000 puntos\n\n"
+                "💡 *No necesitas cancelar tu cuenta actual*\n"
+                "👉 ¿Aceptas cambiar tu nómina a Inbursa? (sí/no)"
+            )
+            user_state[phone_number] = "esperando_respuesta_nomina"
         else:
             send_message(phone_number, "Por favor indica el monto deseado, ejemplo: 65000")
         return True
 
-    # Paso 4: validación nómina - NO DETENER PROCESO SI RESPONDE NO
+    # ✅ PASO 4 MODIFICADO: validación nómina - AGREGAR NUEVOS CAMPOS
     if user_state.get(phone_number) == "esperando_respuesta_nomina":
         if is_thankyou_message(msg):
             send_message(phone_number,
@@ -279,52 +266,98 @@ def handle_imss_flow(phone_number, user_message):
         data = user_data.get(phone_number, {})
         monto_solicitado = data.get('monto_solicitado', 'N/D')
         
-        if intent == 'positive':
-            send_message(phone_number,
-                "✅ *¡Excelente decisión!* Al cambiar tu nómina a Inbursa accederás a todos los beneficios adicionales.\n\n"
-                "📞 *Christian te contactará en breve* para:\n"
-                "• Confirmar los detalles de tu préstamo\n"
-                "• Explicarte todos los beneficios de nómina Inbursa\n"
-                "• Agendar el cambio de nómina si así lo decides\n\n"
-                "¡Gracias por confiar en Inbursa! 🏦"
-            )
-
-            mensaje_asesor = (
-                f"🔥 *NUEVO PROSPECTO IMSS LEY 73 - NÓMINA ACEPTADA*\n\n"
-                f"📞 Número: {phone_number}\n"
-                f"💵 Monto solicitado: ${monto_solicitado:,.0f}\n"
-                f"🏦 Nómina Inbursa: ✅ *ACEPTADA*\n"
-                f"🎯 *Cliente interesado en beneficios adicionales*"
-            )
-            send_message(ADVISOR_NUMBER, mensaje_asesor)
+        if intent == 'positive' or intent == 'negative':
+            # ✅ AGREGAR NUEVOS PASOS: nombre, teléfono, ciudad
+            if intent == 'positive':
+                send_message(phone_number,
+                    "✅ *¡Excelente decisión!* Al cambiar tu nómina a Inbursa accederás a todos los beneficios adicionales.\n\n"
+                    "Ahora necesitamos algunos datos de contacto:\n\n"
+                    "👤 ¿Cuál es tu nombre completo?"
+                )
+            else:
+                send_message(phone_number,
+                    "✅ *¡Perfecto!* Entiendo que por el momento prefieres mantener tu nómina actual.\n\n"
+                    "Ahora necesitamos algunos datos de contacto:\n\n"
+                    "👤 ¿Cuál es tu nombre completo?"
+                )
             
-        elif intent == 'negative':
-            send_message(phone_number,
-                "✅ *¡Perfecto!* Entiendo que por el momento prefieres mantener tu nómina actual.\n\n"
-                "📞 *Christian te contactará en breve* para:\n"
-                "• Confirmar los detalles de tu préstamo\n"
-                "• Explicarte el proceso de desembolso\n\n"
-                "💡 *Recuerda que en cualquier momento puedes cambiar tu nómina a Inbursa* "
-                "para acceder a los beneficios adicionales cuando lo desees.\n\n"
-                "¡Gracias por confiar en Inbursa! 🏦"
-            )
-
-            mensaje_asesor = (
-                f"📋 *NUEVO PROSPECTO IMSS LEY 73*\n\n"
-                f"📞 Número: {phone_number}\n"
-                f"💵 Monto solicitado: ${monto_solicitado:,.0f}\n"
-                f"🏦 Nómina Inbursa: ❌ *No por ahora*\n"
-                f"💡 *Cliente cumple requisitos - Contactar para préstamo básico*"
-            )
-            send_message(ADVISOR_NUMBER, mensaje_asesor)
+            user_data[phone_number]["nomina_inbursa"] = "ACEPTADA" if intent == 'positive' else "NO POR AHORA"
+            user_state[phone_number] = "esperando_nombre_imss"
+            
         else:
             send_message(phone_number, 
                 "Por favor responde *sí* o *no*:\n\n"
                 "• *SÍ* - Para acceder a todos los beneficios adicionales con nómina Inbursa\n"
                 "• *NO* - Para continuar con tu préstamo manteniendo tu nómina actual"
             )
-            return True
+        return True
 
+    # ✅ NUEVO PASO 5: Capturar nombre completo IMSS
+    if user_state.get(phone_number) == "esperando_nombre_imss":
+        if is_valid_name(user_message):
+            user_data[phone_number]["nombre_contacto"] = user_message.title()
+            send_message(phone_number,
+                f"✅ Nombre registrado: {user_message.title()}\n\n"
+                "📞 ¿En qué número telefónico podemos contactarte?\n\n"
+                "💡 Puedes proporcionar el mismo número de WhatsApp o uno diferente"
+            )
+            user_state[phone_number] = "esperando_telefono_imss"
+        else:
+            send_message(phone_number,
+                "Por favor ingresa un nombre válido (solo letras y espacios):\n\n"
+                "Ejemplo: Juan Pérez García"
+            )
+        return True
+
+    # ✅ NUEVO PASO 6: Capturar teléfono de contacto IMSS
+    if user_state.get(phone_number) == "esperando_telefono_imss":
+        if is_valid_phone(user_message):
+            user_data[phone_number]["telefono_contacto"] = user_message
+            send_message(phone_number,
+                f"✅ Teléfono registrado: {user_message}\n\n"
+                "🏙️ ¿En qué ciudad te encuentras?"
+            )
+            user_state[phone_number] = "esperando_ciudad_imss"
+        else:
+            send_message(phone_number,
+                "Por favor ingresa un número de teléfono válido (10 dígitos mínimo):\n\n"
+                "Ejemplo: 6681234567 o +526681234567"
+            )
+        return True
+
+    # ✅ NUEVO PASO 7: Capturar ciudad IMSS y finalizar
+    if user_state.get(phone_number) == "esperando_ciudad_imss":
+        user_data[phone_number]["ciudad"] = user_message.title()
+        
+        data = user_data.get(phone_number, {})
+        monto_solicitado = data.get('monto_solicitado', 'N/D')
+        nomina_status = data.get('nomina_inbursa', 'N/D')
+        nombre_contacto = data.get('nombre_contacto', 'N/D')
+        telefono_contacto = data.get('telefono_contacto', 'N/D')
+        ciudad = data.get('ciudad', 'N/D')
+
+        send_message(phone_number,
+            "🎉 *¡Excelente!* Hemos registrado tu solicitud de préstamo IMSS Ley 73.\n\n"
+            "📞 *Christian te contactará en breve* para:\n\n"
+            "• Confirmar los detalles de tu préstamo\n"
+            "• Explicarte el proceso de desembolso\n"
+            "• Agendar el cambio de nómina si así lo decidiste\n\n"
+            "¡Gracias por confiar en Inbursa! 🏦"
+        )
+
+        # ✅ NOTIFICACIÓN MEJORADA AL ASESOR CON TODOS LOS CAMPOS
+        mensaje_asesor = (
+            f"🔥 *NUEVO PROSPECTO IMSS LEY 73 - INFORMACIÓN COMPLETA*\n\n"
+            f"👤 Nombre: {nombre_contacto}\n"
+            f"📞 Teléfono WhatsApp: {phone_number}\n"
+            f"📱 Teléfono contacto: {telefono_contacto}\n"
+            f"🏙️ Ciudad: {ciudad}\n"
+            f"💵 Monto solicitado: ${monto_solicitado:,.0f}\n"
+            f"🏦 Nómina Inbursa: {nomina_status}\n\n"
+            f"🎯 *Cliente listo para contacto inmediato*"
+        )
+        send_message(ADVISOR_NUMBER, mensaje_asesor)
+        
         user_state.pop(phone_number, None)
         user_data.pop(phone_number, None)
         return True
@@ -619,7 +652,7 @@ def receive_message():
                 )
                 return jsonify({"status": "ok"}), 200
 
-            if user_state.get(phone_number) in ["esperando_respuesta_imss", "esperando_monto_solicitado", "esperando_respuesta_nomina"]:
+            if user_state.get(phone_number) in ["esperando_respuesta_imss", "esperando_monto_solicitado", "esperando_respuesta_nomina", "esperando_nombre_imss", "esperando_telefono_imss", "esperando_ciudad_imss"]:
                 if handle_imss_flow(phone_number, user_message):
                     return jsonify({"status": "ok"}), 200
 
