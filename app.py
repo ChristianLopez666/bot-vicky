@@ -109,7 +109,7 @@ def detect_imss_query(text):
     return any(k in text for k in keywords)
 
 def detect_empresarial_query(text):
-    keywords = ['crédito', 'empresa', 'negocio', 'financiamiento', 'empresarial', 'pyme', '2', '5']
+    keywords = ['crédito', 'empresa', 'negocio', 'financiamiento', 'empresarial', 'pyme', '5']
     text = text.lower()
     return any(k in text for k in keywords)
 
@@ -136,6 +136,7 @@ def funnel_imss(user_id, message):
         if resp == 'negative':
             send_main_menu(phone_number)
             user_state.pop(phone_number, None)
+            user_data.pop(phone_number, None)
             return jsonify({"status": "ok", "funnel": "imss"})
         elif resp == 'positive':
             send_message(phone_number,
@@ -163,6 +164,7 @@ def funnel_imss(user_id, message):
             )
             send_main_menu(phone_number)
             user_state.pop(phone_number, None)
+            user_data.pop(phone_number, None)
             return jsonify({"status": "ok", "funnel": "imss"})
         user_data[phone_number] = {"pension_mensual": monto}
         send_message(phone_number,
@@ -356,6 +358,17 @@ def funnel_empresarial(user_id, message):
 # ----------------------
 # ENDPOINT PRINCIPAL /webhook
 # ----------------------
+@app.route("/webhook", methods=["GET"])
+def verify_webhook():
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        logging.info("✅ Webhook verificado correctamente.")
+        return challenge, 200
+    logging.warning("❌ Verificación de webhook fallida.")
+    return "Forbidden", 403
+
 @app.route("/webhook", methods=["POST"])
 def receive_message():
     try:
@@ -376,13 +389,36 @@ def receive_message():
             user_message = message["text"]["body"].strip()
             logging.info(f"📱 Mensaje de {phone_number}: '{user_message}'")
 
-            # Embudo de venta maestro
-            if detect_imss_query(user_message):
+            # --- CORRECCIÓN: FLUJO MAESTRO CON ESTADO ---
+            current_state = user_state.get(phone_number)
+            # Si está en embudo IMSS, SIEMPRE enviar a funnel_imss
+            if current_state and current_state.startswith("imss_"):
                 return funnel_imss(phone_number, user_message)
-            if detect_empresarial_query(user_message):
+            # Si está en embudo empresarial, SIEMPRE enviar a funnel_empresarial
+            if current_state and current_state.startswith("emp_"):
                 return funnel_empresarial(phone_number, user_message)
 
-            # (Aquí puedes poner tus demás flujos y menú)
+            # Si es mensaje inicial, detectar palabra clave y arrancar embudo
+            if detect_imss_query(user_message):
+                user_state[phone_number] = "inicio_imss"
+                return funnel_imss(phone_number, user_message)
+            if detect_empresarial_query(user_message):
+                user_state[phone_number] = "inicio_empresarial"
+                return funnel_empresarial(phone_number, user_message)
+
+            # Comando de menú
+            if user_message.lower() in ["menu", "menú", "men", "opciones", "servicios"]:
+                user_state.pop(phone_number, None)
+                user_data.pop(phone_number, None)
+                send_main_menu(phone_number)
+                return jsonify({"status": "ok", "funnel": "menu"})
+
+            # Saludos genéricos
+            if user_message.lower() in ["hola", "hi", "hello", "buenas", "buenos días", "buenas tardes"]:
+                send_main_menu(phone_number)
+                return jsonify({"status": "ok", "funnel": "menu"})
+
+            # Si no entiende, muestra menú
             send_main_menu(phone_number)
             return jsonify({"status": "ok", "funnel": "menu"})
         else:
