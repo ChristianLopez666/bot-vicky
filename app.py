@@ -342,14 +342,89 @@ def handle_imss_flow(phone_number, user_message):
 # BLOQUE: FLUJO CRÉDITO EMPRESARIAL - MEJORADO CON DATOS DE CONTACTO
 # ---------------------------------------------------------------
 def handle_business_flow(phone_number, user_message):
-    # ... (sin cambios)
+    # ... (sin cambios en tu flujo empresarial)
     return False
 
 # ---------------------------------------------------------------
 # FLUJO PARA OPCIONES DEL MENÚ
 # ---------------------------------------------------------------
 def handle_menu_options(phone_number, user_message):
-    # ... (sin cambios)
+    """Maneja las opciones del menú principal."""
+    msg = user_message.lower().strip()
+    
+    menu_options = {
+        '1': 'imss',
+        'préstamo': 'imss',
+        'prestamo': 'imss',
+        'imss': 'imss',
+        'ley 73': 'imss',
+        '2': 'seguro_auto',
+        'seguro auto': 'seguro_auto',
+        'seguros de auto': 'seguro_auto',
+        'auto': 'seguro_auto',
+        '3': 'seguro_vida',
+        'seguro vida': 'seguro_vida',
+        'seguros de vida': 'seguro_vida',
+        'seguro salud': 'seguro_vida',
+        'vida': 'seguro_vida',
+        '4': 'vrim',
+        'tarjetas médicas': 'vrim',
+        'tarjetas medicas': 'vrim',
+        'vrim': 'vrim',
+        '5': 'empresarial',
+        'financiamiento empresarial': 'empresarial',
+        'empresa': 'empresarial',
+        'negocio': 'empresarial',
+        'pyme': 'empresarial',
+        'crédito empresarial': 'empresarial',
+        'credito empresarial': 'empresarial'
+    }
+    
+    option = menu_options.get(msg)
+    
+    if option == 'imss':
+        # Corrección: pasar el mensaje original del usuario, NO un string fijo
+        return handle_imss_flow(phone_number, user_message)
+    elif option == 'seguro_auto':
+        send_message(phone_number,
+            "🚗 *Seguros de Auto Inbursa*\n\n"
+            "Protege tu auto con las mejores coberturas:\n\n"
+            "✅ Cobertura amplia contra todo riesgo\n"
+            "✅ Asistencia vial las 24 horas\n"
+            "✅ Responsabilidad civil\n"
+            "✅ Robo total y parcial\n\n"
+            "📞 Un asesor se comunicará contigo para cotizar tu seguro."
+        )
+        send_message(ADVISOR_NUMBER, f"🚗 NUEVO INTERESADO EN SEGURO DE AUTO\n📞 {phone_number}")
+        return True
+    elif option == 'seguro_vida':
+        send_message(phone_number,
+            "🏥 *Seguros de Vida y Salud Inbursa*\n\n"
+            "Protege a tu familia y tu salud:\n\n"
+            "✅ Seguro de vida\n"
+            "✅ Gastos médicos mayores\n"
+            "✅ Hospitalización\n"
+            "✅ Atención médica las 24 horas\n\n"
+            "📞 Un asesor se comunicará contigo para explicarte las coberturas."
+        )
+        send_message(ADVISOR_NUMBER, f"🏥 NUEVO INTERESADO EN SEGURO VIDA/SALUD\n📞 {phone_number}")
+        return True
+    elif option == 'vrim':
+        send_message(phone_number,
+            "💳 *Tarjetas Médicas VRIM*\n\n"
+            "Accede a la mejor atención médica:\n\n"
+            "✅ Consultas médicas ilimitadas\n"
+            "✅ Especialistas y estudios de laboratorio\n"
+            "✅ Medicamentos con descuento\n"
+            "✅ Atención dental y oftalmológica\n\n"
+            "📞 Un asesor se comunicará contigo para explicarte los beneficios."
+        )
+        send_message(ADVISOR_NUMBER, f"💳 NUEVO INTERESADO EN TARJETAS VRIM\n📞 {phone_number}")
+        return True
+    elif option == 'empresarial':
+        user_state[phone_number] = "inicio_empresarial"
+        return handle_business_flow(phone_number, "inicio")
+    
     return False
 
 # ---------------------------------------------------------------
