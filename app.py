@@ -118,7 +118,7 @@ def is_gpt_command(msg):
     return re.match(r'^\s*gpt\s*:', msg.lower())
 
 # ---------------------------------------------------------------
-# EMBUDO PRÉSTAMO IMSS (Ley 73) con preguntas adicionales
+# EMBUDO PRÉSTAMO IMSS (Ley 73) con mensaje mejorado al finalizar
 # ---------------------------------------------------------------
 def funnel_prestamo_imss(user_id, user_message):
     state = user_state.get(user_id, "menu_mostrar_beneficios")
@@ -203,14 +203,14 @@ def funnel_prestamo_imss(user_id, user_message):
                 f"Estatus: Pensión baja, requiere opciones alternativas"
             )
             send_whatsapp_message(ADVISOR_NUMBER, formatted)
-            send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte: 👇")
+            send_message(user_id, "¡Listo! 🎁 Tu solicitud ha sido registrada. Si lo deseas, puedes consultar otros servicios financieros que podrían interesarte: 👇")
             send_main_menu(user_id)
             user_state.pop(user_id, None)
             user_data.pop(user_id, None)
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         else:
             send_message(user_id, "Perfecto, si deseas podemos continuar con otros servicios.")
-            send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte: 👇")
+            send_message(user_id, "¡Listo! 🎁 Tu solicitud ha sido registrada. Si lo deseas, puedes consultar otros servicios financieros que podrían interesarte: 👇")
             send_main_menu(user_id)
             user_state.pop(user_id, None)
             user_data.pop(user_id, None)
@@ -275,8 +275,9 @@ def funnel_prestamo_imss(user_id, user_message):
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         send_message(user_id,
             "¡Listo! 🎉 Tu crédito ha sido preautorizado.\n"
-            "Un asesor financiero (Christian López) se pondrá en contacto contigo para continuar con el trámite.\n"
-            "Gracias por tu confianza 🙌."
+            "En breve, un asesor financiero (Christian López) se pondrá en contacto contigo para continuar con tu trámite y resolver cualquier duda que tengas.\n"
+            "🙏 Gracias por confiar en nosotros. ¡Tu tranquilidad financiera es nuestra prioridad!\n\n"
+            "✨ Además, tenemos otros servicios financieros que podrían interesarte: 👇"
         )
         datos = user_data.get(user_id, {})
         formatted = (
@@ -290,7 +291,6 @@ def funnel_prestamo_imss(user_id, user_message):
             f"Observación: Nómina Inbursa: {datos.get('nomina_inbursa','N/D')}"
         )
         send_whatsapp_message(ADVISOR_NUMBER, formatted)
-        send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte: 👇")
         send_main_menu(user_id)
         user_state.pop(user_id, None)
         user_data.pop(user_id, None)
