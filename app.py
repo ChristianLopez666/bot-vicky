@@ -286,131 +286,130 @@ def receive_message():
         message = messages[0]
         phone_number = message.get("from")
         message_type = message.get("type")
-
-        # SOLO GPT BAJO COMANDO
+        user_message = ""
         if message_type == "text":
             user_message = message["text"]["body"].strip()
-            logging.info(f"📱 Mensaje de {phone_number}: '{user_message}'")
-
-            # Comando GPT: solo si comienza con "gpt:"
-            if user_message.lower().startswith("gpt:"):
-                prompt = user_message[4:].strip()
-                gpt_reply = ask_gpt(prompt)
-                send_message(phone_number, gpt_reply)
-                return jsonify({"status": "ok", "source": "gpt"})
-
-            # Menú principal: opciones
-            menu_options = {
-                "1": "prestamo_imss",
-                "préstamo": "prestamo_imss",
-                "prestamo": "prestamo_imss",
-                "imss": "prestamo_imss",
-                "ley 73": "prestamo_imss",
-                "pension": "prestamo_imss",
-                "pensión": "prestamo_imss",
-                "2": "seguro_auto",
-                "seguro auto": "seguro_auto",
-                "seguros de auto": "seguro_auto",
-                "auto": "seguro_auto",
-                "3": "seguro_vida",
-                "seguro vida": "seguro_vida",
-                "seguros de vida": "seguro_vida",
-                "seguro salud": "seguro_vida",
-                "vida": "seguro_vida",
-                "4": "vrim",
-                "tarjetas médicas": "vrim",
-                "tarjetas medicas": "vrim",
-                "vrim": "vrim",
-                "5": "empresarial",
-                "financiamiento empresarial": "empresarial",
-                "empresa": "empresarial",
-                "negocio": "empresarial",
-                "pyme": "empresarial",
-                "crédito empresarial": "empresarial",
-                "credito empresarial": "empresarial"
-            }
-
-            option = menu_options.get(user_message.lower())
-
-            # FLUJO IMSS: Si está en embudo, seguir el estado
-            current_state = user_state.get(phone_number)
-            if current_state and ("prestamo_imss" in current_state or "pregunta_" in current_state):
-                return funnel_prestamo_imss(phone_number, user_message)
-
-            # Opción 1: Iniciar embudo IMSS
-            if option == "prestamo_imss":
-                user_state[phone_number] = "menu_mostrar_beneficios"
-                return funnel_prestamo_imss(phone_number, user_message)
-
-            # Otros servicios - menú estándar
-            if option == "seguro_auto":
-                send_message(phone_number,
-                    "🚗 *Seguros de Auto Inbursa*\n\n"
-                    "Protege tu auto con las mejores coberturas:\n\n"
-                    "✅ Cobertura amplia contra todo riesgo\n"
-                    "✅ Asistencia vial las 24 horas\n"
-                    "✅ Responsabilidad civil\n"
-                    "✅ Robo total y parcial\n\n"
-                    "📞 Un asesor se comunicará contigo para cotizar tu seguro."
-                )
-                send_whatsapp_message(ADVISOR_NUMBER, f"🚗 NUEVO INTERESADO EN SEGURO DE AUTO\n📞 {phone_number}")
-                return jsonify({"status": "ok", "funnel": "menu"})
-            if option == "seguro_vida":
-                send_message(phone_number,
-                    "🏥 *Seguros de Vida y Salud Inbursa*\n\n"
-                    "Protege a tu familia y tu salud:\n\n"
-                    "✅ Seguro de vida\n"
-                    "✅ Gastos médicos mayores\n"
-                    "✅ Hospitalización\n"
-                    "✅ Atención médica las 24 horas\n\n"
-                    "📞 Un asesor se comunicará contigo para explicarte las coberturas."
-                )
-                send_whatsapp_message(ADVISOR_NUMBER, f"🏥 NUEVO INTERESADO EN SEGURO VIDA/SALUD\n📞 {phone_number}")
-                return jsonify({"status": "ok", "funnel": "menu"})
-            if option == "vrim":
-                send_message(phone_number,
-                    "💳 *Tarjetas Médicas VRIM*\n\n"
-                    "Accede a la mejor atención médica:\n\n"
-                    "✅ Consultas médicas ilimitadas\n"
-                    "✅ Especialistas y estudios de laboratorio\n"
-                    "✅ Medicamentos con descuento\n"
-                    "✅ Atención dental y oftalmológica\n\n"
-                    "📞 Un asesor se comunicará contigo para explicarte los beneficios."
-                )
-                send_whatsapp_message(ADVISOR_NUMBER, f"💳 NUEVO INTERESADO EN TARJETAS VRIM\n📞 {phone_number}")
-                return jsonify({"status": "ok", "funnel": "menu"})
-            if option == "empresarial":
-                send_message(phone_number,
-                    "🏢 *Financiamiento Empresarial Inbursa*\n\n"
-                    "Impulsa el crecimiento de tu negocio con:\n\n"
-                    "✅ Créditos desde $100,000 hasta $100,000,000\n"
-                    "✅ Tasas preferenciales\n"
-                    "✅ Plazos flexibles\n"
-                    "✅ Asesoría especializada\n\n"
-                    "📞 Un asesor se pondrá en contacto contigo para analizar tu proyecto."
-                )
-                send_whatsapp_message(ADVISOR_NUMBER, f"🏢 NUEVO INTERESADO EN FINANCIAMIENTO EMPRESARIAL\n📞 {phone_number}")
-                return jsonify({"status": "ok", "funnel": "menu"})
-
-            # Comando de menú
-            if user_message.lower() in ["menu", "menú", "men", "opciones", "servicios"]:
-                user_state.pop(phone_number, None)
-                user_data.pop(phone_number, None)
-                send_main_menu(phone_number)
-                return jsonify({"status": "ok", "funnel": "menu"})
-
-            if user_message.lower() in ["hola", "hi", "hello", "buenas", "buenos días", "buenas tardes"]:
-                send_main_menu(phone_number)
-                return jsonify({"status": "ok", "funnel": "menu"})
-
-            send_main_menu(phone_number)
-            return jsonify({"status": "ok", "funnel": "menu"})
         else:
             send_message(phone_number, 
                 "Por ahora solo puedo procesar mensajes de texto 📩\n\n"
                 "Escribe *menú* para ver los servicios disponibles."
             )
             return jsonify({"status": "ok"}), 200
+
+        logging.info(f"📱 Mensaje de {phone_number}: '{user_message}'")
+
+        # GPT SOLO BAJO COMANDO
+        if user_message.lower().startswith("gpt:"):
+            prompt = user_message[4:].strip()
+            gpt_reply = ask_gpt(prompt)
+            send_message(phone_number, gpt_reply)
+            return jsonify({"status": "ok", "source": "gpt"})
+
+        menu_options = {
+            "1": "prestamo_imss",
+            "préstamo": "prestamo_imss",
+            "prestamo": "prestamo_imss",
+            "imss": "prestamo_imss",
+            "ley 73": "prestamo_imss",
+            "pension": "prestamo_imss",
+            "pensión": "prestamo_imss",
+            "2": "seguro_auto",
+            "seguro auto": "seguro_auto",
+            "seguros de auto": "seguro_auto",
+            "auto": "seguro_auto",
+            "3": "seguro_vida",
+            "seguro vida": "seguro_vida",
+            "seguros de vida": "seguro_vida",
+            "seguro salud": "seguro_vida",
+            "vida": "seguro_vida",
+            "4": "vrim",
+            "tarjetas médicas": "vrim",
+            "tarjetas medicas": "vrim",
+            "vrim": "vrim",
+            "5": "empresarial",
+            "financiamiento empresarial": "empresarial",
+            "empresa": "empresarial",
+            "negocio": "empresarial",
+            "pyme": "empresarial",
+            "crédito empresarial": "empresarial",
+            "credito empresarial": "empresarial"
+        }
+
+        option = menu_options.get(user_message.lower())
+
+        # FLUJO IMSS: Si está en embudo, seguir el estado
+        current_state = user_state.get(phone_number)
+        if current_state and ("prestamo_imss" in current_state or "pregunta_" in current_state):
+            return funnel_prestamo_imss(phone_number, user_message)
+
+        # Opción 1: Iniciar embudo IMSS
+        if option == "prestamo_imss":
+            user_state[phone_number] = "menu_mostrar_beneficios"
+            return funnel_prestamo_imss(phone_number, user_message)
+
+        # Otros servicios - menú estándar
+        if option == "seguro_auto":
+            send_message(phone_number,
+                "🚗 *Seguros de Auto Inbursa*\n\n"
+                "Protege tu auto con las mejores coberturas:\n\n"
+                "✅ Cobertura amplia contra todo riesgo\n"
+                "✅ Asistencia vial las 24 horas\n"
+                "✅ Responsabilidad civil\n"
+                "✅ Robo total y parcial\n\n"
+                "📞 Un asesor se comunicará contigo para cotizar tu seguro."
+            )
+            send_whatsapp_message(ADVISOR_NUMBER, f"🚗 NUEVO INTERESADO EN SEGURO DE AUTO\n📞 {phone_number}")
+            return jsonify({"status": "ok", "funnel": "menu"})
+        if option == "seguro_vida":
+            send_message(phone_number,
+                "🏥 *Seguros de Vida y Salud Inbursa*\n\n"
+                "Protege a tu familia y tu salud:\n\n"
+                "✅ Seguro de vida\n"
+                "✅ Gastos médicos mayores\n"
+                "✅ Hospitalización\n"
+                "✅ Atención médica las 24 horas\n\n"
+                "📞 Un asesor se comunicará contigo para explicarte las coberturas."
+            )
+            send_whatsapp_message(ADVISOR_NUMBER, f"🏥 NUEVO INTERESADO EN SEGURO VIDA/SALUD\n📞 {phone_number}")
+            return jsonify({"status": "ok", "funnel": "menu"})
+        if option == "vrim":
+            send_message(phone_number,
+                "💳 *Tarjetas Médicas VRIM*\n\n"
+                "Accede a la mejor atención médica:\n\n"
+                "✅ Consultas médicas ilimitadas\n"
+                "✅ Especialistas y estudios de laboratorio\n"
+                "✅ Medicamentos con descuento\n"
+                "✅ Atención dental y oftalmológica\n\n"
+                "📞 Un asesor se comunicará contigo para explicarte los beneficios."
+            )
+            send_whatsapp_message(ADVISOR_NUMBER, f"💳 NUEVO INTERESADO EN TARJETAS VRIM\n📞 {phone_number}")
+            return jsonify({"status": "ok", "funnel": "menu"})
+        if option == "empresarial":
+            send_message(phone_number,
+                "🏢 *Financiamiento Empresarial Inbursa*\n\n"
+                "Impulsa el crecimiento de tu negocio con:\n\n"
+                "✅ Créditos desde $100,000 hasta $100,000,000\n"
+                "✅ Tasas preferenciales\n"
+                "✅ Plazos flexibles\n"
+                "✅ Asesoría especializada\n\n"
+                "📞 Un asesor se pondrá en contacto contigo para analizar tu proyecto."
+            )
+            send_whatsapp_message(ADVISOR_NUMBER, f"🏢 NUEVO INTERESADO EN FINANCIAMIENTO EMPRESARIAL\n📞 {phone_number}")
+            return jsonify({"status": "ok", "funnel": "menu"})
+
+        # Comando de menú
+        if user_message.lower() in ["menu", "menú", "men", "opciones", "servicios"]:
+            user_state.pop(phone_number, None)
+            user_data.pop(phone_number, None)
+            send_main_menu(phone_number)
+            return jsonify({"status": "ok", "funnel": "menu"})
+
+        if user_message.lower() in ["hola", "hi", "hello", "buenas", "buenos días", "buenas tardes"]:
+            send_main_menu(phone_number)
+            return jsonify({"status": "ok", "funnel": "menu"})
+
+        send_main_menu(phone_number)
+        return jsonify({"status": "ok", "funnel": "menu"})
 
     except Exception as e:
         logging.exception(f"❌ Error en receive_message: {e}")
