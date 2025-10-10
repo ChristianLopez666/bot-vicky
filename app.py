@@ -99,7 +99,7 @@ def send_main_menu(phone):
     send_message(phone, menu)
 
 # ---------------------------------------------------------------
-# Integración GPT bajo comando y durante embudo
+# GPT SOLO BAJO COMANDO (NO SUGERIR)
 # ---------------------------------------------------------------
 def ask_gpt(prompt, model="gpt-3.5-turbo", temperature=0.7):
     try:
@@ -118,20 +118,9 @@ def is_gpt_command(msg):
     return re.match(r'^\s*gpt\s*:', msg.lower())
 
 # ---------------------------------------------------------------
-# EMBUDO PRÉSTAMO IMSS (Ley 73) con preguntas adicionales y GPT
+# EMBUDO PRÉSTAMO IMSS (Ley 73) con preguntas adicionales
 # ---------------------------------------------------------------
 def funnel_prestamo_imss(user_id, user_message):
-    # GPT dentro del embudo
-    if is_gpt_command(user_message):
-        prompt = user_message.split(":",1)[1].strip()
-        if not prompt:
-            send_message(user_id, "Para consultar a GPT, escribe tu pregunta después de 'gpt:'. Ejemplo:\n gpt: ¿Cuáles son los requisitos para el crédito?")
-            return jsonify({"status": "ok", "funnel": "prestamo_imss"})
-        gpt_reply = ask_gpt(prompt)
-        send_message(user_id, gpt_reply)
-        send_message(user_id, "¿Quieres seguir con tu proceso IMSS? Responde la pregunta pendiente o escribe *menú* para ver servicios.")
-        return jsonify({"status": "ok", "funnel": "prestamo_imss"})
-
     state = user_state.get(user_id, "menu_mostrar_beneficios")
     datos = user_data.get(user_id, {})
 
@@ -154,7 +143,7 @@ def funnel_prestamo_imss(user_id, user_message):
             "*(Estos beneficios son adicionales y no son obligatorios para obtener tu crédito.)*"
         )
         send_message(user_id,
-            "¿Eres pensionado o jubilado del IMSS bajo la Ley 73?\n\n¿Tienes una duda? Escribe gpt: tu pregunta."
+            "¿Eres pensionado o jubilado del IMSS bajo la Ley 73?"
         )
         user_state[user_id] = "pregunta_pensionado"
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
@@ -169,31 +158,31 @@ def funnel_prestamo_imss(user_id, user_message):
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         elif resp == "positive":
             send_message(user_id,
-                "¿Cuánto recibes aproximadamente al mes por concepto de pensión?\n\n¿Tienes una duda? Escribe gpt: tu pregunta."
+                "¿Cuánto recibes aproximadamente al mes por concepto de pensión?"
             )
             user_state[user_id] = "pregunta_monto_pension"
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         else:
-            send_message(user_id, "Por favor responde *sí* o *no* para continuar. (o escribe gpt: tu pregunta)")
+            send_message(user_id, "Por favor responde *sí* o *no* para continuar.")
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
     # Paso 2: Monto de pensión
     if state == "pregunta_monto_pension":
         monto_pension = extract_number(user_message)
         if monto_pension is None:
-            send_message(user_id, "Indica el monto mensual que recibes por pensión, ejemplo: 6500\n\n¿Tienes una duda? Escribe gpt: tu pregunta.")
+            send_message(user_id, "Indica el monto mensual que recibes por pensión, ejemplo: 6500")
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         if monto_pension < 5000:
             send_message(user_id,
                 "Por ahora los créditos disponibles aplican a pensiones a partir de $5,000.\n"
-                "Pero puedo notificar a nuestro asesor para ofrecerte otra opción sin compromiso. ¿Deseas que lo haga?\n\n¿Tienes una duda? Escribe gpt: tu pregunta."
+                "Pero puedo notificar a nuestro asesor para ofrecerte otra opción sin compromiso. ¿Deseas que lo haga?"
             )
             user_state[user_id] = "pregunta_ofrecer_asesor"
             user_data[user_id] = {"pension_mensual": monto_pension}
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         user_data[user_id] = {"pension_mensual": monto_pension}
         send_message(user_id,
-            "Perfecto 👏 ¿Qué monto de préstamo te gustaría solicitar? (mínimo $40,000)\n\n¿Tienes una duda? Escribe gpt: tu pregunta."
+            "Perfecto 👏 ¿Qué monto de préstamo te gustaría solicitar? (mínimo $40,000)"
         )
         user_state[user_id] = "pregunta_monto_solicitado"
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
@@ -214,14 +203,14 @@ def funnel_prestamo_imss(user_id, user_message):
                 f"Estatus: Pensión baja, requiere opciones alternativas"
             )
             send_whatsapp_message(ADVISOR_NUMBER, formatted)
-            send_message(user_id, "¡Además, tenemos otros servicios financieros que podrían interesarte! 👇")
+            send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte: 👇")
             send_main_menu(user_id)
             user_state.pop(user_id, None)
             user_data.pop(user_id, None)
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         else:
             send_message(user_id, "Perfecto, si deseas podemos continuar con otros servicios.")
-            send_message(user_id, "¡Además, tenemos otros servicios financieros que podrían interesarte! 👇")
+            send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte: 👇")
             send_main_menu(user_id)
             user_state.pop(user_id, None)
             user_data.pop(user_id, None)
@@ -231,11 +220,11 @@ def funnel_prestamo_imss(user_id, user_message):
     if state == "pregunta_monto_solicitado":
         monto_solicitado = extract_number(user_message)
         if monto_solicitado is None or monto_solicitado < 40000:
-            send_message(user_id, "Indica el monto que deseas solicitar (mínimo $40,000), ejemplo: 65000\n\n¿Tienes una duda? Escribe gpt: tu pregunta.")
+            send_message(user_id, "Indica el monto que deseas solicitar (mínimo $40,000), ejemplo: 65000")
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         user_data[user_id]["monto_solicitado"] = monto_solicitado
         send_message(user_id,
-            "¿Cuál es tu nombre completo?\n\n¿Tienes una duda? Escribe gpt: tu pregunta."
+            "¿Cuál es tu nombre completo?"
         )
         user_state[user_id] = "pregunta_nombre"
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
@@ -244,7 +233,7 @@ def funnel_prestamo_imss(user_id, user_message):
     if state == "pregunta_nombre":
         user_data[user_id]["nombre"] = user_message.title()
         send_message(user_id,
-            "¿Cuál es tu teléfono de contacto?\n\n¿Tienes una duda? Escribe gpt: tu pregunta."
+            "¿Cuál es tu teléfono de contacto?"
         )
         user_state[user_id] = "pregunta_telefono"
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
@@ -253,7 +242,7 @@ def funnel_prestamo_imss(user_id, user_message):
     if state == "pregunta_telefono":
         user_data[user_id]["telefono_contacto"] = user_message
         send_message(user_id,
-            "¿En qué ciudad vives?\n\n¿Tienes una duda? Escribe gpt: tu pregunta."
+            "¿En qué ciudad vives?"
         )
         user_state[user_id] = "pregunta_ciudad"
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
@@ -262,7 +251,7 @@ def funnel_prestamo_imss(user_id, user_message):
     if state == "pregunta_ciudad":
         user_data[user_id]["ciudad"] = user_message.title()
         send_message(user_id,
-            "¿Ya recibes tu pensión en Inbursa?\n\n¿Tienes una duda? Escribe gpt: tu pregunta."
+            "¿Ya recibes tu pensión en Inbursa?"
         )
         user_state[user_id] = "pregunta_nomina_inbursa"
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
@@ -282,7 +271,7 @@ def funnel_prestamo_imss(user_id, user_message):
             )
             user_data[user_id]["nomina_inbursa"] = "No"
         else:
-            send_message(user_id, "Por favor responde *sí* o *no* para continuar. (o escribe gpt: tu pregunta)")
+            send_message(user_id, "Por favor responde *sí* o *no* para continuar.")
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         send_message(user_id,
             "¡Listo! 🎉 Tu crédito ha sido preautorizado.\n"
@@ -301,7 +290,7 @@ def funnel_prestamo_imss(user_id, user_message):
             f"Observación: Nómina Inbursa: {datos.get('nomina_inbursa','N/D')}"
         )
         send_whatsapp_message(ADVISOR_NUMBER, formatted)
-        send_message(user_id, "¡Además, tenemos otros servicios financieros que podrían interesarte! 👇")
+        send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte: 👇")
         send_main_menu(user_id)
         user_state.pop(user_id, None)
         user_data.pop(user_id, None)
@@ -403,7 +392,7 @@ def receive_message():
             user_state[phone_number] = "menu_mostrar_beneficios"
             return funnel_prestamo_imss(phone_number, user_message)
 
-        # Otros servicios - menú estándar, con apoyo de GPT si el usuario lo pide
+        # Otros servicios - menú estándar
         if option == "seguro_auto":
             send_message(phone_number,
                 "🚗 *Seguros de Auto Inbursa*\n\n"
@@ -412,7 +401,6 @@ def receive_message():
                 "✅ Asistencia vial las 24 horas\n"
                 "✅ Responsabilidad civil\n"
                 "✅ Robo total y parcial\n\n"
-                "¿Tienes una duda? Escribe gpt: tu pregunta.\n"
                 "📞 Un asesor se comunicará contigo para cotizar tu seguro."
             )
             send_whatsapp_message(ADVISOR_NUMBER, f"🚗 NUEVO INTERESADO EN SEGURO DE AUTO\n📞 {phone_number}")
@@ -425,7 +413,6 @@ def receive_message():
                 "✅ Gastos médicos mayores\n"
                 "✅ Hospitalización\n"
                 "✅ Atención médica las 24 horas\n\n"
-                "¿Tienes una duda? Escribe gpt: tu pregunta.\n"
                 "📞 Un asesor se comunicará contigo para explicarte las coberturas."
             )
             send_whatsapp_message(ADVISOR_NUMBER, f"🏥 NUEVO INTERESADO EN SEGURO VIDA/SALUD\n📞 {phone_number}")
@@ -438,7 +425,6 @@ def receive_message():
                 "✅ Especialistas y estudios de laboratorio\n"
                 "✅ Medicamentos con descuento\n"
                 "✅ Atención dental y oftalmológica\n\n"
-                "¿Tienes una duda? Escribe gpt: tu pregunta.\n"
                 "📞 Un asesor se comunicará contigo para explicarte los beneficios."
             )
             send_whatsapp_message(ADVISOR_NUMBER, f"💳 NUEVO INTERESADO EN TARJETAS VRIM\n📞 {phone_number}")
@@ -451,7 +437,6 @@ def receive_message():
                 "✅ Tasas preferenciales\n"
                 "✅ Plazos flexibles\n"
                 "✅ Asesoría especializada\n\n"
-                "¿Tienes una duda? Escribe gpt: tu pregunta.\n"
                 "📞 Un asesor se pondrá en contacto contigo para analizar tu proyecto."
             )
             send_whatsapp_message(ADVISOR_NUMBER, f"🏢 NUEVO INTERESADO EN FINANCIAMIENTO EMPRESARIAL\n📞 {phone_number}")
