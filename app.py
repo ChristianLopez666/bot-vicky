@@ -118,7 +118,7 @@ def is_gpt_command(msg):
     return re.match(r'^\s*gpt\s*:', msg.lower())
 
 # ---------------------------------------------------------------
-# EMBUDO PRÉSTAMO IMSS (Ley 73) con mensaje mejorado al finalizar
+# EMBUDO PRÉSTAMO IMSS (Ley 73) con preguntas adicionales
 # ---------------------------------------------------------------
 def funnel_prestamo_imss(user_id, user_message):
     state = user_state.get(user_id, "menu_mostrar_beneficios")
@@ -203,14 +203,14 @@ def funnel_prestamo_imss(user_id, user_message):
                 f"Estatus: Pensión baja, requiere opciones alternativas"
             )
             send_whatsapp_message(ADVISOR_NUMBER, formatted)
-            send_message(user_id, "¡Listo! 🎁 Tu solicitud ha sido registrada. Si lo deseas, puedes consultar otros servicios financieros que podrían interesarte: 👇")
+            send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte: 👇")
             send_main_menu(user_id)
             user_state.pop(user_id, None)
             user_data.pop(user_id, None)
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         else:
             send_message(user_id, "Perfecto, si deseas podemos continuar con otros servicios.")
-            send_message(user_id, "¡Listo! 🎁 Tu solicitud ha sido registrada. Si lo deseas, puedes consultar otros servicios financieros que podrían interesarte: 👇")
+            send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte: 👇")
             send_main_menu(user_id)
             user_state.pop(user_id, None)
             user_data.pop(user_id, None)
@@ -275,9 +275,8 @@ def funnel_prestamo_imss(user_id, user_message):
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         send_message(user_id,
             "¡Listo! 🎉 Tu crédito ha sido preautorizado.\n"
-            "En breve, un asesor financiero (Christian López) se pondrá en contacto contigo para continuar con tu trámite y resolver cualquier duda que tengas.\n"
-            "🙏 Gracias por confiar en nosotros. ¡Tu tranquilidad financiera es nuestra prioridad!\n\n"
-            "✨ Además, tenemos otros servicios financieros que podrían interesarte: 👇"
+            "Un asesor financiero (Christian López) se pondrá en contacto contigo para continuar con el trámite.\n"
+            "Gracias por tu confianza 🙌."
         )
         datos = user_data.get(user_id, {})
         formatted = (
@@ -291,6 +290,7 @@ def funnel_prestamo_imss(user_id, user_message):
             f"Observación: Nómina Inbursa: {datos.get('nomina_inbursa','N/D')}"
         )
         send_whatsapp_message(ADVISOR_NUMBER, formatted)
+        send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte: 👇")
         send_main_menu(user_id)
         user_state.pop(user_id, None)
         user_data.pop(user_id, None)
@@ -466,6 +466,44 @@ def receive_message():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "Vicky Bot Inbursa"}), 200
+
+# ---------------------------------------------------------------
+# NUEVA FUNCIÓN: Enviar mensaje plantilla promocional campaña
+# ---------------------------------------------------------------
+def send_campaign_message(phone_number, nombre):
+    """
+    Envía un mensaje tipo plantilla promocional usando la API de WhatsApp Business.
+    La plantilla se llama "credito_imss_promocion_1" en idioma "es_MX".
+    El nombre del prospecto se incluye como parámetro {{1}}.
+    """
+    try:
+        url = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
+        headers = {
+            "Authorization": f"Bearer {META_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": str(phone_number),
+            "type": "template",
+            "template": {
+                "name": "credito_imss_promocion_1",
+                "language": {"code": "es_MX"},
+                "components": [
+                    {
+                        "type": "body",
+                        "parameters": [
+                            {"type": "text", "text": str(nombre)}
+                        ]
+                    }
+                ]
+            }
+        }
+        response = requests.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        logging.info(f"✅ Mensaje campaña enviado a {phone_number} ({nombre})")
+    except Exception as e:
+        logging.exception(f"❌ Error en send_campaign_message: {e}")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
