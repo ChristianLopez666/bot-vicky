@@ -51,6 +51,9 @@ openai.api_key = OPENAI_API_KEY
 def consultar_gpt(mensaje, contexto=""):
     """Consulta a GPT para interpretación de intenciones mejorada"""
     try:
+        if not OPENAI_API_KEY:
+            return interpret_response_tradicional(mensaje)
+            
         prompt = f"""
         Eres un asistente especializado en préstamos IMSS. 
         Contexto: {contexto}
@@ -86,7 +89,28 @@ def consultar_gpt(mensaje, contexto=""):
         
     except Exception as e:
         logging.error(f"❌ Error GPT: {e}")
-        return 'neutral'
+        return interpret_response_tradicional(mensaje)
+
+def interpret_response_tradicional(text):
+    """Lógica tradicional de interpretación como respaldo"""
+    text_lower = (text or '').lower()
+    positive_keywords = ['sí', 'si', 'sip', 'claro', 'por supuesto', 'ok', 'vale', 'afirmativo', 'acepto', 'yes', 'correcto', 'por su puesto']
+    negative_keywords = ['no', 'nop', 'negativo', 'para nada', 'no acepto', 'not', 'nel', 'negativo']
+    
+    if any(k in text_lower for k in positive_keywords):
+        return 'positive'
+    if any(k in text_lower for k in negative_keywords):
+        return 'negative'
+    return 'neutral'
+
+def interpret_response(text, contexto=""):
+    """Interpreta respuestas afirmativas/negativas con GPT como respaldo."""
+    intent_tradicional = interpret_response_tradicional(text)
+    
+    if intent_tradicional != 'neutral':
+        return intent_tradicional
+    
+    return consultar_gpt(text, contexto)
 
 # ---------------------------------------------------------------
 # Función: enviar mensaje por WhatsApp (Meta Cloud API)
@@ -113,9 +137,6 @@ def send_message(to, text):
     except Exception as e:
         logging.exception(f"❌ Error en send_message: {e}")
 
-# ---------------------------------------------------------------
-# Función auxiliar: extraer número de texto
-# ---------------------------------------------------------------
 def extract_number(text):
     """Extrae el primer número encontrado dentro del texto."""
     if not text:
@@ -131,28 +152,6 @@ def extract_number(text):
             return None
     return None
 
-# ---------------------------------------------------------------
-# Función: interpretar respuestas sí/no MEJORADA CON GPT
-# ---------------------------------------------------------------
-def interpret_response(text, contexto=""):
-    """Interpreta respuestas afirmativas/negativas con GPT como respaldo."""
-    text_lower = (text or '').lower()
-    
-    # Primero intentar con lógica simple (más rápido)
-    positive_keywords = ['sí', 'si', 'sip', 'claro', 'por supuesto', 'ok', 'vale', 'afirmativo', 'acepto', 'yes', 'correcto']
-    negative_keywords = ['no', 'nop', 'negativo', 'para nada', 'no acepto', 'not', 'nel']
-    
-    if any(k in text_lower for k in positive_keywords):
-        return 'positive'
-    if any(k in text_lower for k in negative_keywords):
-        return 'negative'
-    
-    # Si no es claro, usar GPT
-    return consultar_gpt(text, contexto)
-
-# ---------------------------------------------------------------
-# Función: detectar agradecimientos
-# ---------------------------------------------------------------
 def is_thankyou_message(text):
     """Detecta mensajes de agradecimiento."""
     text_lower = text.lower().strip()
@@ -162,32 +161,21 @@ def is_thankyou_message(text):
     ]
     return any(keyword in text_lower for keyword in thankyou_keywords)
 
-# ---------------------------------------------------------------
-# Función: validar nombre
-# ---------------------------------------------------------------
 def is_valid_name(text):
     """Valida que el texto sea un nombre válido."""
     if not text or len(text.strip()) < 2:
         return False
-    # Verificar que contenga solo letras, espacios y algunos caracteres especiales comunes en nombres
     if re.match(r'^[a-zA-ZáéíóúÁÉÍÓÚñÑüÜ\s\.\-]+$', text.strip()):
         return True
     return False
 
-# ---------------------------------------------------------------
-# Función: validar teléfono
-# ---------------------------------------------------------------
 def is_valid_phone(text):
     """Valida que el texto sea un teléfono válido."""
     if not text:
         return False
-    # Limpiar y verificar formato de teléfono
     clean_phone = re.sub(r'[\s\-\(\)\+]', '', text)
     return re.match(r'^\d{10,15}$', clean_phone) is not None
 
-# ---------------------------------------------------------------
-# MENÚ PRINCIPAL MEJORADO
-# ---------------------------------------------------------------
 def send_main_menu(phone):
     menu = (
         "🏦 *INBURSA - SERVICIOS DISPONIBLES*\n\n"
@@ -200,9 +188,6 @@ def send_main_menu(phone):
     )
     send_message(phone, menu)
 
-# ---------------------------------------------------------------
-# Función: manejar comando menu
-# ---------------------------------------------------------------
 def handle_menu_command(phone_number):
     """Maneja el comando menu para reiniciar la conversación"""
     user_state.pop(phone_number, None)
@@ -220,17 +205,12 @@ def handle_menu_command(phone_number):
     )
     send_message(phone_number, menu_text)
 
-# ---------------------------------------------------------------
-# BLOQUE PRINCIPAL: FLUJO PRÉSTAMO IMSS LEY 73 - MODIFICADO
-# ---------------------------------------------------------------
 def handle_imss_flow(phone_number, user_message):
     """Gestiona el flujo completo del préstamo IMSS Ley 73."""
     msg = user_message.lower()
 
-    # Detección mejorada de palabras clave IMSS - INCLUYE NÚMERO 1
     imss_keywords = ["préstamo", "prestamo", "imss", "pensión", "pension", "ley 73", "1"]
     
-    # Paso 1: activación inicial por palabras clave
     if any(keyword in msg for keyword in imss_keywords):
         current_state = user_state.get(phone_number)
         if current_state not in ["esperando_respuesta_imss", "esperando_monto_solicitado", "esperando_respuesta_nomina", "esperando_nombre_imss", "esperando_telefono_imss", "esperando_ciudad_imss"]:
@@ -241,7 +221,6 @@ def handle_imss_flow(phone_number, user_message):
             user_state[phone_number] = "esperando_respuesta_imss"
         return True
 
-    # Paso 2: validación de respuesta IMSS - CON GPT
     if user_state.get(phone_number) == "esperando_respuesta_imss":
         intent = interpret_response(msg, "confirmar si es pensionado IMSS")
         if intent == 'negative':
@@ -264,7 +243,6 @@ def handle_imss_flow(phone_number, user_message):
             )
         return True
 
-    # ✅ PASO 3 MODIFICADO: monto solicitado - ELIMINAR VALIDACIONES
     if user_state.get(phone_number) == "esperando_monto_solicitado":
         if is_thankyou_message(msg):
             send_message(phone_number,
@@ -276,7 +254,6 @@ def handle_imss_flow(phone_number, user_message):
             
         monto = extract_number(msg)
         if monto is not None:
-            # ✅ ACEPTAR CUALQUIER MONTO SIN VALIDACIONES
             user_data[phone_number] = {"monto_solicitado": monto}
             
             send_message(phone_number,
@@ -307,7 +284,6 @@ def handle_imss_flow(phone_number, user_message):
             send_message(phone_number, "Por favor indica el monto deseado, ejemplo: 65000")
         return True
 
-    # ✅ PASO 4 MODIFICADO: validación nómina - CON GPT
     if user_state.get(phone_number) == "esperando_respuesta_nomina":
         if is_thankyou_message(msg):
             send_message(phone_number,
@@ -323,7 +299,6 @@ def handle_imss_flow(phone_number, user_message):
         monto_solicitado = data.get('monto_solicitado', 'N/D')
         
         if intent == 'positive' or intent == 'negative':
-            # ✅ AGREGAR NUEVOS PASOS: nombre, teléfono, ciudad
             if intent == 'positive':
                 send_message(phone_number,
                     "✅ *¡Excelente decisión!* Al cambiar tu nómina a Inbursa accederás a todos los beneficios adicionales.\n\n"
@@ -348,7 +323,6 @@ def handle_imss_flow(phone_number, user_message):
             )
         return True
 
-    # ✅ NUEVO PASO 5: Capturar nombre completo IMSS
     if user_state.get(phone_number) == "esperando_nombre_imss":
         if is_valid_name(user_message):
             user_data[phone_number]["nombre_contacto"] = user_message.title()
@@ -365,7 +339,6 @@ def handle_imss_flow(phone_number, user_message):
             )
         return True
 
-    # ✅ NUEVO PASO 6: Capturar teléfono de contacto IMSS
     if user_state.get(phone_number) == "esperando_telefono_imss":
         if is_valid_phone(user_message):
             user_data[phone_number]["telefono_contacto"] = user_message
@@ -381,7 +354,6 @@ def handle_imss_flow(phone_number, user_message):
             )
         return True
 
-    # ✅ NUEVO PASO 7: Capturar ciudad IMSS y finalizar
     if user_state.get(phone_number) == "esperando_ciudad_imss":
         user_data[phone_number]["ciudad"] = user_message.title()
         
@@ -401,7 +373,6 @@ def handle_imss_flow(phone_number, user_message):
             "¡Gracias por confiar en Inbursa! 🏦"
         )
 
-        # ✅ NOTIFICACIÓN MEJORADA AL ASESOR CON TODOS LOS CAMPOS
         mensaje_asesor = (
             f"🔥 *NUEVO PROSPECTO IMSS LEY 73 - INFORMACIÓN COMPLETA*\n\n"
             f"👤 Nombre: {nombre_contacto}\n"
@@ -420,14 +391,10 @@ def handle_imss_flow(phone_number, user_message):
 
     return False
 
-# ---------------------------------------------------------------
-# BLOQUE: FLUJO CRÉDITO EMPRESARIAL - MEJORADO CON DATOS DE CONTACTO
-# ---------------------------------------------------------------
 def handle_business_flow(phone_number, user_message):
     """Gestiona el flujo completo de crédito empresarial."""
     msg = user_message.lower()
 
-    # Paso 1: Inicio del flujo empresarial
     if user_state.get(phone_number) == "inicio_empresarial":
         send_message(phone_number,
             "🏢 *Financiamiento Empresarial Inbursa*\n\n"
@@ -446,7 +413,6 @@ def handle_business_flow(phone_number, user_message):
         user_state[phone_number] = "esperando_tipo_credito"
         return True
 
-    # Paso 2: Capturar tipo de crédito
     if user_state.get(phone_number) == "esperando_tipo_credito":
         user_data[phone_number] = {"tipo_credito": user_message}
         send_message(phone_number,
@@ -455,7 +421,6 @@ def handle_business_flow(phone_number, user_message):
         user_state[phone_number] = "esperando_giro_empresa"
         return True
 
-    # Paso 3: Capturar giro de la empresa
     if user_state.get(phone_number) == "esperando_giro_empresa":
         user_data[phone_number]["giro_empresa"] = user_message
         send_message(phone_number,
@@ -467,7 +432,6 @@ def handle_business_flow(phone_number, user_message):
         user_state[phone_number] = "esperando_monto_empresarial"
         return True
 
-    # Paso 4: Capturar monto solicitado
     if user_state.get(phone_number) == "esperando_monto_empresarial":
         monto = extract_number(msg)
         if monto is not None:
@@ -495,7 +459,6 @@ def handle_business_flow(phone_number, user_message):
             send_message(phone_number, "Por favor ingresa un monto válido, ejemplo: 250000")
         return True
 
-    # ✅ NUEVO PASO 5: Capturar nombre completo
     if user_state.get(phone_number) == "esperando_nombre_empresarial":
         if is_valid_name(user_message):
             user_data[phone_number]["nombre_contacto"] = user_message.title()
@@ -512,7 +475,6 @@ def handle_business_flow(phone_number, user_message):
             )
         return True
 
-    # ✅ NUEVO PASO 6: Capturar teléfono de contacto
     if user_state.get(phone_number) == "esperando_telefono_empresarial":
         if is_valid_phone(user_message):
             user_data[phone_number]["telefono_contacto"] = user_message
@@ -528,7 +490,6 @@ def handle_business_flow(phone_number, user_message):
             )
         return True
 
-    # ✅ NUEVO PASO 7: Capturar ciudad
     if user_state.get(phone_number) == "esperando_ciudad_empresarial":
         user_data[phone_number]["ciudad_empresa"] = user_message.title()
         send_message(phone_number,
@@ -539,7 +500,6 @@ def handle_business_flow(phone_number, user_message):
         user_state[phone_number] = "esperando_contacto_empresarial"
         return True
 
-    # Paso 8: Capturar horario de contacto y finalizar
     if user_state.get(phone_number) == "esperando_contacto_empresarial":
         user_data[phone_number]["horario_contacto"] = user_message
         
@@ -554,7 +514,6 @@ def handle_business_flow(phone_number, user_message):
             "¡Gracias por considerar a Inbursa para impulsar tu empresa! 🏢"
         )
 
-        # Notificar al asesor con información completa
         mensaje_asesor = (
             f"🏢 *NUEVO PROSPECTO EMPRESARIAL - INFORMACIÓN COMPLETA*\n\n"
             f"👤 Nombre: {data.get('nombre_contacto', 'N/D')}\n"
@@ -575,9 +534,6 @@ def handle_business_flow(phone_number, user_message):
 
     return False
 
-# ---------------------------------------------------------------
-# FLUJO PARA OPCIONES DEL MENÚ
-# ---------------------------------------------------------------
 def handle_menu_options(phone_number, user_message):
     """Maneja las opciones del menú principal."""
     msg = user_message.lower().strip()
@@ -656,9 +612,6 @@ def handle_menu_options(phone_number, user_message):
     
     return False
 
-# ---------------------------------------------------------------
-# Endpoint de verificación de Meta Webhook
-# ---------------------------------------------------------------
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     mode = request.args.get("hub.mode")
@@ -670,9 +623,6 @@ def verify_webhook():
     logging.warning("❌ Verificación de webhook fallida.")
     return "Forbidden", 403
 
-# ---------------------------------------------------------------
-# Endpoint principal para recepción de mensajes
-# ---------------------------------------------------------------
 @app.route("/webhook", methods=["POST"])
 def receive_message():
     try:
@@ -759,16 +709,10 @@ def receive_message():
         logging.exception(f"❌ Error en receive_message: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ---------------------------------------------------------------
-# Endpoint de salud
-# ---------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "Vicky Bot Inbursa"}), 200
 
-# ---------------------------------------------------------------
-# Ejecución principal
-# ---------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     logging.info(f"🚀 Iniciando Vicky Bot en puerto {port}")
