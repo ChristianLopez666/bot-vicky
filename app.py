@@ -10,6 +10,7 @@ import json
 import logging
 import requests
 import re
+import openai
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from datetime import datetime
@@ -23,6 +24,7 @@ META_TOKEN = os.getenv("META_TOKEN")
 WABA_PHONE_ID = os.getenv("WABA_PHONE_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # ---------------------------------------------------------------
 # Configuración de logging
@@ -40,6 +42,51 @@ app = Flask(__name__)
 # Diccionarios temporales para gestionar el estado de cada usuario
 user_state = {}
 user_data = {}
+
+# ---------------------------------------------------------------
+# CONFIGURACIÓN GPT MEJORADA
+# ---------------------------------------------------------------
+openai.api_key = OPENAI_API_KEY
+
+def consultar_gpt(mensaje, contexto=""):
+    """Consulta a GPT para interpretación de intenciones mejorada"""
+    try:
+        prompt = f"""
+        Eres un asistente especializado en préstamos IMSS. 
+        Contexto: {contexto}
+        
+        Mensaje del usuario: "{mensaje}"
+        
+        Responde ÚNICAMENTE con:
+        - "positive" si la intención es AFIRMATIVA (sí, acepto, quiero, me interesa)
+        - "negative" si la intención es NEGATIVA (no, rechazo, no quiero)
+        - "neutral" si no es claro
+        
+        Ejemplos:
+        "sí" → "positive"
+        "claro que sí" → "positive" 
+        "no" → "negative"
+        "para nada" → "negative"
+        "quizás" → "neutral"
+        "hola" → "neutral"
+        """
+        
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "Eres un clasificador de intenciones para préstamos IMSS."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=10,
+            temperature=0.1
+        )
+        
+        resultado = response.choices[0].message['content'].strip().lower()
+        return resultado if resultado in ['positive', 'negative', 'neutral'] else 'neutral'
+        
+    except Exception as e:
+        logging.error(f"❌ Error GPT: {e}")
+        return 'neutral'
 
 # ---------------------------------------------------------------
 # Función: enviar mensaje por WhatsApp (Meta Cloud API)
@@ -85,18 +132,23 @@ def extract_number(text):
     return None
 
 # ---------------------------------------------------------------
-# Función: interpretar respuestas sí/no
+# Función: interpretar respuestas sí/no MEJORADA CON GPT
 # ---------------------------------------------------------------
-def interpret_response(text):
-    """Interpreta respuestas afirmativas/negativas."""
+def interpret_response(text, contexto=""):
+    """Interpreta respuestas afirmativas/negativas con GPT como respaldo."""
     text_lower = (text or '').lower()
-    positive_keywords = ['sí', 'si', 'sip', 'claro', 'por supuesto', 'ok', 'vale', 'afirmativo', 'acepto', 'yes']
-    negative_keywords = ['no', 'nop', 'negativo', 'para nada', 'no acepto', 'not']
+    
+    # Primero intentar con lógica simple (más rápido)
+    positive_keywords = ['sí', 'si', 'sip', 'claro', 'por supuesto', 'ok', 'vale', 'afirmativo', 'acepto', 'yes', 'correcto']
+    negative_keywords = ['no', 'nop', 'negativo', 'para nada', 'no acepto', 'not', 'nel']
+    
     if any(k in text_lower for k in positive_keywords):
         return 'positive'
     if any(k in text_lower for k in negative_keywords):
         return 'negative'
-    return 'neutral'
+    
+    # Si no es claro, usar GPT
+    return consultar_gpt(text, contexto)
 
 # ---------------------------------------------------------------
 # Función: detectar agradecimientos
@@ -189,9 +241,9 @@ def handle_imss_flow(phone_number, user_message):
             user_state[phone_number] = "esperando_respuesta_imss"
         return True
 
-    # Paso 2: validación de respuesta IMSS
+    # Paso 2: validación de respuesta IMSS - CON GPT
     if user_state.get(phone_number) == "esperando_respuesta_imss":
-        intent = interpret_response(msg)
+        intent = interpret_response(msg, "confirmar si es pensionado IMSS")
         if intent == 'negative':
             send_message(phone_number,
                 "Entiendo. Para el préstamo IMSS Ley 73 es necesario ser pensionado del IMSS. 😔\n\n"
@@ -205,7 +257,11 @@ def handle_imss_flow(phone_number, user_message):
             )
             user_state[phone_number] = "esperando_monto_solicitado"
         else:
-            send_message(phone_number, "Por favor responde *sí* o *no* para continuar.")
+            send_message(phone_number, 
+                "Por favor responde *sí* o *no* para continuar:\n\n"
+                "• *SÍ* - Si eres pensionado del IMSS\n"
+                "• *NO* - Si no eres pensionado"
+            )
         return True
 
     # ✅ PASO 3 MODIFICADO: monto solicitado - ELIMINAR VALIDACIONES
@@ -251,7 +307,7 @@ def handle_imss_flow(phone_number, user_message):
             send_message(phone_number, "Por favor indica el monto deseado, ejemplo: 65000")
         return True
 
-    # ✅ PASO 4 MODIFICADO: validación nómina - AGREGAR NUEVOS CAMPOS
+    # ✅ PASO 4 MODIFICADO: validación nómina - CON GPT
     if user_state.get(phone_number) == "esperando_respuesta_nomina":
         if is_thankyou_message(msg):
             send_message(phone_number,
@@ -261,7 +317,7 @@ def handle_imss_flow(phone_number, user_message):
             )
             return True
             
-        intent = interpret_response(msg)
+        intent = interpret_response(msg, "cambio de nómina a Inbursa")
         
         data = user_data.get(phone_number, {})
         monto_solicitado = data.get('monto_solicitado', 'N/D')
