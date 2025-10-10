@@ -7,6 +7,8 @@ from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from datetime import datetime
 
+import openai
+
 # ---------------------------------------------------------------
 # Cargar variables de entorno
 # ---------------------------------------------------------------
@@ -16,6 +18,9 @@ META_TOKEN = os.getenv("META_TOKEN")
 WABA_PHONE_ID = os.getenv("WABA_PHONE_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+openai.api_key = OPENAI_API_KEY
 
 app = Flask(__name__)
 
@@ -87,6 +92,22 @@ def send_main_menu(phone):
         "Escribe el *número* o el *nombre* del servicio que te interesa:"
     )
     send_message(phone, menu)
+
+# ---------------------------------------------------------------
+# Integración GPT bajo comando
+# ---------------------------------------------------------------
+def ask_gpt(prompt, model="gpt-3.5-turbo", temperature=0.7):
+    try:
+        response = openai.ChatCompletion.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=400
+        )
+        return response.choices[0].message["content"].strip()
+    except Exception as e:
+        logging.exception(f"Error con OpenAI: {e}")
+        return "Lo siento, ocurrió un error al consultar GPT."
 
 # ---------------------------------------------------------------
 # EMBUDO PRÉSTAMO IMSS (Ley 73)
@@ -229,7 +250,6 @@ def funnel_prestamo_imss(user_id, user_message):
             f"Observación: Nómina Inbursa: {datos.get('nomina_inbursa','N/D')}"
         )
         send_whatsapp_message(ADVISOR_NUMBER, formatted)
-        # Aquí puedes agregar registro en Google Sheets si lo requieres
         user_state.pop(user_id, None)
         user_data.pop(user_id, None)
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
@@ -267,10 +287,19 @@ def receive_message():
         phone_number = message.get("from")
         message_type = message.get("type")
 
+        # SOLO GPT BAJO COMANDO
         if message_type == "text":
             user_message = message["text"]["body"].strip()
             logging.info(f"📱 Mensaje de {phone_number}: '{user_message}'")
 
+            # Comando GPT: solo si comienza con "gpt:"
+            if user_message.lower().startswith("gpt:"):
+                prompt = user_message[4:].strip()
+                gpt_reply = ask_gpt(prompt)
+                send_message(phone_number, gpt_reply)
+                return jsonify({"status": "ok", "source": "gpt"})
+
+            # Menú principal: opciones
             menu_options = {
                 "1": "prestamo_imss",
                 "préstamo": "prestamo_imss",
