@@ -22,9 +22,9 @@ app = Flask(__name__)
 user_state = {}
 user_data = {}
 
-# ----------------------
-# Utilidades de mensajes
-# ----------------------
+# ---------------------------------------------------------------
+# UTILIDADES
+# ---------------------------------------------------------------
 def send_message(to, text):
     try:
         url = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
@@ -38,11 +38,7 @@ def send_message(to, text):
             "type": "text",
             "text": {"body": text}
         }
-        response = requests.post(url, headers=headers, json=payload)
-        if response.status_code not in (200, 201):
-            logging.warning(f"⚠️ Error al enviar mensaje: {response.text}")
-        else:
-            logging.info(f"📩 Mensaje enviado correctamente a {to}")
+        requests.post(url, headers=headers, json=payload)
     except Exception as e:
         logging.exception(f"❌ Error en send_message: {e}")
 
@@ -80,12 +76,6 @@ def is_valid_name(text):
         return True
     return False
 
-def is_valid_phone(text):
-    if not text:
-        return False
-    clean_phone = re.sub(r'[\s\-\(\)\+]', '', text)
-    return re.match(r'^\d{10,15}$', clean_phone) is not None
-
 def send_main_menu(phone):
     menu = (
         "🏦 *INBURSA - SERVICIOS DISPONIBLES*\n\n"
@@ -98,14 +88,14 @@ def send_main_menu(phone):
     )
     send_message(phone, menu)
 
-# ----------------------
-# Embudo Préstamo IMSS
-# ----------------------
-def funnel_prestamo_imss(user_id):
+# ---------------------------------------------------------------
+# EMBUDO PRÉSTAMO IMSS (Ley 73)
+# ---------------------------------------------------------------
+def funnel_prestamo_imss(user_id, user_message):
     state = user_state.get(user_id, "menu_mostrar_beneficios")
     datos = user_data.get(user_id, {})
 
-    # Paso 0: Mostrar beneficios
+    # Paso 0: Mostrar beneficios y preguntar si es pensionado
     if state == "menu_mostrar_beneficios":
         send_message(user_id,
             "💰 *Beneficios del Préstamo para Pensionados IMSS (Ley 73)*\n"
@@ -131,7 +121,7 @@ def funnel_prestamo_imss(user_id):
 
     # Paso 1: Pregunta pensionado
     if state == "pregunta_pensionado":
-        resp = interpret_response(datos.get("last_msg", ""))
+        resp = interpret_response(user_message)
         if resp == "negative":
             send_main_menu(user_id)
             user_state.pop(user_id, None)
@@ -149,7 +139,7 @@ def funnel_prestamo_imss(user_id):
 
     # Paso 2: Monto de pensión
     if state == "pregunta_monto_pension":
-        monto_pension = extract_number(datos.get("last_msg", ""))
+        monto_pension = extract_number(user_message)
         if monto_pension is None:
             send_message(user_id, "Indica el monto mensual que recibes por pensión, ejemplo: 6500")
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
@@ -170,7 +160,7 @@ def funnel_prestamo_imss(user_id):
 
     # Paso 2b: Ofrecer asesor por pensión baja
     if state == "pregunta_ofrecer_asesor":
-        resp = interpret_response(datos.get("last_msg", ""))
+        resp = interpret_response(user_message)
         if resp == "positive":
             send_message(user_id,
                 "¡Listo! Un asesor te contactará para ofrecerte opciones alternativas. Gracias por confiar en nosotros 🙌."
@@ -196,7 +186,7 @@ def funnel_prestamo_imss(user_id):
 
     # Paso 3: Monto solicitado
     if state == "pregunta_monto_solicitado":
-        monto_solicitado = extract_number(datos.get("last_msg", ""))
+        monto_solicitado = extract_number(user_message)
         if monto_solicitado is None or monto_solicitado < 40000:
             send_message(user_id, "Indica el monto que deseas solicitar (mínimo $40,000), ejemplo: 65000")
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
@@ -209,7 +199,7 @@ def funnel_prestamo_imss(user_id):
 
     # Paso 4: Nómina Inbursa
     if state == "pregunta_nomina_inbursa":
-        resp = interpret_response(datos.get("last_msg", ""))
+        resp = interpret_response(user_message)
         if resp == "positive":
             send_message(user_id,
                 "Excelente, con Inbursa tendrás acceso a beneficios adicionales y atención prioritaria."
@@ -229,7 +219,6 @@ def funnel_prestamo_imss(user_id):
             "Un asesor financiero (Christian López) se pondrá en contacto contigo para continuar con el trámite.\n"
             "Gracias por tu confianza 🙌."
         )
-        # Notificación al asesor
         datos = user_data.get(user_id, {})
         formatted = (
             f"🔔 NUEVO PROSPECTO – PRÉSTAMO IMSS\n"
@@ -240,43 +229,17 @@ def funnel_prestamo_imss(user_id):
             f"Observación: Nómina Inbursa: {datos.get('nomina_inbursa','N/D')}"
         )
         send_whatsapp_message(ADVISOR_NUMBER, formatted)
-        # Registro en Google Sheets (simulado aquí, implementar con Sheets API si lo tienes)
-        # save_lead_to_gsheet(
-        #     fecha=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        #     nombre=datos.get('nombre','N/D'),
-        #     numero=user_id,
-        #     tipo_credito="IMSS",
-        #     monto=datos.get('monto_solicitado','N/D'),
-        #     estatus="Preautorizado",
-        #     observaciones=f"Nómina Inbursa: {datos.get('nomina_inbursa','N/D')}"
-        # )
+        # Aquí puedes agregar registro en Google Sheets si lo requieres
         user_state.pop(user_id, None)
         user_data.pop(user_id, None)
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
-    # Si falta nombre, lo pide tras monto solicitado o pensión
-    if state == "pregunta_nombre":
-        if is_valid_name(datos.get("last_msg", "")):
-            user_data[user_id]["nombre"] = datos.get("last_msg", "").title()
-            send_message(user_id, "¡Gracias! Seguimos con tu proceso.")
-            # Regresa al paso anterior (según lo que falta)
-            if "pension_mensual" not in user_data[user_id]:
-                user_state[user_id] = "pregunta_monto_pension"
-            elif "monto_solicitado" not in user_data[user_id]:
-                user_state[user_id] = "pregunta_monto_solicitado"
-            else:
-                user_state[user_id] = "pregunta_nomina_inbursa"
-            return jsonify({"status": "ok", "funnel": "prestamo_imss"})
-        else:
-            send_message(user_id, "Por favor indica tu nombre completo (solo letras y espacios).")
-            return jsonify({"status": "ok", "funnel": "prestamo_imss"})
-    # Cualquier otro caso
     send_main_menu(user_id)
     return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
-# ---------------------------------
+# ---------------------------------------------------------------
 # ENDPOINT PRINCIPAL /webhook
-# ---------------------------------
+# ---------------------------------------------------------------
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     mode = request.args.get("hub.mode")
@@ -308,12 +271,6 @@ def receive_message():
             user_message = message["text"]["body"].strip()
             logging.info(f"📱 Mensaje de {phone_number}: '{user_message}'")
 
-            # Guardar el último mensaje para el embudo
-            if phone_number not in user_data:
-                user_data[phone_number] = {}
-            user_data[phone_number]["last_msg"] = user_message
-
-            # Menú principal: opciones
             menu_options = {
                 "1": "prestamo_imss",
                 "préstamo": "prestamo_imss",
@@ -346,15 +303,15 @@ def receive_message():
 
             option = menu_options.get(user_message.lower())
 
-            # Ruteo por estado del embudo
+            # FLUJO IMSS: Si está en embudo, seguir el estado
             current_state = user_state.get(phone_number)
-            if current_state and "prestamo_imss" in current_state:
-                return funnel_prestamo_imss(phone_number)
+            if current_state and ("prestamo_imss" in current_state or "pregunta_" in current_state):
+                return funnel_prestamo_imss(phone_number, user_message)
 
-            # Nueva opción 1 - embudo IMSS
+            # Opción 1: Iniciar embudo IMSS
             if option == "prestamo_imss":
                 user_state[phone_number] = "menu_mostrar_beneficios"
-                return funnel_prestamo_imss(phone_number)
+                return funnel_prestamo_imss(phone_number, user_message)
 
             # Otros servicios - menú estándar
             if option == "seguro_auto":
@@ -430,9 +387,9 @@ def receive_message():
         logging.exception(f"❌ Error en receive_message: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ---------------------------------
+# ---------------------------------------------------------------
 # Endpoint de salud
-# ---------------------------------
+# ---------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "Vicky Bot Inbursa"}), 200
