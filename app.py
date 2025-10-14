@@ -560,13 +560,23 @@ def receive_message():
 
         option = menu_options.get(user_message.lower())
 
-        # FLUJO IMSS: Si está en embudo, seguir el estado
+        # DETECCIÓN DE ESTADO ACTUAL - VERSIÓN CORREGIDA
         current_state = user_state.get(phone_number)
+
+        # Si el usuario escribe "menu", "servicios", etc. - SALIR de cualquier embudo
+        if user_message.lower() in ["menu", "menú", "men", "opciones", "servicios"]:
+            user_state.pop(phone_number, None)
+            user_data.pop(phone_number, None)
+            send_main_menu(phone_number)
+            return jsonify({"status": "ok", "funnel": "menu"})
+
+        # Si está en embudo empresarial
+        if current_state and "empresarial" in current_state:
+            return funnel_empresarial(phone_number, user_message)
+
+        # Si está en embudo IMSS
         if current_state and ("prestamo_imss" in current_state or "pregunta_" in current_state):
-            if "empresarial" in current_state:
-                return funnel_empresarial(phone_number, user_message)
-            else:
-                return funnel_prestamo_imss(phone_number, user_message)
+            return funnel_prestamo_imss(phone_number, user_message)
 
         # Opción 1: Iniciar embudo IMSS
         if option == "prestamo_imss":
@@ -616,7 +626,7 @@ def receive_message():
             send_whatsapp_message(ADVISOR_NUMBER, f"💳 NUEVO INTERESADO EN TARJETAS VRIM\n📞 {phone_number}")
             return jsonify({"status": "ok", "funnel": "menu"})
 
-        # Comando de menú
+        # Comando de menú (ya manejado arriba, pero por si acaso)
         if user_message.lower() in ["menu", "menú", "men", "opciones", "servicios"]:
             user_state.pop(phone_number, None)
             user_data.pop(phone_number, None)
