@@ -3,7 +3,8 @@ import json
 import logging
 import requests
 import re
-from flask import Flask, request, jsonify
+import sqlite3
+from flask import Flask, request, jsonify, render_template_string
 from dotenv import load_dotenv
 from datetime import datetime
 import openai
@@ -27,47 +28,131 @@ user_state = {}
 user_data = {}
 
 # ---------------------------------------------------------------
-# FUNCIÓN SEND_MESSAGE MEJORADA
+# CONFIGURACIÓN DE LOGGING MEJORADA
 # ---------------------------------------------------------------
-def send_message(to, text):
-    """Envía mensajes de texto al usuario vía Meta Cloud API - VERSIÓN MEJORADA"""
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('vicky_conversations.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+
+# ---------------------------------------------------------------
+# SISTEMA DE BASE DE DATOS PARA CONVERSACIONES
+# ---------------------------------------------------------------
+def init_database():
+    """Inicializa la base de datos SQLite"""
     try:
-        # Validación de variables críticas
-        if not META_TOKEN:
-            logging.error("❌ META_TOKEN no configurado - No se puede enviar mensaje")
-            return False
-        if not WABA_PHONE_ID:
-            logging.error("❌ WABA_PHONE_ID no configurado - No se puede enviar mensaje")
-            return False
-            
-        url = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
-        headers = {
-            "Authorization": f"Bearer {META_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": str(to),
-            "type": "text",
-            "text": {"body": text}
-        }
+        conn = sqlite3.connect('conversations.db')
+        cursor = conn.cursor()
         
-        logging.info(f"📤 Intentando enviar mensaje a {to}: {text[:50]}...")
-        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL,
+                user_message TEXT,
+                bot_response TEXT,
+                funnel TEXT,
+                message_type TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
         
-        if response.status_code in (200, 201):
-            logging.info(f"✅ Mensaje enviado CORRECTAMENTE a {to}")
-            return True
-        else:
-            logging.error(f"❌ Error API Meta al enviar a {to}: {response.status_code} - {response.text}")
-            return False
-            
+        # Índices para búsquedas más rápidas
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_phone ON conversations(phone)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON conversations(timestamp)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_funnel ON conversations(funnel)')
+        
+        conn.commit()
+        conn.close()
+        logging.info("✅ Base de datos inicializada correctamente")
     except Exception as e:
-        logging.exception(f"💥 Error CRÍTICO en send_message para {to}: {e}")
+        logging.error(f"❌ Error inicializando base de datos: {e}")
+
+def save_conversation(phone, user_message, bot_response, funnel, message_type="text"):
+    """Guarda una conversación en la base de datos"""
+    try:
+        conn = sqlite3.connect('conversations.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO conversations (phone, user_message, bot_response, funnel, message_type)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (phone, user_message, bot_response, funnel, message_type))
+        
+        conn.commit()
+        conn.close()
+        logging.info(f"💾 Conversación guardada: {phone} - Funnel: {funnel}")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Error guardando conversación: {e}")
         return False
 
-def send_whatsapp_message(to, text):
-    return send_message(to, text)
+def get_conversations(limit=100, phone=None):
+    """Obtiene conversaciones de la base de datos"""
+    try:
+        conn = sqlite3.connect('conversations.db')
+        cursor = conn.cursor()
+        
+        if phone:
+            cursor.execute('''
+                SELECT phone, user_message, bot_response, funnel, message_type, timestamp 
+                FROM conversations 
+                WHERE phone = ?
+                ORDER BY timestamp DESC 
+                LIMIT ?
+            ''', (phone, limit))
+        else:
+            cursor.execute('''
+                SELECT phone, user_message, bot_response, funnel, message_type, timestamp 
+                FROM conversations 
+                ORDER BY timestamp DESC 
+                LIMIT ?
+            ''', (limit,))
+        
+        conversations = cursor.fetchall()
+        conn.close()
+        
+        return conversations
+    except Exception as e:
+        logging.error(f"❌ Error obteniendo conversaciones: {e}")
+        return []
+
+def get_conversation_stats():
+    """Obtiene estadísticas de conversaciones"""
+    try:
+        conn = sqlite3.connect('conversations.db')
+        cursor = conn.cursor()
+        
+        # Total conversaciones
+        cursor.execute('SELECT COUNT(*) FROM conversations')
+        total_conv = cursor.fetchone()[0]
+        
+        # Conversaciones únicas
+        cursor.execute('SELECT COUNT(DISTINCT phone) FROM conversations')
+        unique_users = cursor.fetchone()[0]
+        
+        # Por funnel
+        cursor.execute('SELECT funnel, COUNT(*) FROM conversations GROUP BY funnel')
+        funnel_stats = cursor.fetchall()
+        
+        # Hoy
+        cursor.execute('SELECT COUNT(*) FROM conversations WHERE DATE(timestamp) = DATE("now")')
+        today_conv = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        return {
+            "total_conversations": total_conv,
+            "unique_users": unique_users,
+            "today_conversations": today_conv,
+            "funnel_stats": dict(funnel_stats)
+        }
+    except Exception as e:
+        logging.error(f"❌ Error obteniendo estadísticas: {e}")
+        return {}
 
 # ---------------------------------------------------------------
 # FUNCIONES AUXILIARES
@@ -119,7 +204,7 @@ def send_main_menu(phone):
         "5️⃣ Financiamiento Empresarial\n\n"
         "Escribe el *número* o el *nombre* del servicio que te interesa:"
     )
-    send_message(phone, menu)
+    send_message(phone, menu, "menu", "")
 
 def ask_gpt(prompt, model="gpt-3.5-turbo", temperature=0.7):
     try:
@@ -138,11 +223,19 @@ def is_gpt_command(msg):
     return re.match(r'^\s*gpt\s*:', msg.lower())
 
 # ---------------------------------------------------------------
-# FLUJO PARA CRÉDITOS EMPRESARIALES (NUEVO)
+# FLUJO PARA CRÉDITOS EMPRESARIALES (CORREGIDO - SIN CICLOS)
 # ---------------------------------------------------------------
 def funnel_credito_empresarial(user_id, user_message):
     state = user_state.get(user_id, "menu_tipo_credito")
     datos = user_data.get(user_id, {})
+    
+    # Permitir salir en cualquier momento con "menú" o "salir"
+    if user_message.lower() in ["menu", "menú", "salir", "volver", "atrás"]:
+        send_message(user_id, "Volviendo al menú principal...", "credito_empresarial", user_message)
+        send_main_menu(user_id)
+        user_state.pop(user_id, None)
+        user_data.pop(user_id, None)
+        return jsonify({"status": "ok", "funnel": "menu"})
 
     # Paso 1: Mostrar tipos de crédito disponibles
     if state == "menu_tipo_credito":
@@ -160,9 +253,10 @@ def funnel_credito_empresarial(user_id, user_message):
             "   - Línea de crédito flexible\n"
             "   - Tasas 3% mensual\n"
             "   - Hasta 45 días\n\n"
+            "💡 *Escribe 'menú' en cualquier momento para volver al menú principal*\n\n"
             "Escribe el *número* del crédito que te interesa:"
         )
-        send_message(user_id, menu_creditos)
+        send_message(user_id, menu_creditos, "credito_empresarial", user_message)
         user_state[user_id] = "pregunta_tipo_credito"
         return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
@@ -176,7 +270,7 @@ def funnel_credito_empresarial(user_id, user_message):
                 "1️⃣ Persona Física con Actividad Empresarial (PFAE)\n"
                 "2️⃣ Persona Moral (PM)\n\n"
                 "Responde con el número:"
-            )
+            , "credito_empresarial", user_message)
             user_state[user_id] = "pregunta_tipo_empresa"
         elif user_message in ["2", "factoraje"]:
             user_data[user_id] = {"tipo_credito": "Factoraje"}
@@ -186,7 +280,7 @@ def funnel_credito_empresarial(user_id, user_message):
                 "1️⃣ Persona Física con Actividad Empresarial (PFAE)\n"
                 "2️⃣ Persona Moral (PM)\n\n"
                 "Responde con el número:"
-            )
+            , "credito_empresarial", user_message)
             user_state[user_id] = "pregunta_tipo_empresa"
         elif user_message in ["3", "revolvente"]:
             user_data[user_id] = {"tipo_credito": "Revolvente"}
@@ -194,10 +288,18 @@ def funnel_credito_empresarial(user_id, user_message):
                 "🔄 *REVOLVENTE*\n\n"
                 "Este producto está dirigido a Personas Morales (PM) con ventas mínimas de 50 millones de pesos.\n\n"
                 "¿Tu empresa cumple con estos requisitos?"
-            )
+            , "credito_empresarial", user_message)
             user_state[user_id] = "pregunta_cumple_requisitos_revolvente"
         else:
-            send_message(user_id, "Por favor elige una opción válida (1, 2 o 3):")
+            # CORRECCIÓN: Manejar opción no válida sin ciclarse
+            send_message(user_id, 
+                "❌ Opción no válida. Por favor elige 1, 2 o 3:\n\n"
+                "1️⃣ Crédito Simple\n"
+                "2️⃣ Factoraje\n" 
+                "3️⃣ Revolvente\n\n"
+                "O escribe 'menú' para volver al menú principal."
+            , "credito_empresarial", user_message)
+            # Mantener el mismo estado para reintentar
             return jsonify({"status": "ok", "funnel": "credito_empresarial"})
         return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
@@ -205,15 +307,37 @@ def funnel_credito_empresarial(user_id, user_message):
     if state == "pregunta_cumple_requisitos_revolvente":
         resp = interpret_response(user_message)
         if resp == "positive":
-            send_message(user_id, "Excelente. Continuemos con tu solicitud:")
+            send_message(user_id, "Excelente. Continuemos con tu solicitud:", "credito_empresarial", user_message)
             user_state[user_id] = "pregunta_antiguedad_fiscal"
-        else:
+        elif resp == "negative":
             send_message(user_id, 
                 "Entiendo. Te recomiendo revisar nuestras otras opciones de crédito que pueden adaptarse mejor a tus necesidades.\n\n"
-                "¿Te gustaría conocer más sobre Crédito Simple o Factoraje?"
-            )
-            user_state[user_id] = "menu_tipo_credito"
+                "¿Te gustaría conocer más sobre Crédito Simple o Factoraje? (responde sí o no)"
+            , "credito_empresarial", user_message)
+            user_state[user_id] = "pregunta_otras_opciones"
+        else:
+            send_message(user_id, 
+                "Por favor responde *sí* o *no*:\n\n"
+                "¿Tu empresa cumple con los requisitos para Revolvente?"
+            , "credito_empresarial", user_message)
             return jsonify({"status": "ok", "funnel": "credito_empresarial"})
+        return jsonify({"status": "ok", "funnel": "credito_empresarial"})
+
+    # Paso 3b: Preguntar si quiere otras opciones
+    if state == "pregunta_otras_opciones":
+        resp = interpret_response(user_message)
+        if resp == "positive":
+            user_state[user_id] = "menu_tipo_credito"
+            return funnel_credito_empresarial(user_id, "")  # Reiniciar el flujo
+        else:
+            send_message(user_id, 
+                "De acuerdo. Si cambias de opinión, siempre puedes escribir 'empresarial' para volver a ver las opciones.\n\n"
+                "¿Te interesa algún otro servicio?"
+            , "credito_empresarial", user_message)
+            send_main_menu(user_id)
+            user_state.pop(user_id, None)
+            user_data.pop(user_id, None)
+            return jsonify({"status": "ok", "funnel": "menu"})
         return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
     # Paso 4: Preguntar tipo de empresa (para Crédito Simple y Factoraje)
@@ -222,25 +346,40 @@ def funnel_credito_empresarial(user_id, user_message):
             user_data[user_id]["tipo_empresa"] = "PFAE"
             send_message(user_id, 
                 "¿Cuánto tiempo tiene operando tu empresa? (antigüedad fiscal)"
-            )
+            , "credito_empresarial", user_message)
             user_state[user_id] = "pregunta_antiguedad_fiscal"
         elif user_message in ["2", "pm", "persona moral"]:
             user_data[user_id]["tipo_empresa"] = "PM"
             send_message(user_id, 
                 "¿Cuánto tiempo tiene operando tu empresa? (antigüedad fiscal)"
-            )
+            , "credito_empresarial", user_message)
             user_state[user_id] = "pregunta_antiguedad_fiscal"
         else:
-            send_message(user_id, "Por favor responde con 1 (PFAE) o 2 (PM):")
+            send_message(user_id, 
+                "Por favor responde con 1 (PFAE) o 2 (PM):\n\n"
+                "1️⃣ Persona Física con Actividad Empresarial (PFAE)\n"
+                "2️⃣ Persona Moral (PM)"
+            , "credito_empresarial", user_message)
             return jsonify({"status": "ok", "funnel": "credito_empresarial"})
         return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
     # Paso 5: Preguntar antigüedad fiscal
     if state == "pregunta_antiguedad_fiscal":
+        # Permitir salir
+        if user_message.lower() in ["menu", "menú", "salir"]:
+            send_message(user_id, "Volviendo al menú principal...", "credito_empresarial", user_message)
+            send_main_menu(user_id)
+            user_state.pop(user_id, None)
+            user_data.pop(user_id, None)
+            return jsonify({"status": "ok", "funnel": "menu"})
+            
         # Extraer números del mensaje
         antiguedad = extract_number(user_message)
         if antiguedad is None:
-            send_message(user_id, "Por favor indica el tiempo en meses o años. Ejemplo: '6 meses' o '2 años'")
+            send_message(user_id, 
+                "Por favor indica el tiempo en meses o años. Ejemplo: '6 meses' o '2 años'\n\n"
+                "O escribe 'menú' para volver al menú principal."
+            , "credito_empresarial", user_message)
             return jsonify({"status": "ok", "funnel": "credito_empresarial"})
         
         user_data[user_id]["antiguedad_fiscal"] = antiguedad
@@ -250,7 +389,7 @@ def funnel_credito_empresarial(user_id, user_message):
             "2️⃣ Con vencimientos menores a 30 mil pesos\n"
             "3️⃣ Con vencimientos mayores\n\n"
             "Responde con el número:"
-        )
+        , "credito_empresarial", user_message)
         user_state[user_id] = "pregunta_buro_credito"
         return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
@@ -263,24 +402,29 @@ def funnel_credito_empresarial(user_id, user_message):
         elif user_message in ["3", "vencimientos mayores"]:
             user_data[user_id]["buro_credito"] = "Vencimientos mayores"
         else:
-            send_message(user_id, "Por favor elige una opción válida (1, 2 o 3):")
+            send_message(user_id, 
+                "Por favor elige una opción válida (1, 2 o 3):\n\n"
+                "1️⃣ Sin vencimientos\n"
+                "2️⃣ Con vencimientos menores a 30 mil pesos\n"
+                "3️⃣ Con vencimientos mayores"
+            , "credito_empresarial", user_message)
             return jsonify({"status": "ok", "funnel": "credito_empresarial"})
         
-        send_message(user_id, "¿Cuál es tu nombre completo?")
+        send_message(user_id, "¿Cuál es tu nombre completo?", "credito_empresarial", user_message)
         user_state[user_id] = "pregunta_nombre_empresarial"
         return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
     # Paso 7: Preguntar nombre
     if state == "pregunta_nombre_empresarial":
         user_data[user_id]["nombre"] = user_message.title()
-        send_message(user_id, "¿Cuál es tu teléfono de contacto?")
+        send_message(user_id, "¿Cuál es tu teléfono de contacto?", "credito_empresarial", user_message)
         user_state[user_id] = "pregunta_telefono_empresarial"
         return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
     # Paso 8: Preguntar teléfono
     if state == "pregunta_telefono_empresarial":
         user_data[user_id]["telefono"] = user_message
-        send_message(user_id, "¿En qué ciudad se encuentra tu empresa?")
+        send_message(user_id, "¿En qué ciudad se encuentra tu empresa?", "credito_empresarial", user_message)
         user_state[user_id] = "pregunta_ciudad_empresarial"
         return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
@@ -308,7 +452,7 @@ def funnel_credito_empresarial(user_id, user_message):
             "✅ *¡Excelente! Hemos recibido tu información*\n\n"
             "Un asesor especializado en créditos empresariales se pondrá en contacto contigo en menos de 24 horas para analizar tu caso y ofrecerte las mejores opciones.\n\n"
             "Gracias por confiar en nosotros para impulsar tu negocio! 🚀"
-        )
+        , "credito_empresarial", user_message)
         
         send_message(user_id, "¿Necesitas información sobre otros servicios financieros?")
         send_main_menu(user_id)
@@ -317,8 +461,12 @@ def funnel_credito_empresarial(user_id, user_message):
         user_data.pop(user_id, None)
         return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
+    # Estado no reconocido - resetear
+    send_message(user_id, "Volviendo al menú principal...", "credito_empresarial", user_message)
     send_main_menu(user_id)
-    return jsonify({"status": "ok", "funnel": "credito_empresarial"})
+    user_state.pop(user_id, None)
+    user_data.pop(user_id, None)
+    return jsonify({"status": "ok", "funnel": "menu"})
 
 # ---------------------------------------------------------------
 # FLUJO PARA PRÉSTAMOS IMSS (EXISTENTE)
@@ -326,6 +474,14 @@ def funnel_credito_empresarial(user_id, user_message):
 def funnel_prestamo_imss(user_id, user_message):
     state = user_state.get(user_id, "menu_mostrar_beneficios")
     datos = user_data.get(user_id, {})
+
+    # Permitir salir en cualquier momento
+    if user_message.lower() in ["menu", "menú", "salir", "volver", "atrás"]:
+        send_message(user_id, "Volviendo al menú principal...", "prestamo_imss", user_message)
+        send_main_menu(user_id)
+        user_state.pop(user_id, None)
+        user_data.pop(user_id, None)
+        return jsonify({"status": "ok", "funnel": "menu"})
 
     # Paso 0: Mostrar beneficios y preguntar si es pensionado
     if state == "menu_mostrar_beneficios":
@@ -336,7 +492,7 @@ def funnel_prestamo_imss(user_id, user_message):
             "- Plazos de 12 a 60 meses\n"
             "- Depósito directo a tu cuenta\n"
             "- Sin aval ni garantía"
-        )
+        , "prestamo_imss", user_message)
         send_message(user_id,
             "🏦 *Beneficios adicionales si recibes tu pensión en Inbursa:*\n"
             "- Tasas preferenciales y pagos más bajos\n"
@@ -344,10 +500,10 @@ def funnel_prestamo_imss(user_id, user_message):
             "- Anticipo de nómina disponible\n"
             "- Atención personalizada 24/7\n\n"
             "*(Estos beneficios son adicionales y no son obligatorios para obtener tu crédito.)*"
-        )
+        , "prestamo_imss", user_message)
         send_message(user_id,
             "¿Eres pensionado o jubilado del IMSS bajo la Ley 73?"
-        )
+        , "prestamo_imss", user_message)
         user_state[user_id] = "pregunta_pensionado"
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
@@ -355,6 +511,7 @@ def funnel_prestamo_imss(user_id, user_message):
     if state == "pregunta_pensionado":
         resp = interpret_response(user_message)
         if resp == "negative":
+            send_message(user_id, "Entiendo. Te muestro otros servicios que podrían interesarte:", "prestamo_imss", user_message)
             send_main_menu(user_id)
             user_state.pop(user_id, None)
             user_data.pop(user_id, None)
@@ -362,31 +519,31 @@ def funnel_prestamo_imss(user_id, user_message):
         elif resp == "positive":
             send_message(user_id,
                 "¿Cuánto recibes aproximadamente al mes por concepto de pensión?"
-            )
+            , "prestamo_imss", user_message)
             user_state[user_id] = "pregunta_monto_pension"
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         else:
-            send_message(user_id, "Por favor responde *sí* o *no* para continuar.")
+            send_message(user_id, "Por favor responde *sí* o *no* para continuar.", "prestamo_imss", user_message)
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
     # Paso 2: Monto de pensión
     if state == "pregunta_monto_pension":
         monto_pension = extract_number(user_message)
         if monto_pension is None:
-            send_message(user_id, "Indica el monto mensual que recibes por pensión, ejemplo: 6500")
+            send_message(user_id, "Indica el monto mensual que recibes por pensión, ejemplo: 6500", "prestamo_imss", user_message)
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         if monto_pension < 5000:
             send_message(user_id,
                 "Por ahora los créditos disponibles aplican a pensiones a partir de $5,000.\n"
                 "Pero puedo notificar a nuestro asesor para ofrecerte otra opción sin compromiso. ¿Deseas que lo haga?"
-            )
+            , "prestamo_imss", user_message)
             user_state[user_id] = "pregunta_ofrecer_asesor"
             user_data[user_id] = {"pension_mensual": monto_pension}
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         user_data[user_id] = {"pension_mensual": monto_pension}
         send_message(user_id,
             "Perfecto 👏 ¿Qué monto de préstamo te gustaría solicitar? (mínimo $40,000)"
-        )
+        , "prestamo_imss", user_message)
         user_state[user_id] = "pregunta_monto_solicitado"
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
@@ -396,7 +553,7 @@ def funnel_prestamo_imss(user_id, user_message):
         if resp == "positive":
             send_message(user_id,
                 "¡Listo! Un asesor te contactará para ofrecerte opciones alternativas. Gracias por confiar en nosotros 🙌."
-            )
+            , "prestamo_imss", user_message)
             datos = user_data.get(user_id, {})
             formatted = (
                 f"🔔 NUEVO PROSPECTO – PRÉSTAMO IMSS\n"
@@ -412,7 +569,7 @@ def funnel_prestamo_imss(user_id, user_message):
             user_data.pop(user_id, None)
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         else:
-            send_message(user_id, "Perfecto, si deseas podemos continuar con otros servicios.")
+            send_message(user_id, "Perfecto, si deseas podemos continuar con otros servicios.", "prestamo_imss", user_message)
             send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte: 👇")
             send_main_menu(user_id)
             user_state.pop(user_id, None)
@@ -423,12 +580,12 @@ def funnel_prestamo_imss(user_id, user_message):
     if state == "pregunta_monto_solicitado":
         monto_solicitado = extract_number(user_message)
         if monto_solicitado is None or monto_solicitado < 40000:
-            send_message(user_id, "Indica el monto que deseas solicitar (mínimo $40,000), ejemplo: 65000")
+            send_message(user_id, "Indica el monto que deseas solicitar (mínimo $40,000), ejemplo: 65000", "prestamo_imss", user_message)
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         user_data[user_id]["monto_solicitado"] = monto_solicitado
         send_message(user_id,
             "¿Cuál es tu nombre completo?"
-        )
+        , "prestamo_imss", user_message)
         user_state[user_id] = "pregunta_nombre"
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
@@ -437,7 +594,7 @@ def funnel_prestamo_imss(user_id, user_message):
         user_data[user_id]["nombre"] = user_message.title()
         send_message(user_id,
             "¿Cuál es tu teléfono de contacto?"
-        )
+        , "prestamo_imss", user_message)
         user_state[user_id] = "pregunta_telefono"
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
@@ -446,7 +603,7 @@ def funnel_prestamo_imss(user_id, user_message):
         user_data[user_id]["telefono_contacto"] = user_message
         send_message(user_id,
             "¿En qué ciudad vives?"
-        )
+        , "prestamo_imss", user_message)
         user_state[user_id] = "pregunta_ciudad"
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
@@ -455,7 +612,7 @@ def funnel_prestamo_imss(user_id, user_message):
         user_data[user_id]["ciudad"] = user_message.title()
         send_message(user_id,
             "¿Ya recibes tu pensión en Inbursa?"
-        )
+        , "prestamo_imss", user_message)
         user_state[user_id] = "pregunta_nomina_inbursa"
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
@@ -465,22 +622,22 @@ def funnel_prestamo_imss(user_id, user_message):
         if resp == "positive":
             send_message(user_id,
                 "Excelente, con Inbursa tendrás acceso a beneficios adicionales y atención prioritaria."
-            )
+            , "prestamo_imss", user_message)
             user_data[user_id]["nomina_inbursa"] = "Sí"
         elif resp == "negative":
             send_message(user_id,
                 "No hay problema 😊, los beneficios adicionales solo aplican si tienes la nómina con nosotros,\n"
                 "pero puedes cambiarte cuando gustes, sin costo ni compromiso."
-            )
+            , "prestamo_imss", user_message)
             user_data[user_id]["nomina_inbursa"] = "No"
         else:
-            send_message(user_id, "Por favor responde *sí* o *no* para continuar.")
+            send_message(user_id, "Por favor responde *sí* o *no* para continuar.", "prestamo_imss", user_message)
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         send_message(user_id,
             "¡Listo! 🎉 Tu crédito ha sido preautorizado.\n"
             "Un asesor financiero (Christian López) se pondrá en contacto contigo para continuar con el trámite.\n"
             "Gracias por tu confianza 🙌."
-        )
+        , "prestamo_imss", user_message)
         datos = user_data.get(user_id, {})
         formatted = (
             f"🔔 NUEVO PROSPECTO – PRÉSTAMO IMSS\n"
@@ -501,6 +658,174 @@ def funnel_prestamo_imss(user_id, user_message):
 
     send_main_menu(user_id)
     return jsonify({"status": "ok", "funnel": "prestamo_imss"})
+
+# ---------------------------------------------------------------
+# FUNCIÓN SEND_MESSAGE ACTUALIZADA PARA GUARDAR CONVERSACIONES
+# ---------------------------------------------------------------
+def send_message(to, text, funnel="menu", user_message=""):
+    """Envía mensajes y guarda en base de datos"""
+    try:
+        # Validación de variables críticas
+        if not META_TOKEN:
+            logging.error("❌ META_TOKEN no configurado")
+            return False
+            
+        url = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
+        headers = {
+            "Authorization": f"Bearer {META_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": str(to),
+            "type": "text",
+            "text": {"body": text}
+        }
+        
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        
+        if response.status_code in (200, 201):
+            # GUARDAR CONVERSACIÓN EN BASE DE DATOS
+            save_conversation(to, user_message, text, funnel, "text")
+            logging.info(f"✅ Mensaje enviado y guardado: {to}")
+            return True
+        else:
+            logging.error(f"❌ Error API Meta: {response.status_code}")
+            return False
+            
+    except Exception as e:
+        logging.exception(f"💥 Error en send_message: {e}")
+        return False
+
+def send_whatsapp_message(to, text):
+    return send_message(to, text, "system", "")
+
+# ---------------------------------------------------------------
+# ENDPOINTS PARA VER CONVERSACIONES
+# ---------------------------------------------------------------
+@app.route("/conversations", methods=["GET"])
+def view_conversations():
+    """Página web para ver todas las conversaciones"""
+    try:
+        limit = request.args.get('limit', 100, type=int)
+        phone_filter = request.args.get('phone', '')
+        
+        if phone_filter:
+            conversations = get_conversations(limit=limit, phone=phone_filter)
+        else:
+            conversations = get_conversations(limit=limit)
+        
+        stats = get_conversation_stats()
+        
+        html_template = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Conversaciones de Vicky Bot</title>
+            <meta charset="utf-8">
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+                .header { background: #2c3e50; color: white; padding: 20px; border-radius: 10px; }
+                .stats { background: white; padding: 15px; margin: 10px 0; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+                .conversation { background: white; padding: 15px; margin: 10px 0; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+                .user { color: #e74c3c; font-weight: bold; }
+                .bot { color: #27ae60; font-weight: bold; }
+                .phone { background: #3498db; color: white; padding: 2px 8px; border-radius: 3px; font-size: 12px; }
+                .funnel { background: #9b59b6; color: white; padding: 2px 8px; border-radius: 3px; font-size: 12px; }
+                .filters { background: white; padding: 15px; margin: 10px 0; border-radius: 5px; }
+                .timestamp { color: #7f8c8d; font-size: 12px; }
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>💬 Conversaciones de Vicky Bot</h1>
+                <p>Total: {{ stats.total_conversations }} conversaciones | Usuarios únicos: {{ stats.unique_users }} | Hoy: {{ stats.today_conversations }}</p>
+            </div>
+            
+            <div class="filters">
+                <form method="GET">
+                    <input type="text" name="phone" placeholder="Filtrar por teléfono" value="{{ phone_filter }}">
+                    <input type="number" name="limit" value="{{ limit }}" min="1" max="1000">
+                    <button type="submit">Filtrar</button>
+                    <a href="/conversations">Ver todas</a>
+                </form>
+            </div>
+            
+            <div class="stats">
+                <h3>📊 Estadísticas por Funnel:</h3>
+                {% for funnel, count in stats.funnel_stats.items() %}
+                <span class="funnel">{{ funnel }}: {{ count }}</span>
+                {% endfor %}
+            </div>
+            
+            {% for conv in conversations %}
+            <div class="conversation">
+                <div>
+                    <span class="phone">{{ conv[0] }}</span>
+                    <span class="funnel">{{ conv[3] }}</span>
+                    <span class="timestamp">{{ conv[5] }}</span>
+                </div>
+                <p><span class="user">👤 Usuario:</span> {{ conv[1] }}</p>
+                <p><span class="bot">🤖 Vicky Bot:</span> {{ conv[2] }}</p>
+                <p><span class="timestamp">Tipo: {{ conv[4] }}</span></p>
+            </div>
+            {% endfor %}
+            
+            {% if not conversations %}
+            <div class="conversation">
+                <p>No hay conversaciones para mostrar</p>
+            </div>
+            {% endif %}
+        </body>
+        </html>
+        """
+        
+        return render_template_string(html_template, 
+                                   conversations=conversations, 
+                                   stats=stats,
+                                   phone_filter=phone_filter,
+                                   limit=limit)
+        
+    except Exception as e:
+        return f"Error: {str(e)}", 500
+
+@app.route("/api/conversations", methods=["GET"])
+def api_conversations():
+    """API JSON para obtener conversaciones"""
+    try:
+        limit = request.args.get('limit', 50, type=int)
+        phone = request.args.get('phone', '')
+        
+        conversations = get_conversations(limit=limit, phone=phone)
+        
+        result = []
+        for conv in conversations:
+            result.append({
+                "phone": conv[0],
+                "user_message": conv[1],
+                "bot_response": conv[2],
+                "funnel": conv[3],
+                "message_type": conv[4],
+                "timestamp": conv[5]
+            })
+        
+        return jsonify({
+            "status": "success",
+            "count": len(result),
+            "conversations": result
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route("/api/stats", methods=["GET"])
+def api_stats():
+    """API para estadísticas"""
+    try:
+        stats = get_conversation_stats()
+        return jsonify({"status": "success", "stats": stats}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 # ---------------------------------------------------------------
 # ENDPOINTS PRINCIPALES
@@ -538,7 +863,7 @@ def receive_message():
             send_message(phone_number, 
                 "Por ahora solo puedo procesar mensajes de texto 📩\n\n"
                 "Escribe *menú* para ver los servicios disponibles."
-            )
+            , "system", user_message)
             return jsonify({"status": "ok"}), 200
 
         logging.info(f"📱 Mensaje de {phone_number}: '{user_message}'")
@@ -547,10 +872,10 @@ def receive_message():
         if is_gpt_command(user_message):
             prompt = user_message.split(":",1)[1].strip()
             if not prompt:
-                send_message(phone_number, "Para consultar GPT, escribe por ejemplo:\ngpt: ¿Qué ventajas tiene el crédito IMSS?")
+                send_message(phone_number, "Para consultar GPT, escribe por ejemplo:\ngpt: ¿Qué ventajas tiene el crédito IMSS?", "gpt", user_message)
                 return jsonify({"status": "ok", "source": "gpt"})
             gpt_reply = ask_gpt(prompt)
-            send_message(phone_number, gpt_reply)
+            send_message(phone_number, gpt_reply, "gpt", user_message)
             return jsonify({"status": "ok", "source": "gpt"})
 
         menu_options = {
@@ -614,7 +939,7 @@ def receive_message():
                 "✅ Responsabilidad civil\n"
                 "✅ Robo total y parcial\n\n"
                 "📞 Un asesor se comunicará contigo para cotizar tu seguro."
-            )
+            , "seguro_auto", user_message)
             send_whatsapp_message(ADVISOR_NUMBER, f"🚗 NUEVO INTERESADO EN SEGURO DE AUTO\n📞 {phone_number}")
             return jsonify({"status": "ok", "funnel": "menu"})
         if option == "seguro_vida":
@@ -626,7 +951,7 @@ def receive_message():
                 "✅ Hospitalización\n"
                 "✅ Atención médica las 24 horas\n\n"
                 "📞 Un asesor se comunicará contigo para explicarte las coberturas."
-            )
+            , "seguro_vida", user_message)
             send_whatsapp_message(ADVISOR_NUMBER, f"🏥 NUEVO INTERESADO EN SEGURO VIDA/SALUD\n📞 {phone_number}")
             return jsonify({"status": "ok", "funnel": "menu"})
         if option == "vrim":
@@ -638,7 +963,7 @@ def receive_message():
                 "✅ Medicamentos con descuento\n"
                 "✅ Atención dental y oftalmológica\n\n"
                 "📞 Un asesor se comunicará contigo para explicarte los beneficios."
-            )
+            , "vrim", user_message)
             send_whatsapp_message(ADVISOR_NUMBER, f"💳 NUEVO INTERESADO EN TARJETAS VRIM\n📞 {phone_number}")
             return jsonify({"status": "ok", "funnel": "menu"})
 
@@ -740,7 +1065,14 @@ def send_campaign_message(phone_number, nombre):
     except Exception as e:
         logging.exception(f"❌ Error en send_campaign_message: {e}")
 
+# ---------------------------------------------------------------
+# INICIALIZACIÓN
+# ---------------------------------------------------------------
 if __name__ == "__main__":
+    # Inicializar base de datos al iniciar
+    init_database()
+    
     port = int(os.getenv("PORT", 5000))
-    logging.info(f"🚀 Iniciando Vicky Bot en puerto {port}")
+    logging.info(f"🚀 Iniciando Vicky Bot con sistema de conversaciones en puerto {port}")
+    logging.info(f"📊 Ver conversaciones en: http://localhost:{port}/conversations")
     app.run(host="0.0.0.0", port=port)
