@@ -720,4 +720,4 @@ def send_campaign_message(phone_number, nombre):
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     logging.info(f"🚀 Iniciando Vicky Bot en puerto {port}")
-    app.run(host="0.0.0.0
+    app.run(host="0.0.0.0", port=port)
