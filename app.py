@@ -27,19 +27,10 @@ user_state = {}
 user_data = {}
 
 # ---------------------------------------------------------------
-# FUNCIÓN SEND_MESSAGE MEJORADA - ÚNICA MODIFICACIÓN CRÍTICA
+# UTILIDADES
 # ---------------------------------------------------------------
 def send_message(to, text):
-    """Envía mensajes de texto al usuario vía Meta Cloud API - VERSIÓN MEJORADA"""
     try:
-        # Validación de variables críticas
-        if not META_TOKEN:
-            logging.error("❌ META_TOKEN no configurado - No se puede enviar mensaje")
-            return False
-        if not WABA_PHONE_ID:
-            logging.error("❌ WABA_PHONE_ID no configurado - No se puede enviar mensaje")
-            return False
-            
         url = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
         headers = {
             "Authorization": f"Bearer {META_TOKEN}",
@@ -51,68 +42,13 @@ def send_message(to, text):
             "type": "text",
             "text": {"body": text}
         }
-        
-        logging.info(f"📤 Intentando enviar mensaje a {to}: {text[:50]}...")
-        response = requests.post(url, headers=headers, json=payload, timeout=10)
-        
-        if response.status_code in (200, 201):
-            logging.info(f"✅ Mensaje enviado CORRECTAMENTE a {to}")
-            return True
-        else:
-            logging.error(f"❌ Error API Meta al enviar a {to}: {response.status_code} - {response.text}")
-            return False
-            
+        requests.post(url, headers=headers, json=payload)
     except Exception as e:
-        logging.exception(f"💥 Error CRÍTICO en send_message para {to}: {e}")
-        return False
+        logging.exception(f"❌ Error en send_message: {e}")
 
 def send_whatsapp_message(to, text):
-    return send_message(to, text)
+    send_message(to, text)
 
-# ---------------------------------------------------------------
-# ENDPOINT DE DIAGNÓSTICO TEMPORAL - SOLO PARA DEBUGGING
-# ---------------------------------------------------------------
-@app.route("/debug-notification", methods=["GET", "POST"])
-def debug_notification():
-    """Endpoint temporal para probar notificaciones al asesor"""
-    if request.method == "GET":
-        return jsonify({
-            "service": "Debug Notificaciones Vicky",
-            "advisor_number": ADVISOR_NUMBER,
-            "variables_configuradas": {
-                "META_TOKEN": bool(META_TOKEN),
-                "WABA_PHONE_ID": bool(WABA_PHONE_ID),
-                "ADVISOR_NUMBER": ADVISOR_NUMBER
-            }
-        }), 200
-    
-    # POST: Probar envío de notificación real
-    try:
-        test_message = (
-            f"🔔 PRUEBA: Notificación de Vicky Bot\n"
-            f"📞 Para: {ADVISOR_NUMBER}\n"
-            f"🕐 Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"✅ Si recibes esto, las notificaciones funcionan"
-        )
-        
-        success = send_message(ADVISOR_NUMBER, test_message)
-        
-        return jsonify({
-            "notification_test": {
-                "sent_to": ADVISOR_NUMBER,
-                "success": success,
-                "timestamp": datetime.now().isoformat(),
-                "message_preview": test_message[:100] + "..."
-            }
-        }), 200
-        
-    except Exception as e:
-        logging.error(f"❌ Error en debug-notification: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# ---------------------------------------------------------------
-# MANTENER TODO EL RESTO DEL CÓDIGO EXACTAMENTE IGUAL
-# ---------------------------------------------------------------
 def extract_number(text):
     if not text:
         return None
@@ -162,6 +98,9 @@ def send_main_menu(phone):
     )
     send_message(phone, menu)
 
+# ---------------------------------------------------------------
+# GPT SOLO BAJO COMANDO (NO SUGERIR)
+# ---------------------------------------------------------------
 def ask_gpt(prompt, model="gpt-3.5-turbo", temperature=0.7):
     try:
         response = openai.ChatCompletion.create(
@@ -178,10 +117,9 @@ def ask_gpt(prompt, model="gpt-3.5-turbo", temperature=0.7):
 def is_gpt_command(msg):
     return re.match(r'^\s*gpt\s*:', msg.lower())
 
-def is_time_message(msg):
-    """Detecta si el mensaje contiene horas como '520 p.m.' o '921 a.m.'"""
-    return bool(re.search(r'\d{1,4}\s*(a\.m\.|p\.m\.)', msg.lower()))
-
+# ---------------------------------------------------------------
+# EMBUDO PRÉSTAMO IMSS (Ley 73) con preguntas adicionales
+# ---------------------------------------------------------------
 def funnel_prestamo_imss(user_id, user_message):
     state = user_state.get(user_id, "menu_mostrar_beneficios")
     datos = user_data.get(user_id, {})
@@ -361,7 +299,9 @@ def funnel_prestamo_imss(user_id, user_message):
     send_main_menu(user_id)
     return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
+# ---------------------------------------------------------------
 # NUEVA FUNCIÓN: Embudo de Financiamiento Empresarial
+# ---------------------------------------------------------------
 def funnel_empresarial(user_id, user_message):
     state = user_state.get(user_id, "empresarial_opciones")
     datos = user_data.get(user_id, {})
@@ -480,6 +420,9 @@ def funnel_empresarial(user_id, user_message):
     send_main_menu(user_id)
     return jsonify({"status": "ok", "funnel": "empresarial"})
 
+# ---------------------------------------------------------------
+# ENDPOINT PRINCIPAL /webhook
+# ---------------------------------------------------------------
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     mode = request.args.get("hub.mode")
@@ -518,11 +461,6 @@ def receive_message():
 
         logging.info(f"📱 Mensaje de {phone_number}: '{user_message}'")
 
-        # IGNORAR mensajes que contengan horas como "520 p.m." o "921 a.m."
-        if is_time_message(user_message):
-            logging.info(f"⏰ Ignorando mensaje con hora: {user_message}")
-            return jsonify({"status": "ignored", "reason": "time_message"}), 200
-
         # GPT SOLO BAJO COMANDO (en cualquier parte del bot)
         if is_gpt_command(user_message):
             prompt = user_message.split(":",1)[1].strip()
@@ -532,13 +470,6 @@ def receive_message():
             gpt_reply = ask_gpt(prompt)
             send_message(phone_number, gpt_reply)
             return jsonify({"status": "ok", "source": "gpt"})
-
-        # PRIMERO VERIFICAR SI EL USUARIO QUIERE SALIR AL MENÚ (desde cualquier estado)
-        if user_message.lower() in ["menu", "menú", "men", "opciones", "servicios"]:
-            user_state.pop(phone_number, None)
-            user_data.pop(phone_number, None)
-            send_main_menu(phone_number)
-            return jsonify({"status": "ok", "funnel": "menu"})
 
         menu_options = {
             "1": "prestamo_imss",
@@ -631,11 +562,17 @@ def receive_message():
             send_whatsapp_message(ADVISOR_NUMBER, f"💳 NUEVO INTERESADO EN TARJETAS VRIM\n📞 {phone_number}")
             return jsonify({"status": "ok", "funnel": "menu"})
 
+        # Comando de menú
+        if user_message.lower() in ["menu", "menú", "men", "opciones", "servicios"]:
+            user_state.pop(phone_number, None)
+            user_data.pop(phone_number, None)
+            send_main_menu(phone_number)
+            return jsonify({"status": "ok", "funnel": "menu"})
+
         if user_message.lower() in ["hola", "hi", "hello", "buenas", "buenos días", "buenas tardes"]:
             send_main_menu(phone_number)
             return jsonify({"status": "ok", "funnel": "menu"})
 
-        # Si no es un comando reconocido, mostrar el menú principal
         send_main_menu(phone_number)
         return jsonify({"status": "ok", "funnel": "menu"})
 
@@ -643,44 +580,12 @@ def receive_message():
         logging.exception(f"❌ Error en receive_message: {e}")
         return jsonify({"error": str(e)}), 500
 
+# ---------------------------------------------------------------
+# Endpoint de salud
+# ---------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "Vicky Bot Inbursa"}), 200
-
-def send_campaign_message(phone_number, nombre):
-    """
-    Envía un mensaje tipo plantilla promocional usando la API de WhatsApp Business.
-    La plantilla se llama "credito_imss_promocion_1" en idioma "es_MX".
-    El nombre del prospecto se incluye como parámetro {{1}}.
-    """
-    try:
-        url = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
-        headers = {
-            "Authorization": f"Bearer {META_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": str(phone_number),
-            "type": "template",
-            "template": {
-                "name": "credito_imss_promocion_1",
-                "language": {"code": "es_MX"},
-                "components": [
-                    {
-                        "type": "body",
-                        "parameters": [
-                            {"type": "text", "text": str(nombre)}
-                        ]
-                    }
-                ]
-            }
-        }
-        response = requests.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        logging.info(f"✅ Mensaje campaña enviado a {phone_number} ({nombre})")
-    except Exception as e:
-        logging.exception(f"❌ Error en send_campaign_message: {e}")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
