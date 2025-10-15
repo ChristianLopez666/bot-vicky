@@ -178,6 +178,10 @@ def ask_gpt(prompt, model="gpt-3.5-turbo", temperature=0.7):
 def is_gpt_command(msg):
     return re.match(r'^\s*gpt\s*:', msg.lower())
 
+def is_time_message(msg):
+    """Detecta si el mensaje contiene horas como '520 p.m.' o '921 a.m.'"""
+    return bool(re.search(r'\d{1,4}\s*(a\.m\.|p\.m\.)', msg.lower()))
+
 def funnel_prestamo_imss(user_id, user_message):
     state = user_state.get(user_id, "menu_mostrar_beneficios")
     datos = user_data.get(user_id, {})
@@ -362,6 +366,13 @@ def funnel_empresarial(user_id, user_message):
     state = user_state.get(user_id, "empresarial_opciones")
     datos = user_data.get(user_id, {})
 
+    # Verificar primero si el usuario quiere salir al menú
+    if user_message.lower() in ["menu", "menú", "men", "opciones", "servicios"]:
+        send_main_menu(user_id)
+        user_state.pop(user_id, None)
+        user_data.pop(user_id, None)
+        return jsonify({"status": "ok", "funnel": "menu"})
+
     # Paso 1: Mostrar opciones de crédito empresarial
     if state == "empresarial_opciones":
         send_message(user_id,
@@ -507,6 +518,11 @@ def receive_message():
 
         logging.info(f"📱 Mensaje de {phone_number}: '{user_message}'")
 
+        # IGNORAR mensajes que contengan horas como "520 p.m." o "921 a.m."
+        if is_time_message(user_message):
+            logging.info(f"⏰ Ignorando mensaje con hora: {user_message}")
+            return jsonify({"status": "ignored", "reason": "time_message"}), 200
+
         # GPT SOLO BAJO COMANDO (en cualquier parte del bot)
         if is_gpt_command(user_message):
             prompt = user_message.split(":",1)[1].strip()
@@ -516,6 +532,13 @@ def receive_message():
             gpt_reply = ask_gpt(prompt)
             send_message(phone_number, gpt_reply)
             return jsonify({"status": "ok", "source": "gpt"})
+
+        # PRIMERO VERIFICAR SI EL USUARIO QUIERE SALIR AL MENÚ (desde cualquier estado)
+        if user_message.lower() in ["menu", "menú", "men", "opciones", "servicios"]:
+            user_state.pop(phone_number, None)
+            user_data.pop(phone_number, None)
+            send_main_menu(phone_number)
+            return jsonify({"status": "ok", "funnel": "menu"})
 
         menu_options = {
             "1": "prestamo_imss",
@@ -549,15 +572,8 @@ def receive_message():
 
         option = menu_options.get(user_message.lower())
 
-        # DETECCIÓN DE ESTADO ACTUAL - VERSIÓN CORREGIDA
+        # DETECCIÓN DE ESTADO ACTUAL
         current_state = user_state.get(phone_number)
-
-        # Si el usuario escribe "menu", "servicios", etc. - SALIR de cualquier embudo
-        if user_message.lower() in ["menu", "menú", "men", "opciones", "servicios"]:
-            user_state.pop(phone_number, None)
-            user_data.pop(phone_number, None)
-            send_main_menu(phone_number)
-            return jsonify({"status": "ok", "funnel": "menu"})
 
         # Si está en embudo empresarial
         if current_state and "empresarial" in current_state:
@@ -615,17 +631,11 @@ def receive_message():
             send_whatsapp_message(ADVISOR_NUMBER, f"💳 NUEVO INTERESADO EN TARJETAS VRIM\n📞 {phone_number}")
             return jsonify({"status": "ok", "funnel": "menu"})
 
-        # Comando de menú (ya manejado arriba, pero por si acaso)
-        if user_message.lower() in ["menu", "menú", "men", "opciones", "servicios"]:
-            user_state.pop(phone_number, None)
-            user_data.pop(phone_number, None)
-            send_main_menu(phone_number)
-            return jsonify({"status": "ok", "funnel": "menu"})
-
         if user_message.lower() in ["hola", "hi", "hello", "buenas", "buenos días", "buenas tardes"]:
             send_main_menu(phone_number)
             return jsonify({"status": "ok", "funnel": "menu"})
 
+        # Si no es un comando reconocido, mostrar el menú principal
         send_main_menu(phone_number)
         return jsonify({"status": "ok", "funnel": "menu"})
 
