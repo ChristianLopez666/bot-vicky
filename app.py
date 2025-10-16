@@ -358,12 +358,12 @@ def funnel_prestamo_imss(user_id, user_message):
     return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
 # ---------------------------------------------------------------
-# EMBUDO PARA CRÉDITO EMPRESARIAL (AGREGADO / CORREGIDO)
+# EMBUDO PARA CRÉDITO EMPRESARIAL (SOLAMENTE ESTE BLOQUE SE MODIFICÓ)
 # ---------------------------------------------------------------
 def funnel_credito_empresarial(user_id, user_message):
     """
     Embudo conversacional para Financiamiento Empresarial Inbursa.
-    Mantiene el mismo estilo y manejo de estados que funnel_prestamo_imss.
+    Mantiene el mismo estilo, validaciones y uso de user_state y user_data que funnel_prestamo_imss.
     """
     state = user_state.get(user_id, "menu_mostrar_beneficios_empresarial")
     datos = user_data.get(user_id, {})
@@ -389,11 +389,14 @@ def funnel_credito_empresarial(user_id, user_message):
         resp = interpret_response(user_message)
         lowered = (user_message or "").lower()
         empresario_keywords = ["empresario", "empresa", "negocio", "pyme", "comercio"]
+        # Si el usuario responde afirmativamente (o usa alguna palabra clave), avanzar
         if resp == "positive" or any(k in lowered for k in empresario_keywords):
             send_message(user_id, "¿A qué se dedica tu empresa?")
             user_state[user_id] = "pregunta_actividad_empresa"
+            # asegurar que exista el dict para este usuario
             user_data.setdefault(user_id, {})
             return jsonify({"status": "ok", "funnel": "credito_empresarial"})
+        # Si responde negativo, volver al menú principal
         elif resp == "negative":
             send_main_menu(user_id)
             user_state.pop(user_id, None)
@@ -457,7 +460,6 @@ def funnel_credito_empresarial(user_id, user_message):
         # Formatear y enviar notificación al asesor usando ADVISOR_NUMBER
         try:
             monto = datos.get("monto_solicitado", 0)
-            # asegurar que monto maneje None
             monto_val = monto if isinstance(monto, (int, float)) else 0
             formatted = (
                 f"🔔 NUEVO PROSPECTO – CRÉDITO EMPRESARIAL\n"
@@ -468,8 +470,11 @@ def funnel_credito_empresarial(user_id, user_message):
                 f"Actividad: {datos.get('actividad_empresa','N/D')}\n"
                 f"Número WhatsApp: {user_id}"
             )
-            # enviar notificación al asesor
-            send_whatsapp_message(ADVISOR_NUMBER, formatted)
+            sent = send_whatsapp_message(ADVISOR_NUMBER, formatted)
+            if not sent:
+                logging.error("❌ No fue posible enviar la notificación al asesor (CRÉDITO EMPRESARIAL).")
+            else:
+                logging.info("✅ Notificación enviada al asesor (CRÉDITO EMPRESARIAL).")
         except Exception as e:
             logging.exception(f"❌ Error al notificar al asesor (crédito empresarial): {e}")
 
@@ -574,14 +579,6 @@ def receive_message():
             user_state[phone_number] = "menu_mostrar_beneficios"
             return funnel_prestamo_imss(phone_number, user_message)
 
-        # Opción 5: Iniciar embudo Crédito Empresarial
-        if option == "empresarial":
-            # iniciar embudo conversacional empresarial
-            user_state[phone_number] = "menu_mostrar_beneficios_empresarial"
-            # asegurar estructura de datos inicial
-            user_data.setdefault(phone_number, {})
-            return funnel_credito_empresarial(phone_number, user_message)
-
         # Otros servicios - menú estándar
         if option == "seguro_auto":
             send_message(phone_number,
@@ -618,6 +615,18 @@ def receive_message():
                 "📞 Un asesor se comunicará contigo para explicarte los beneficios."
             )
             send_whatsapp_message(ADVISOR_NUMBER, f"💳 NUEVO INTERESADO EN TARJETAS VRIM\n📞 {phone_number}")
+            return jsonify({"status": "ok", "funnel": "menu"})
+        if option == "empresarial":
+            send_message(phone_number,
+                "🏢 *Financiamiento Empresarial Inbursa*\n\n"
+                "Impulsa el crecimiento de tu negocio con:\n\n"
+                "✅ Créditos desde $100,000 hasta $100,000,000\n"
+                "✅ Tasas preferenciales\n"
+                "✅ Plazos flexibles\n"
+                "✅ Asesoría especializada\n\n"
+                "📞 Un asesor se pondrá en contacto contigo para analizar tu proyecto."
+            )
+            send_whatsapp_message(ADVISOR_NUMBER, f"🏢 NUEVO INTERESADO EN FINANCIAMIENTO EMPRESARIAL\n📞 {phone_number}")
             return jsonify({"status": "ok", "funnel": "menu"})
 
         # Comando de menú
