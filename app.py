@@ -358,12 +358,14 @@ def funnel_prestamo_imss(user_id, user_message):
     return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
 # ---------------------------------------------------------------
-# EMBUDO PARA CRÉDITO EMPRESARIAL (SOLAMENTE ESTE BLOQUE SE MODIFICÓ)
+# EMBUDO PARA CRÉDITO EMPRESARIAL (SE AJUSTÓ SOLO ESTE BLOQUE)
 # ---------------------------------------------------------------
 def funnel_credito_empresarial(user_id, user_message):
     """
     Embudo conversacional para Financiamiento Empresarial Inbursa.
-    Mantiene el mismo estilo, validaciones y uso de user_state y user_data que funnel_prestamo_imss.
+    Ajustado para evitar conflicto con la lógica global del menú que detecta estados que contienen
+    la subcadena "pregunta_" y redirige al embudo IMSS. Por eso aquí usamos estados diferentes
+    (sin "pregunta_") pero mantenemos user_state/user_data, validaciones y formato.
     """
     state = user_state.get(user_id, "menu_mostrar_beneficios_empresarial")
     datos = user_data.get(user_id, {})
@@ -381,23 +383,22 @@ def funnel_credito_empresarial(user_id, user_message):
         send_message(user_id,
             "¿Eres empresario o representas una empresa?"
         )
-        user_state[user_id] = "pregunta_empresario"
+        # Estado siguiente (evitar 'pregunta_' prefijo para no ser atrapado por la regla global)
+        user_state[user_id] = "empresa_confirmacion"
         # asegurar dict inicial
         user_data.setdefault(user_id, {})
         return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
     # Paso 2 – Confirmar si es empresario
-    if state == "pregunta_empresario":
+    if state == "empresa_confirmacion":
         resp = interpret_response(user_message)
         lowered = (user_message or "").lower()
         empresario_keywords = ["empresario", "empresa", "negocio", "pyme", "comercio"]
-        # Si el usuario responde afirmativamente (o usa alguna palabra clave), avanzar
         if resp == "positive" or any(k in lowered for k in empresario_keywords):
             send_message(user_id, "¿A qué se dedica tu empresa?")
-            user_state[user_id] = "pregunta_actividad_empresa"
+            user_state[user_id] = "empresa_actividad"
             user_data.setdefault(user_id, {})
             return jsonify({"status": "ok", "funnel": "credito_empresarial"})
-        # Si responde negativo, volver al menú principal
         elif resp == "negative":
             send_main_menu(user_id)
             user_state.pop(user_id, None)
@@ -408,16 +409,16 @@ def funnel_credito_empresarial(user_id, user_message):
             return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
     # Paso 3 – Actividad de la empresa
-    if state == "pregunta_actividad_empresa":
+    if state == "empresa_actividad":
         datos = user_data.get(user_id, {})
         datos["actividad_empresa"] = user_message.title()
         user_data[user_id] = datos
         send_message(user_id, "¿Qué monto deseas solicitar? (mínimo $100,000)")
-        user_state[user_id] = "pregunta_monto_solicitado_empresarial"
+        user_state[user_id] = "empresa_monto"
         return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
     # Paso 4 – Monto solicitado
-    if state == "pregunta_monto_solicitado_empresarial":
+    if state == "empresa_monto":
         monto_solicitado = extract_number(user_message)
         if monto_solicitado is None or monto_solicitado < 100000:
             send_message(user_id, "Indica el monto que deseas solicitar (mínimo $100,000), ejemplo: 250000")
@@ -426,29 +427,29 @@ def funnel_credito_empresarial(user_id, user_message):
         datos["monto_solicitado"] = monto_solicitado
         user_data[user_id] = datos
         send_message(user_id, "¿Cuál es tu nombre completo?")
-        user_state[user_id] = "pregunta_nombre_empresarial"
+        user_state[user_id] = "empresa_nombre"
         return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
     # Paso 5 – Nombre completo
-    if state == "pregunta_nombre_empresarial":
+    if state == "empresa_nombre":
         datos = user_data.get(user_id, {})
         datos["nombre"] = user_message.title()
         user_data[user_id] = datos
         send_message(user_id, "¿Cuál es tu número telefónico?")
-        user_state[user_id] = "pregunta_telefono_empresarial"
+        user_state[user_id] = "empresa_telefono"
         return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
     # Paso 6 – Teléfono de contacto
-    if state == "pregunta_telefono_empresarial":
+    if state == "empresa_telefono":
         datos = user_data.get(user_id, {})
         datos["telefono"] = user_message
         user_data[user_id] = datos
         send_message(user_id, "¿En qué ciudad está ubicada tu empresa?")
-        user_state[user_id] = "pregunta_ciudad_empresarial"
+        user_state[user_id] = "empresa_ciudad"
         return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
     # Paso 7 – Ciudad y Paso 8 – Confirmar y notificar
-    if state == "pregunta_ciudad_empresarial":
+    if state == "empresa_ciudad":
         datos = user_data.get(user_id, {})
         datos["ciudad"] = user_message.title()
         user_data[user_id] = datos
