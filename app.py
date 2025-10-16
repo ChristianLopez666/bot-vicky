@@ -382,6 +382,8 @@ def funnel_credito_empresarial(user_id, user_message):
             "¿Eres empresario o representas una empresa?"
         )
         user_state[user_id] = "pregunta_empresario"
+        # asegurar dict inicial
+        user_data.setdefault(user_id, {})
         return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
     # Paso 2 – Confirmar si es empresario
@@ -393,7 +395,6 @@ def funnel_credito_empresarial(user_id, user_message):
         if resp == "positive" or any(k in lowered for k in empresario_keywords):
             send_message(user_id, "¿A qué se dedica tu empresa?")
             user_state[user_id] = "pregunta_actividad_empresa"
-            # asegurar que exista el dict para este usuario
             user_data.setdefault(user_id, {})
             return jsonify({"status": "ok", "funnel": "credito_empresarial"})
         # Si responde negativo, volver al menú principal
@@ -617,17 +618,10 @@ def receive_message():
             send_whatsapp_message(ADVISOR_NUMBER, f"💳 NUEVO INTERESADO EN TARJETAS VRIM\n📞 {phone_number}")
             return jsonify({"status": "ok", "funnel": "menu"})
         if option == "empresarial":
-            send_message(phone_number,
-                "🏢 *Financiamiento Empresarial Inbursa*\n\n"
-                "Impulsa el crecimiento de tu negocio con:\n\n"
-                "✅ Créditos desde $100,000 hasta $100,000,000\n"
-                "✅ Tasas preferenciales\n"
-                "✅ Plazos flexibles\n"
-                "✅ Asesoría especializada\n\n"
-                "📞 Un asesor se pondrá en contacto contigo para analizar tu proyecto."
-            )
-            send_whatsapp_message(ADVISOR_NUMBER, f"🏢 NUEVO INTERESADO EN FINANCIAMIENTO EMPRESARIAL\n📞 {phone_number}")
-            return jsonify({"status": "ok", "funnel": "menu"})
+            # Iniciar embudo conversacional para crédito empresarial
+            user_state[phone_number] = "menu_mostrar_beneficios_empresarial"
+            user_data.setdefault(phone_number, {})
+            return funnel_credito_empresarial(phone_number, user_message)
 
         # Comando de menú
         if user_message.lower() in ["menu", "menú", "men", "opciones", "servicios"]:
