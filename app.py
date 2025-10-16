@@ -358,7 +358,7 @@ def funnel_prestamo_imss(user_id, user_message):
     return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
 # ---------------------------------------------------------------
-# NUEVO: EMBUDO PARA CRÉDITO EMPRESARIAL
+# NUEVO: EMBUDO PARA CRÉDITO EMPRESARIAL (CORREGIDO)
 # ---------------------------------------------------------------
 def funnel_credito_empresarial(user_id, user_message):
     """
@@ -557,10 +557,38 @@ def receive_message():
 
         option = menu_options.get(user_message.lower())
 
-        # FLUJO IMSS: Si está en embudo, seguir el estado
+        # FLUJO: Si hay un estado en curso, enrutar al funnel correspondiente
         current_state = user_state.get(phone_number)
-        if current_state and ("prestamo_imss" in current_state or "pregunta_" in current_state):
-            return funnel_prestamo_imss(phone_number, user_message)
+
+        # Definir los estados del embudo IMSS y Empresarial de forma explícita
+        prestamo_imss_states = {
+            "menu_mostrar_beneficios",
+            "pregunta_pensionado",
+            "pregunta_monto_pension",
+            "pregunta_ofrecer_asesor",
+            "pregunta_monto_solicitado",
+            "pregunta_nombre",
+            "pregunta_telefono",
+            "pregunta_ciudad",
+            "pregunta_nomina_inbursa"
+        }
+
+        empresarial_states = {
+            "menu_mostrar_beneficios_empresarial",
+            "pregunta_empresario",
+            "pregunta_actividad_empresa",
+            "pregunta_monto_solicitado_empresarial",
+            "pregunta_nombre_empresarial",
+            "pregunta_telefono_empresarial",
+            "pregunta_ciudad_empresarial"
+        }
+
+        if current_state:
+            if current_state in prestamo_imss_states:
+                return funnel_prestamo_imss(phone_number, user_message)
+            if current_state in empresarial_states:
+                return funnel_credito_empresarial(phone_number, user_message)
+            # si el estado no pertenece a ninguno, continuar con evaluación normal
 
         # Opción 1: Iniciar embudo IMSS
         if option == "prestamo_imss":
@@ -609,220 +637,6 @@ def receive_message():
             )
             send_whatsapp_message(ADVISOR_NUMBER, f"💳 NUEVO INTERESADO EN TARJETAS VRIM\n📞 {phone_number}")
             return jsonify({"status": "ok", "funnel": "menu"})
-        if option == "empresarial":
-            # handled above
-            pass
-        if option == "empresarial":
-            # redundant guard, safe no-op
-            pass
-        if option == "empresarial":
-            # safe no-op
-            pass
-        if option == "empresarial":
-            # safe no-op
-            pass
-        if option == "empresarial":
-            # safe no-op
-            pass
-        if option == "empresarial":
-            # safe no-op
-            pass
-        if option == "empresarial":
-            # safe no-op
-            pass
-        if option == "empresarial":
-            # safe no-op
-            pass
-        if option == "empresarial":
-            # safe no-op
-            pass
-        if option == "empresarial":
-            # safe no-op
-            pass
-
-        if option == "empresarial":
-            # final safe no-op
-            pass
-
-        if option == "empresarial":
-            # final safe no-op
-            pass
-
-        if option == "empresarial":
-            # final safe no-op
-            pass
-
-        if option == "empresarial":
-            # final safe no-op
-            pass
-
-        if option == "empresarial":
-            # final safe no-op
-            pass
-
-        if option == "empresarial":
-            # final safe no-op
-            pass
-
-        if option == "empresarial":
-            # final safe no-op
-            pass
-
-        if option == "empresarial":
-            # final safe no-op
-            pass
-
-        if option == "empresarial":
-            # final safe no-op
-            pass
-
-        if option == "empresarial":
-            # final safe no-op
-            pass
-
-        if option == "empresarial":
-            # final safe no-op
-            pass
-
-        if option == "empresarial":
-            # final safe no-op
-            pass
-
-        if option == "empresarial":
-            # final safe no-op
-            pass
-
-        if option == "empresarial":
-            # placeholder to ensure previous blocks unchanged
-            pass
-
-        if option == "empresarial":
-            # placeholder
-            pass
-
-        if option == "empresarial":
-            # placeholder
-            pass
-
-        if option == "empresarial":
-            # placeholder
-            pass
-
-        if option == "empresarial":
-            # placeholder
-            pass
-
-        if option == "empresarial":
-            # placeholder
-            pass
-
-        # Opción empresarial ya manejada arriba; resto de servicios abajo
-
-        if option == "empresarial":
-            # already handled
-            pass
-
-        if option == "empresarial":
-            # no-op
-            pass
-
-        if option == "empresarial":
-            # no-op
-            pass
-
-        if option == "empresarial":
-            # no-op
-            pass
-
-        if option == "empresarial":
-            # no-op
-            pass
-
-        if option == "empresarial":
-            # no-op
-            pass
-
-        if option == "empresarial":
-            # no-op
-            pass
-
-        if option == "empresarial":
-            # no-op
-            pass
-
-        if option == "empresarial":
-            # no-op
-            pass
-
-        if option == "empresarial":
-            # no-op
-            pass
-
-        if option == "empresarial":
-            # no-op
-            pass
-
-        if option == "empresarial":
-            # no-op
-            pass
-
-        if option == "empresarial":
-            # no-op
-            pass
-
-        if option == "empresarial":
-            # no-op
-            pass
-
-        if option == "empresarial":
-            # no-op
-            pass
-
-        # Fin de bloques repetidos para mantener integridad del archivo original
-
-        if option == "empresarial":
-            # asegurando que no se ejecute el bloque original de notificación simple
-            pass
-
-        if option == "empresarial":
-            # passthrough
-            pass
-
-        if option == "empresarial":
-            # noop
-            pass
-
-        if option == "empresarial":
-            # noop
-            pass
-
-        if option == "empresarial":
-            # noop
-            pass
-
-        if option == "empresarial":
-            # noop
-            pass
-
-        if option == "empresarial":
-            # noop
-            pass
-
-        if option == "empresarial":
-            # noop
-            pass
-
-        if option == "empresarial":
-            # noop
-            pass
-
-        if option == "empresarial":
-            # noop
-            pass
-
-        if option == "empresarial":
-            # noop
-            pass
 
         # Comando de menú
         if user_message.lower() in ["menu", "menú", "men", "opciones", "servicios"]:
