@@ -357,6 +357,110 @@ def funnel_prestamo_imss(user_id, user_message):
     send_main_menu(user_id)
     return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
+# ---------------------------------------------------------------
+# NUEVO EMBUDO – CRÉDITO EMPRESARIAL
+# ---------------------------------------------------------------
+def funnel_credito_empresarial(user_id, user_message):
+    state = user_state.get(user_id, "menu_mostrar_beneficios_empresarial")
+    datos = user_data.get(user_id, {})
+
+    # Paso 0 – Mostrar beneficios
+    if state == "menu_mostrar_beneficios_empresarial":
+        send_message(user_id,
+            "💼 *Crédito Empresarial Inbursa*\n"
+            "- Financiamiento desde $100,000 hasta $100,000,000\n"
+            "- Tasas preferenciales y plazos flexibles\n"
+            "- Sin aval con buen historial\n"
+            "- Apoyo a PYMES, comercios y empresas consolidadas\n"
+            "- Asesoría personalizada según tu giro"
+        )
+        send_message(user_id, "¿Eres empresario o representas una empresa?")
+        user_state[user_id] = "pregunta_empresario"
+        return jsonify({"status": "ok", "funnel": "credito_empresarial"})
+
+    # Paso 1 – Confirmar si es empresario
+    if state == "pregunta_empresario":
+        resp = interpret_response(user_message)
+        if resp == "negative":
+            send_message(user_id, "Perfecto 😊, también tenemos otros servicios financieros que pueden interesarte:")
+            send_main_menu(user_id)
+            user_state.pop(user_id, None)
+            user_data.pop(user_id, None)
+            return jsonify({"status": "ok", "funnel": "credito_empresarial"})
+        elif resp == "positive":
+            send_message(user_id, "Excelente 👏 ¿A qué se dedica tu empresa?")
+            user_state[user_id] = "pregunta_actividad_empresa"
+            return jsonify({"status": "ok", "funnel": "credito_empresarial"})
+        else:
+            send_message(user_id, "Por favor responde *sí* o *no* para continuar.")
+            return jsonify({"status": "ok", "funnel": "credito_empresarial"})
+
+    # Paso 2 – Actividad de la empresa
+    if state == "pregunta_actividad_empresa":
+        user_data[user_id]["actividad_empresa"] = user_message.title()
+        send_message(user_id, "¿Qué monto aproximado deseas solicitar? (mínimo $100,000)")
+        user_state[user_id] = "pregunta_monto_solicitado_emp"
+        return jsonify({"status": "ok", "funnel": "credito_empresarial"})
+
+    # Paso 3 – Monto solicitado
+    if state == "pregunta_monto_solicitado_emp":
+        monto = extract_number(user_message)
+        if monto is None or monto < 100000:
+            send_message(user_id, "Indica el monto deseado (mínimo $100,000), ejemplo: 250000")
+            return jsonify({"status": "ok", "funnel": "credito_empresarial"})
+        user_data[user_id]["monto_solicitado"] = monto
+        send_message(user_id, "¿Cuál es el nombre completo del titular o representante legal?")
+        user_state[user_id] = "pregunta_nombre_emp"
+        return jsonify({"status": "ok", "funnel": "credito_empresarial"})
+
+    # Paso 4 – Nombre
+    if state == "pregunta_nombre_emp":
+        if not is_valid_name(user_message):
+            send_message(user_id, "Por favor escribe el nombre completo del titular o representante legal.")
+            return jsonify({"status": "ok", "funnel": "credito_empresarial"})
+        user_data[user_id]["nombre"] = user_message.title()
+        send_message(user_id, "¿Cuál es el número de contacto?")
+        user_state[user_id] = "pregunta_telefono_emp"
+        return jsonify({"status": "ok", "funnel": "credito_empresarial"})
+
+    # Paso 5 – Teléfono
+    if state == "pregunta_telefono_emp":
+        if not is_valid_phone(user_message):
+            send_message(user_id, "Por favor escribe un número válido de 10 a 15 dígitos.")
+            return jsonify({"status": "ok", "funnel": "credito_empresarial"})
+        user_data[user_id]["telefono_contacto"] = user_message
+        send_message(user_id, "¿En qué ciudad se encuentra tu empresa?")
+        user_state[user_id] = "pregunta_ciudad_emp"
+        return jsonify({"status": "ok", "funnel": "credito_empresarial"})
+
+    # Paso 6 – Ciudad
+    if state == "pregunta_ciudad_emp":
+        user_data[user_id]["ciudad"] = user_message.title()
+        datos = user_data.get(user_id, {})
+        send_message(user_id,
+            "🎯 Perfecto, hemos registrado tu solicitud.\n"
+            "Un asesor financiero (Christian López) se comunicará contigo para ofrecerte la mejor propuesta.\n"
+            "Gracias por confiar en Inbursa 🙌."
+        )
+        formatted = (
+            f"🔔 NUEVO PROSPECTO – CRÉDITO EMPRESARIAL\n"
+            f"Nombre: {datos.get('nombre','N/D')}\n"
+            f"WhatsApp: {user_id}\n"
+            f"Teléfono: {datos.get('telefono_contacto','N/D')}\n"
+            f"Ciudad: {datos.get('ciudad','N/D')}\n"
+            f"Giro: {datos.get('actividad_empresa','N/D')}\n"
+            f"Monto solicitado: ${datos.get('monto_solicitado','N/D'):,.0f}"
+        )
+        send_whatsapp_message(ADVISOR_NUMBER, formatted)
+        send_message(user_id, "Además, tenemos otros servicios financieros disponibles 👇")
+        send_main_menu(user_id)
+        user_state.pop(user_id, None)
+        user_data.pop(user_id, None)
+        return jsonify({"status": "ok", "funnel": "credito_empresarial"})
+
+    send_main_menu(user_id)
+    return jsonify({"status": "ok", "funnel": "credito_empresarial"})
+
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     mode = request.args.get("hub.mode")
@@ -441,11 +545,19 @@ def receive_message():
         current_state = user_state.get(phone_number)
         if current_state and ("prestamo_imss" in current_state or "pregunta_" in current_state):
             return funnel_prestamo_imss(phone_number, user_message)
+        # FLUJO EMPRESARIAL: si está en embudo, seguir el estado (1 línea)
+        if current_state and ("empresarial" in current_state or current_state.startswith("menu_mostrar_beneficios_empresarial")):
+            return funnel_credito_empresarial(phone_number, user_message)
 
         # Opción 1: Iniciar embudo IMSS
         if option == "prestamo_imss":
             user_state[phone_number] = "menu_mostrar_beneficios"
             return funnel_prestamo_imss(phone_number, user_message)
+
+        # Opción 5: Iniciar embudo EMPRESARIAL (cambio mínimo en bloque del menú)
+        if option == "empresarial":
+            user_state[phone_number] = "menu_mostrar_beneficios_empresarial"
+            return funnel_credito_empresarial(phone_number, user_message)
 
         # Otros servicios - menú estándar
         if option == "seguro_auto":
@@ -483,18 +595,6 @@ def receive_message():
                 "📞 Un asesor se comunicará contigo para explicarte los beneficios."
             )
             send_whatsapp_message(ADVISOR_NUMBER, f"💳 NUEVO INTERESADO EN TARJETAS VRIM\n📞 {phone_number}")
-            return jsonify({"status": "ok", "funnel": "menu"})
-        if option == "empresarial":
-            send_message(phone_number,
-                "🏢 *Financiamiento Empresarial Inbursa*\n\n"
-                "Impulsa el crecimiento de tu negocio con:\n\n"
-                "✅ Créditos desde $100,000 hasta $100,000,000\n"
-                "✅ Tasas preferenciales\n"
-                "✅ Plazos flexibles\n"
-                "✅ Asesoría especializada\n\n"
-                "📞 Un asesor se pondrá en contacto contigo para analizar tu proyecto."
-            )
-            send_whatsapp_message(ADVISOR_NUMBER, f"🏢 NUEVO INTERESADO EN FINANCIAMIENTO EMPRESARIAL\n📞 {phone_number}")
             return jsonify({"status": "ok", "funnel": "menu"})
 
         # Comando de menú
@@ -558,3 +658,4 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     logging.info(f"🚀 Iniciando Vicky Bot en puerto {port}")
     app.run(host="0.0.0.0", port=port)
+
