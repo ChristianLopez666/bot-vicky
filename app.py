@@ -32,14 +32,12 @@ user_data = {}
 def send_message(to, text):
     """Envía mensajes de texto al usuario vía Meta Cloud API - VERSIÓN MEJORADA"""
     try:
-        # Validación de variables críticas
         if not META_TOKEN:
             logging.error("❌ META_TOKEN no configurado - No se puede enviar mensaje")
             return False
         if not WABA_PHONE_ID:
             logging.error("❌ WABA_PHONE_ID no configurado - No se puede enviar mensaje")
             return False
-            
         url = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
         headers = {
             "Authorization": f"Bearer {META_TOKEN}",
@@ -51,19 +49,16 @@ def send_message(to, text):
             "type": "text",
             "text": {"body": text}
         }
-        
-        logging.info(f"📤 Intentando enviar mensaje a {to}: {text[:50]}...")
+        logging.info(f"📤 Intentando enviar mensaje a {to} {text[:50]}...")
         response = requests.post(url, headers=headers, json=payload, timeout=10)
-        
         if response.status_code in (200, 201):
             logging.info(f"✅ Mensaje enviado CORRECTAMENTE a {to}")
             return True
         else:
-            logging.error(f"❌ Error API Meta al enviar a {to}: {response.status_code} - {response.text}")
+            logging.error(f"❌ Error API Meta al enviar a {to} {response.status_code} - {response.text}")
             return False
-            
     except Exception as e:
-        logging.exception(f"💥 Error CRÍTICO en send_message para {to}: {e}")
+        logging.exception(f"💥 Error CRÍTICO en send_message para {to} {e}")
         return False
 
 def send_whatsapp_message(to, text):
@@ -72,7 +67,7 @@ def send_whatsapp_message(to, text):
 # ---------------------------------------------------------------
 # ENDPOINT DE DIAGNÓSTICO TEMPORAL - SOLO PARA DEBUGGING
 # ---------------------------------------------------------------
-@app.route("/debug-notification", methods=["GET", "POST"])
+@app.route("debug-notification", methods=["GET", "POST"])
 def debug_notification():
     """Endpoint temporal para probar notificaciones al asesor"""
     if request.method == "GET":
@@ -85,18 +80,14 @@ def debug_notification():
                 "ADVISOR_NUMBER": ADVISOR_NUMBER
             }
         }), 200
-    
-    # POST: Probar envío de notificación real
     try:
         test_message = (
-            f"🔔 PRUEBA: Notificación de Vicky Bot\n"
-            f"📞 Para: {ADVISOR_NUMBER}\n"
-            f"🕐 Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"🔔 PRUEBA Notificación de Vicky Bot\n"
+            f"📞 Para {ADVISOR_NUMBER}\n"
+            f"🕐 Hora {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"✅ Si recibes esto, las notificaciones funcionan"
         )
-        
         success = send_message(ADVISOR_NUMBER, test_message)
-        
         return jsonify({
             "notification_test": {
                 "sent_to": ADVISOR_NUMBER,
@@ -105,9 +96,8 @@ def debug_notification():
                 "message_preview": test_message[:100] + "..."
             }
         }), 200
-        
     except Exception as e:
-        logging.error(f"❌ Error en debug-notification: {e}")
+        logging.error(f"❌ Error en debug-notification {e}")
         return jsonify({"error": str(e)}), 500
 
 # ---------------------------------------------------------------
@@ -117,10 +107,10 @@ def extract_number(text):
     if not text:
         return None
     clean = text.replace(',', '').replace('$', '')
-    match = re.search(r'(\d{1,9})(?:\.\d+)?\b', clean)
+    match = re.search(r'(\d{1,9})(\.\d+)?\b', clean)
     if match:
         try:
-            if ':' in text:
+            if '' in text:
                 return None
             return float(match.group(1))
         except ValueError:
@@ -140,25 +130,26 @@ def interpret_response(text):
 def is_valid_name(text):
     if not text or len(text.strip()) < 2:
         return False
-    if re.match(r'^[a-zA-ZáéíóúÁÉÍÓÚñÑüÜ\s\.\-]+$', text.strip()):
+    if re.match(r'^[a-zA-ZáéíóúÁÉÍÓÚñÑüÜ\s\.-]+$', text.strip()):
         return True
     return False
 
 def is_valid_phone(text):
     if not text:
         return False
-    clean_phone = re.sub(r'[\s\-\(\)\+]', '', text)
+    clean_phone = re.sub(r'[\s\-\(\)+]', '', text)
     return re.match(r'^\d{10,15}$', clean_phone) is not None
 
 def send_main_menu(phone):
     menu = (
-        "🏦 *INBURSA - SERVICIOS DISPONIBLES*\n\n"
+        "🏦 INBURSA - SERVICIOS DISPONIBLES\n\n"
         "1️⃣ Préstamos IMSS Pensionados (Ley 73)\n"
         "2️⃣ Seguros de Auto\n"
         "3️⃣ Seguros de Vida y Salud\n"
         "4️⃣ Tarjetas Médicas VRIM\n"
-        "5️⃣ Financiamiento Empresarial\n\n"
-        "Escribe el *número* o el *nombre* del servicio que te interesa:"
+        "5️⃣ Financiamiento Empresarial\n"
+        "6️⃣ Financiamiento Práctico Empresarial (desde 24 hrs)\n\n"
+        "Escribe el número o el nombre del servicio que te interesa"
     )
     send_message(phone, menu)
 
@@ -172,11 +163,11 @@ def ask_gpt(prompt, model="gpt-3.5-turbo", temperature=0.7):
         )
         return response.choices[0].message["content"].strip()
     except Exception as e:
-        logging.exception(f"Error con OpenAI: {e}")
+        logging.exception(f"Error con OpenAI {e}")
         return "Lo siento, ocurrió un error al consultar GPT."
 
 def is_gpt_command(msg):
-    return re.match(r'^\s*gpt\s*:', msg.lower())
+    return re.match(r'^gpt\s', msg.lower())
 
 # ---------------------------------------------------------------
 # EMBUDO PRÉSTAMOS IMSS PENSIONADOS (LEY 73) - BLOQUE AGREGADO
@@ -185,10 +176,10 @@ def funnel_prestamo_imss(user_id, user_message):
     state = user_state.get(user_id, "menu_mostrar_beneficios")
     datos = user_data.get(user_id, {})
 
-    # Paso 0: Mostrar beneficios y preguntar si es pensionado
+    # Paso 0 Mostrar beneficios y preguntar si es pensionado
     if state == "menu_mostrar_beneficios":
         send_message(user_id,
-            "💰 *Beneficios del Préstamo para Pensionados IMSS (Ley 73)*\n"
+            "💰 Beneficios del Préstamo para Pensionados IMSS (Ley 73)\n"
             "- Montos desde $40,000 hasta $650,000\n"
             "- Descuento vía pensión (sin buró de crédito)\n"
             "- Plazos de 12 a 60 meses\n"
@@ -196,12 +187,12 @@ def funnel_prestamo_imss(user_id, user_message):
             "- Sin aval ni garantía"
         )
         send_message(user_id,
-            "🏦 *Beneficios adicionales si recibes tu pensión en Inbursa:*\n"
+            "🏦 Beneficios adicionales si recibes tu pensión en Inbursa\n"
             "- Tasas preferenciales y pagos más bajos\n"
             "- Acceso a seguro de vida sin costo\n"
             "- Anticipo de nómina disponible\n"
             "- Atención personalizada 24/7\n\n"
-            "*(Estos beneficios son adicionales y no son obligatorios para obtener tu crédito.)*"
+            "(Estos beneficios son adicionales y no son obligatorios para obtener tu crédito.)"
         )
         send_message(user_id,
             "¿Eres pensionado o jubilado del IMSS bajo la Ley 73?"
@@ -209,7 +200,7 @@ def funnel_prestamo_imss(user_id, user_message):
         user_state[user_id] = "pregunta_pensionado"
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
-    # Paso 1: Pregunta pensionado
+    # Paso 1 Pregunta pensionado
     if state == "pregunta_pensionado":
         resp = interpret_response(user_message)
         if resp == "negative":
@@ -224,10 +215,10 @@ def funnel_prestamo_imss(user_id, user_message):
             user_state[user_id] = "pregunta_monto_pension"
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         else:
-            send_message(user_id, "Por favor responde *sí* o *no* para continuar.")
+            send_message(user_id, "Por favor responde sí o no para continuar.")
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
-    # Paso 2: Monto de pensión
+    # Paso 2 Monto de pensión
     if state == "pregunta_monto_pension":
         monto_pension = extract_number(user_message)
         if monto_pension is None:
@@ -248,7 +239,7 @@ def funnel_prestamo_imss(user_id, user_message):
         user_state[user_id] = "pregunta_monto_solicitado"
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
-    # Paso 2b: Ofrecer asesor por pensión baja
+    # Paso 2b Ofrecer asesor por pensión baja
     if state == "pregunta_ofrecer_asesor":
         resp = interpret_response(user_message)
         if resp == "positive":
@@ -258,26 +249,26 @@ def funnel_prestamo_imss(user_id, user_message):
             datos = user_data.get(user_id, {})
             formatted = (
                 f"🔔 NUEVO PROSPECTO – PRÉSTAMO IMSS\n"
-                f"Nombre: {datos.get('nombre','N/D')}\n"
+                f"Nombre: {datos.get('nombre','ND')}\n"
                 f"Número WhatsApp: {user_id}\n"
-                f"Pensión mensual: ${datos.get('pension_mensual','N/D'):,.0f}\n"
+                f"Pensión mensual: ${datos.get('pension_mensual','ND'):.0f}\n"
                 f"Estatus: Pensión baja, requiere opciones alternativas"
             )
             send_whatsapp_message(ADVISOR_NUMBER, formatted)
-            send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte: 👇")
+            send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte 👇")
             send_main_menu(user_id)
             user_state.pop(user_id, None)
             user_data.pop(user_id, None)
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         else:
             send_message(user_id, "Perfecto, si deseas podemos continuar con otros servicios.")
-            send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte: 👇")
+            send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte 👇")
             send_main_menu(user_id)
             user_state.pop(user_id, None)
             user_data.pop(user_id, None)
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
-    # Paso 3: Monto solicitado
+    # Paso 3 Monto solicitado
     if state == "pregunta_monto_solicitado":
         monto_solicitado = extract_number(user_message)
         if monto_solicitado is None or monto_solicitado < 40000:
@@ -290,7 +281,7 @@ def funnel_prestamo_imss(user_id, user_message):
         user_state[user_id] = "pregunta_nombre"
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
-    # Paso 4: Pregunta nombre
+    # Paso 4 Pregunta nombre
     if state == "pregunta_nombre":
         user_data[user_id]["nombre"] = user_message.title()
         send_message(user_id,
@@ -299,7 +290,7 @@ def funnel_prestamo_imss(user_id, user_message):
         user_state[user_id] = "pregunta_telefono"
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
-    # Paso 5: Pregunta teléfono
+    # Paso 5 Pregunta teléfono
     if state == "pregunta_telefono":
         user_data[user_id]["telefono_contacto"] = user_message
         send_message(user_id,
@@ -308,7 +299,7 @@ def funnel_prestamo_imss(user_id, user_message):
         user_state[user_id] = "pregunta_ciudad"
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
-    # Paso 6: Pregunta ciudad
+    # Paso 6 Pregunta ciudad
     if state == "pregunta_ciudad":
         user_data[user_id]["ciudad"] = user_message.title()
         send_message(user_id,
@@ -317,7 +308,7 @@ def funnel_prestamo_imss(user_id, user_message):
         user_state[user_id] = "pregunta_nomina_inbursa"
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
-    # Paso 7: Nómina Inbursa
+    # Paso 7 Nómina Inbursa
     if state == "pregunta_nomina_inbursa":
         resp = interpret_response(user_message)
         if resp == "positive":
@@ -332,7 +323,7 @@ def funnel_prestamo_imss(user_id, user_message):
             )
             user_data[user_id]["nomina_inbursa"] = "No"
         else:
-            send_message(user_id, "Por favor responde *sí* o *no* para continuar.")
+            send_message(user_id, "Por favor responde sí o no para continuar.")
             return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         send_message(user_id,
             "¡Listo! 🎉 Tu crédito ha sido preautorizado.\n"
@@ -342,16 +333,16 @@ def funnel_prestamo_imss(user_id, user_message):
         datos = user_data.get(user_id, {})
         formatted = (
             f"🔔 NUEVO PROSPECTO – PRÉSTAMO IMSS\n"
-            f"Nombre: {datos.get('nombre','N/D')}\n"
+            f"Nombre: {datos.get('nombre','ND')}\n"
             f"Número WhatsApp: {user_id}\n"
-            f"Teléfono contacto: {datos.get('telefono_contacto','N/D')}\n"
-            f"Ciudad: {datos.get('ciudad','N/D')}\n"
-            f"Monto solicitado: ${datos.get('monto_solicitado','N/D'):,.0f}\n"
+            f"Teléfono contacto: {datos.get('telefono_contacto','ND')}\n"
+            f"Ciudad: {datos.get('ciudad','ND')}\n"
+            f"Monto solicitado: ${datos.get('monto_solicitado','ND'):.0f}\n"
             f"Estatus: Preautorizado\n"
-            f"Observación: Nómina Inbursa: {datos.get('nomina_inbursa','N/D')}"
+            f"Observación: Nómina Inbursa {datos.get('nomina_inbursa','ND')}"
         )
         send_whatsapp_message(ADVISOR_NUMBER, formatted)
-        send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte: 👇")
+        send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte 👇")
         send_main_menu(user_id)
         user_state.pop(user_id, None)
         user_data.pop(user_id, None)
@@ -367,10 +358,10 @@ def funnel_credito_empresarial(user_id, user_message):
     state = user_state.get(user_id, "empresarial_beneficios")
     datos = user_data.get(user_id, {})
 
-    # Paso 1: Mostrar beneficios y preguntar si es empresario
+    # Paso 1 Mostrar beneficios y preguntar si es empresario
     if state == "empresarial_beneficios":
         send_message(user_id,
-            "🏢 *Crédito Empresarial Inbursa*\n"
+            "🏢 Crédito Empresarial Inbursa\n"
             "- Financiamiento desde $100,000 hasta $100,000,000\n"
             "- Tasas preferenciales y plazos flexibles\n"
             "- Sin aval con buen historial\n"
@@ -383,7 +374,7 @@ def funnel_credito_empresarial(user_id, user_message):
         user_state[user_id] = "empresarial_confirmacion"
         return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
-    # Paso 2: Confirmar si es empresario
+    # Paso 2 Confirmar si es empresario
     if state == "empresarial_confirmacion":
         resp = interpret_response(user_message)
         lowered = (user_message or "").lower()
@@ -398,10 +389,10 @@ def funnel_credito_empresarial(user_id, user_message):
             user_data.pop(user_id, None)
             return jsonify({"status": "ok", "funnel": "credito_empresarial"})
         else:
-            send_message(user_id, "Por favor responde *sí* o *no* para continuar.")
+            send_message(user_id, "Por favor responde sí o no para continuar.")
             return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
-    # Paso 3: Actividad de la empresa
+    # Paso 3 Actividad de la empresa
     if state == "empresarial_actividad":
         datos["actividad_empresa"] = user_message.title()
         user_data[user_id] = datos
@@ -409,7 +400,7 @@ def funnel_credito_empresarial(user_id, user_message):
         user_state[user_id] = "empresarial_monto"
         return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
-    # Paso 4: Monto solicitado
+    # Paso 4 Monto solicitado
     if state == "empresarial_monto":
         monto_solicitado = extract_number(user_message)
         if monto_solicitado is None or monto_solicitado < 100000:
@@ -421,7 +412,7 @@ def funnel_credito_empresarial(user_id, user_message):
         user_state[user_id] = "empresarial_nombre"
         return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
-    # Paso 5: Nombre completo
+    # Paso 5 Nombre completo
     if state == "empresarial_nombre":
         datos["nombre"] = user_message.title()
         user_data[user_id] = datos
@@ -429,7 +420,7 @@ def funnel_credito_empresarial(user_id, user_message):
         user_state[user_id] = "empresarial_telefono"
         return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
-    # Paso 6: Teléfono de contacto
+    # Paso 6 Teléfono de contacto
     if state == "empresarial_telefono":
         datos["telefono"] = user_message
         user_data[user_id] = datos
@@ -437,7 +428,7 @@ def funnel_credito_empresarial(user_id, user_message):
         user_state[user_id] = "empresarial_ciudad"
         return jsonify({"status": "ok", "funnel": "credito_empresarial"})
 
-    # Paso 7: Ciudad y notificación al asesor
+    # Paso 7 Ciudad y notificación al asesor
     if state == "empresarial_ciudad":
         datos["ciudad"] = user_message.title()
         user_data[user_id] = datos
@@ -447,15 +438,15 @@ def funnel_credito_empresarial(user_id, user_message):
         )
         formatted = (
             f"🔔 NUEVO PROSPECTO – CRÉDITO EMPRESARIAL\n"
-            f"Nombre: {datos.get('nombre','N/D')}\n"
-            f"Teléfono: {datos.get('telefono','N/D')}\n"
-            f"Ciudad: {datos.get('ciudad','N/D')}\n"
-            f"Monto solicitado: ${datos.get('monto_solicitado','N/D'):,.0f}\n"
-            f"Actividad: {datos.get('actividad_empresa','N/D')}\n"
+            f"Nombre: {datos.get('nombre','ND')}\n"
+            f"Teléfono: {datos.get('telefono','ND')}\n"
+            f"Ciudad: {datos.get('ciudad','ND')}\n"
+            f"Monto solicitado: ${datos.get('monto_solicitado','ND'):.0f}\n"
+            f"Actividad: {datos.get('actividad_empresa','ND')}\n"
             f"Número WhatsApp: {user_id}"
         )
         send_whatsapp_message(ADVISOR_NUMBER, formatted)
-        send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte: 👇")
+        send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte 👇")
         send_main_menu(user_id)
         user_state.pop(user_id, None)
         user_data.pop(user_id, None)
@@ -463,170 +454,151 @@ def funnel_credito_empresarial(user_id, user_message):
 
     send_main_menu(user_id)
     return jsonify({"status": "ok", "funnel": "credito_empresarial"})
-    # ---------------------------------------------------------------
-# EMBUDO OPCIÓN 6: FINANCIAMIENTO PRÁCTICO EMPRESARIAL 24HRS
+
+# ---------------------------------------------------------------
+# EMBUDO – FINANCIAMIENTO PRÁCTICO EMPRESARIAL (NUEVA OPCIÓN 6)
 # ---------------------------------------------------------------
 def funnel_financiamiento_practico(user_id, user_message):
-    state = user_state.get(user_id, "practico_beneficios")
+    state = user_state.get(user_id, "financiamiento_intro")
     datos = user_data.get(user_id, {})
 
-    # Paso 1: Mostrar producto y preguntar interés
-    if state == "practico_beneficios":
+    # Paso 1 – Introducción
+    if state == "financiamiento_intro":
         send_message(user_id,
-            "💸 *Financiamiento Práctico Empresarial Inbursa (24hrs)*\n"
-            "- Crédito simple sin garantía\n"
-            "- Desde $100,000 pesos\n"
-            "- Respuesta y depósito desde 24 horas\n"
-            "- Sin aval ni garantía\n"
-            "- Perfil empresarial y fiscal requerido\n"
-            "- Asesoría personalizada\n\n"
-            "¿Te interesa este producto?"
+            "💼 *Financiamiento Práctico Empresarial – Inbursa*\n\n"
+            "⏱️ *Aprobación desde 24 horas*\n"
+            "💰 *Crédito simple sin garantía* desde $100,000 MXN\n"
+            "🏢 Diseñado para empresas y personas físicas con actividad empresarial.\n\n"
+            "¿Deseas conocer si puedes acceder a este financiamiento?"
         )
-        user_state[user_id] = "practico_interes"
+        user_state[user_id] = "financiamiento_confirmar_interes"
         return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
 
-    # Paso 2: Preguntar si está interesado
-    if state == "practico_interes":
+    # Paso 2 – Confirmar interés
+    if state == "financiamiento_confirmar_interes":
         resp = interpret_response(user_message)
         if resp == "negative":
             send_message(user_id,
-                "¡Gracias! Un ejecutivo financiero se pondrá en contacto contigo para analizar tus necesidades y ofrecerte la mejor solución."
+                "Perfecto 👍. Un ejecutivo te contactará para conocer tus necesidades "
+                "y ofrecerte otras opciones de crédito que se adapten mejor a tu empresa."
             )
-            # Notificación de prospecto NO interesado
-            send_whatsapp_message(ADVISOR_NUMBER,
-                f"🔔 Prospecto NO interesado en Financiamiento Práctico Empresarial\nWhatsApp: {user_id}"
+            send_whatsapp_message(
+                ADVISOR_NUMBER,
+                f"📩 Prospecto NO interesado en Financiamiento Práctico\nNúmero: {user_id}"
             )
             send_main_menu(user_id)
             user_state.pop(user_id, None)
             user_data.pop(user_id, None)
-            return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+            return jsonify({"status": "ok"})
         elif resp == "positive":
             send_message(user_id,
-                "Perfecto, te haré unas preguntas para perfilar tu empresa y saber si eres candidato para este tipo de crédito.\n\n"
-                "Puedes escribir *cancelar* en cualquier momento para terminar."
+                "Excelente 🙌. Te haré unas preguntas rápidas para perfilar a tu empresa "
+                "y saber si es candidata al financiamiento.\n\n"
+                "Comencemos:\n1️⃣ ¿Cuál es el *giro de la empresa*?"
             )
-            send_message(user_id, "1. ¿Cuál es el giro de la empresa?")
-            user_state[user_id] = "practico_q1"
-            return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+            user_state[user_id] = "fp_q1_giro"
+            return jsonify({"status": "ok"})
         else:
             send_message(user_id, "Por favor responde *sí* o *no* para continuar.")
-            return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+            return jsonify({"status": "ok"})
 
     # CUESTIONARIO DE PERFILAMIENTO
-    # 1. Giro empresa
-    if state == "practico_q1":
-        datos["giro"] = user_message
+    if state == "fp_q1_giro":
+        datos["giro_empresa"] = user_message
+        send_message(user_id, "2️⃣ ¿Qué *antigüedad fiscal* tiene la empresa?")
+        user_state[user_id] = "fp_q2_antiguedad"
         user_data[user_id] = datos
-        send_message(user_id, "2. ¿Qué antigüedad fiscal tiene la empresa?")
-        user_state[user_id] = "practico_q2"
-        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+        return jsonify({"status": "ok"})
 
-    # 2. Antigüedad fiscal
-    if state == "practico_q2":
+    if state == "fp_q2_antiguedad":
         datos["antiguedad_fiscal"] = user_message
+        send_message(user_id, "3️⃣ ¿Es *persona física con actividad empresarial* o *persona moral*?")
+        user_state[user_id] = "fp_q3_tipo"
         user_data[user_id] = datos
-        send_message(user_id, "3. ¿Es persona física con actividad empresarial o persona moral?")
-        user_state[user_id] = "practico_q3"
-        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+        return jsonify({"status": "ok"})
 
-    # 3. Tipo de persona
-    if state == "practico_q3":
+    if state == "fp_q3_tipo":
         datos["tipo_persona"] = user_message
+        send_message(user_id, "4️⃣ ¿Qué *edad tiene el representante legal*?")
+        user_state[user_id] = "fp_q4_edad"
         user_data[user_id] = datos
-        send_message(user_id, "4. ¿Qué edad tiene el Representante Legal de la empresa?")
-        user_state[user_id] = "practico_q4"
-        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+        return jsonify({"status": "ok"})
 
-    # 4. Edad representante legal
-    if state == "practico_q4":
+    if state == "fp_q4_edad":
         datos["edad_representante"] = user_message
+        send_message(user_id,
+            "5️⃣ ¿El *buró de crédito* de la empresa y de los accionistas está al día en sus compromisos?\n"
+            "(Si no tiene créditos, no hay problema) – responde *positivo* o *negativo*."
+        )
+        user_state[user_id] = "fp_q5_buro"
         user_data[user_id] = datos
-        send_message(user_id, "5. ¿Se encuentra en buró de crédito empresa y accionista con poderes al día en sus compromisos de créditos? (Si no tiene créditos no hay problema)\nResponde: *positivo* o *negativo*")
-        user_state[user_id] = "practico_q5"
-        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+        return jsonify({"status": "ok"})
 
-    # 5. Buró de crédito
-    if state == "practico_q5":
-        datos["buro"] = user_message
+    if state == "fp_q5_buro":
+        datos["buro_credito"] = user_message
+        send_message(user_id, "6️⃣ ¿Aproximadamente *cuánto factura al año* la empresa?")
+        user_state[user_id] = "fp_q6_facturacion"
         user_data[user_id] = datos
-        send_message(user_id, "6. ¿Aproximadamente cuánto factura al año?")
-        user_state[user_id] = "practico_q6"
-        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+        return jsonify({"status": "ok"})
 
-    # 6. Facturación anual
-    if state == "practico_q6":
+    if state == "fp_q6_facturacion":
         datos["facturacion_anual"] = user_message
+        send_message(user_id, "7️⃣ ¿Tiene *facturación constante* en los últimos seis meses? (Sí/No)")
+        user_state[user_id] = "fp_q7_constancia"
         user_data[user_id] = datos
-        send_message(user_id, "7. ¿Tiene facturación constante en los últimos seis meses?\nResponde: *sí* o *no*")
-        user_state[user_id] = "practico_q7"
-        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+        return jsonify({"status": "ok"})
 
-    # 7. Facturación constante
-    if state == "practico_q7":
+    if state == "fp_q7_constancia":
         datos["facturacion_constante"] = user_message
+        send_message(user_id, "8️⃣ ¿Cuánto es el *monto de financiamiento* que requiere?")
+        user_state[user_id] = "fp_q8_monto"
         user_data[user_id] = datos
-        send_message(user_id, "8. ¿Cuánto es el monto de financiamiento que requiere?")
-        user_state[user_id] = "practico_q8"
-        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+        return jsonify({"status": "ok"})
 
-    # 8. Monto requerido
-    if state == "practico_q8":
+    if state == "fp_q8_monto":
         datos["monto_requerido"] = user_message
+        send_message(user_id, "9️⃣ ¿Cuenta con la *opinión de cumplimiento positiva* ante el SAT?")
+        user_state[user_id] = "fp_q9_opinion"
         user_data[user_id] = datos
-        send_message(user_id, "9. ¿Cuenta con la opinión de cumplimiento positiva ante el SAT?")
-        user_state[user_id] = "practico_q9"
-        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+        return jsonify({"status": "ok"})
 
-    # 9. Opinión de cumplimiento SAT
-    if state == "practico_q9":
+    if state == "fp_q9_opinion":
         datos["opinion_sat"] = user_message
+        send_message(user_id, "🔟 ¿Qué *tipo de financiamiento* requiere?")
+        user_state[user_id] = "fp_q10_tipo"
         user_data[user_id] = datos
-        send_message(user_id, "10. ¿Qué tipo de financiamiento requiere?")
-        user_state[user_id] = "practico_q10"
-        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+        return jsonify({"status": "ok"})
 
-    # 10. Tipo de financiamiento
-    if state == "practico_q10":
+    if state == "fp_q10_tipo":
         datos["tipo_financiamiento"] = user_message
+        send_message(user_id, "1️⃣1️⃣ ¿Cuenta con financiamiento actualmente? ¿Con quién?")
+        user_state[user_id] = "fp_q11_actual"
         user_data[user_id] = datos
-        send_message(user_id, "11. ¿Cuenta con financiamiento actualmente? ¿Con quién?")
-        user_state[user_id] = "practico_q11"
-        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+        return jsonify({"status": "ok"})
 
-    # 11. Financiamiento actual
-    if state == "practico_q11":
+    # Último paso – Comentario final y notificación
+    if state == "fp_q11_actual":
         datos["financiamiento_actual"] = user_message
+        send_message(user_id, "Por último, ¿deseas dejar *algún comentario adicional* para el asesor?")
+        user_state[user_id] = "fp_comentario"
         user_data[user_id] = datos
-        send_message(user_id, "¿Quieres agregar algún comentario o detalle adicional? (Opcional, escribe tu comentario o *no* si no deseas agregar nada.)")
-        user_state[user_id] = "practico_comentario"
-        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+        return jsonify({"status": "ok"})
 
-    # Comentario final y notificación al asesor
-    if state == "practico_comentario":
+    if state == "fp_comentario":
         datos["comentario"] = user_message
-        user_data[user_id] = datos
-
-        # Notificación al asesor con todos los datos del prospecto
         formatted = (
-            f"🔔 NUEVO PROSPECTO – FINANCIAMIENTO PRÁCTICO EMPRESARIAL 24HRS\n"
-            f"WhatsApp: {user_id}\n"
-            f"Giro empresa: {datos.get('giro','')}\n"
-            f"Antigüedad fiscal: {datos.get('antiguedad_fiscal','')}\n"
-            f"Tipo de persona: {datos.get('tipo_persona','')}\n"
-            f"Edad representante legal: {datos.get('edad_representante','')}\n"
-            f"Buró de crédito: {datos.get('buro','')}\n"
-            f"Facturación anual: {datos.get('facturacion_anual','')}\n"
-            f"Facturación constante últimos 6 meses: {datos.get('facturacion_constante','')}\n"
-            f"Monto requerido: {datos.get('monto_requerido','')}\n"
-            f"Opinión SAT positiva: {datos.get('opinion_sat','')}\n"
-            f"Tipo de financiamiento requerido: {datos.get('tipo_financiamiento','')}\n"
-            f"Financiamiento actual: {datos.get('financiamiento_actual','')}\n"
-            f"Comentario adicional: {datos.get('comentario','')}\n"
+            f"🔔 *NUEVO PROSPECTO – FINANCIAMIENTO PRÁCTICO EMPRESARIAL*\n\n"
+            f"📱 WhatsApp: {user_id}\n"
+            f"🏢 Giro: {datos.get('giro_empresa','ND')}\n"
+            f"📆 Antigüedad Fiscal: {datos.get('antiguedad_fiscal','ND')}\n"
+            f"👤 Tipo de Persona: {datos.get('tipo_persona','ND')}\n"
+            f"🎯 Monto Requerido: {datos.get('monto_requerido','ND')}\n"
+            f"💬 Comentario: {datos.get('comentario','Ninguno')}\n"
         )
         send_whatsapp_message(ADVISOR_NUMBER, formatted)
-
         send_message(user_id,
-            "¡Listo! Tu información fue enviada. Un ejecutivo de Inbursa se pondrá en contacto contigo para continuar con tu solicitud de financiamiento práctico empresarial."
+            "✅ Gracias por la información. Un asesor financiero (Christian López) "
+            "se pondrá en contacto contigo en breve para continuar con tu solicitud."
         )
         send_main_menu(user_id)
         user_state.pop(user_id, None)
@@ -636,14 +608,13 @@ def funnel_financiamiento_practico(user_id, user_message):
     send_main_menu(user_id)
     return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
 
-@app.route("/health", methods=["GET"])
+@app.route("health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "Vicky Bot Inbursa"}), 200
 
 def send_campaign_message(phone_number, nombre):
-    """
-    Envía un mensaje tipo plantilla promocional usando la API de WhatsApp Business.
-    La plantilla se llama "credito_imss_promocion_1" en idioma "es_MX".
+    """Envía un mensaje tipo plantilla promocional usando la API de WhatsApp Business.
+    La plantilla se llama credito_imss_promocion_1 en idioma es_MX.
     El nombre del prospecto se incluye como parámetro {{1}}.
     """
     try:
@@ -673,9 +644,44 @@ def send_campaign_message(phone_number, nombre):
         response.raise_for_status()
         logging.info(f"✅ Mensaje campaña enviado a {phone_number} ({nombre})")
     except Exception as e:
-        logging.exception(f"❌ Error en send_campaign_message: {e}")
+        logging.exception(f"❌ Error en send_campaign_message {e}")
 
-@app.route("/webhook", methods=["POST"])
+# -------------------- MENÚ DE OPCIONES -------------------------
+menu_options = {
+    "1": "prestamo_imss",
+    "préstamo": "prestamo_imss",
+    "prestamo": "prestamo_imss",
+    "imss": "prestamo_imss",
+    "ley 73": "prestamo_imss",
+    "pension": "prestamo_imss",
+    "pensión": "prestamo_imss",
+    "2": "seguro_auto",
+    "seguro auto": "seguro_auto",
+    "seguros de auto": "seguro_auto",
+    "auto": "seguro_auto",
+    "3": "seguro_vida",
+    "seguro vida": "seguro_vida",
+    "seguros de vida": "seguro_vida",
+    "seguro salud": "seguro_vida",
+    "vida": "seguro_vida",
+    "4": "vrim",
+    "tarjetas médicas": "vrim",
+    "tarjetas medicas": "vrim",
+    "vrim": "vrim",
+    "5": "empresarial",
+    "financiamiento empresarial": "empresarial",
+    "empresa": "empresarial",
+    "negocio": "empresarial",
+    "pyme": "empresarial",
+    "crédito empresarial": "empresarial",
+    "credito empresarial": "empresarial",
+    "6": "financiamiento_practico",
+    "financiamiento practico": "financiamiento_practico",
+    "crédito simple": "financiamiento_practico",
+    "credito simple": "financiamiento_practico"
+}
+
+@app.route("webhook", methods=["POST"])
 def receive_message():
     try:
         data = request.get_json()
@@ -696,68 +702,44 @@ def receive_message():
         else:
             send_message(phone_number, 
                 "Por ahora solo puedo procesar mensajes de texto 📩\n\n"
-                "Escribe *menú* para ver los servicios disponibles."
+                "Escribe menú para ver los servicios disponibles."
             )
             return jsonify({"status": "ok"}), 200
 
-        logging.info(f"📱 Mensaje de {phone_number}: '{user_message}'")
+        logging.info(f"📱 Mensaje de {phone_number} '{user_message}'")
 
         # GPT SOLO BAJO COMANDO (en cualquier parte del bot)
         if is_gpt_command(user_message):
-            prompt = user_message.split(":",1)[1].strip()
+            prompt = user_message.split(" ",1)[1].strip()
             if not prompt:
-                send_message(phone_number, "Para consultar GPT, escribe por ejemplo:\ngpt: ¿Qué ventajas tiene el crédito IMSS?")
+                send_message(phone_number, "Para consultar GPT, escribe por ejemplo:\ngpt ¿Qué ventajas tiene el crédito IMSS?")
                 return jsonify({"status": "ok", "source": "gpt"})
             gpt_reply = ask_gpt(prompt)
             send_message(phone_number, gpt_reply)
             return jsonify({"status": "ok", "source": "gpt"})
 
-        menu_options = {
-            "1": "prestamo_imss",
-            "préstamo": "prestamo_imss",
-            "prestamo": "prestamo_imss",
-            "imss": "prestamo_imss",
-            "ley 73": "prestamo_imss",
-            "pension": "prestamo_imss",
-            "pensión": "prestamo_imss",
-            "2": "seguro_auto",
-            "seguro auto": "seguro_auto",
-            "seguros de auto": "seguro_auto",
-            "auto": "seguro_auto",
-            "3": "seguro_vida",
-            "seguro vida": "seguro_vida",
-            "seguros de vida": "seguro_vida",
-            "seguro salud": "seguro_vida",
-            "vida": "seguro_vida",
-            "4": "vrim",
-            "tarjetas médicas": "vrim",
-            "tarjetas medicas": "vrim",
-            "vrim": "vrim",
-            "5": "empresarial",
-            "financiamiento empresarial": "empresarial",
-            "empresa": "empresarial",
-            "negocio": "empresarial",
-            "pyme": "empresarial",
-            "crédito empresarial": "empresarial",
-            "credito empresarial": "empresarial"
-        }
-
         option = menu_options.get(user_message.lower())
 
-        # FLUJO IMSS: Si está en embudo, seguir el estado
         current_state = user_state.get(phone_number)
+        # FLUJO IMSS Si está en embudo, seguir el estado
         if current_state and ("prestamo_imss" in current_state or "pregunta_" in current_state):
             return funnel_prestamo_imss(phone_number, user_message)
-        # FLUJO EMPRESARIAL: Si está en embudo, seguir el estado
+        # FLUJO EMPRESARIAL Si está en embudo, seguir el estado
         if current_state and current_state.startswith("empresarial_"):
             return funnel_credito_empresarial(phone_number, user_message)
-
-        # Opción 1: Iniciar embudo IMSS
+        # Opción 6 – Financiamiento Práctico Empresarial
+        if option == "financiamiento_practico":
+            user_state[phone_number] = "financiamiento_intro"
+            user_data.setdefault(phone_number, {})
+            return funnel_financiamiento_practico(phone_number, user_message)
+        # Si el usuario ya está dentro del flujo
+        if current_state and current_state.startswith("fp_"):
+            return funnel_financiamiento_practico(phone_number, user_message)
+        # Opción 1 Iniciar embudo IMSS
         if option == "prestamo_imss":
             user_state[phone_number] = "menu_mostrar_beneficios"
             return funnel_prestamo_imss(phone_number, user_message)
-
-        # Opción 5: Iniciar embudo Crédito Empresarial
+        # Opción 5 Iniciar embudo Crédito Empresarial
         if option == "empresarial":
             user_state[phone_number] = "empresarial_beneficios"
             user_data.setdefault(phone_number, {})
@@ -766,8 +748,8 @@ def receive_message():
         # Otros servicios - menú estándar
         if option == "seguro_auto":
             send_message(phone_number,
-                "🚗 *Seguros de Auto Inbursa*\n\n"
-                "Protege tu auto con las mejores coberturas:\n\n"
+                "🚗 Seguros de Auto Inbursa\n\n"
+                "Protege tu auto con las mejores coberturas\n\n"
                 "✅ Cobertura amplia contra todo riesgo\n"
                 "✅ Asistencia vial las 24 horas\n"
                 "✅ Responsabilidad civil\n"
@@ -778,8 +760,8 @@ def receive_message():
             return jsonify({"status": "ok", "funnel": "menu"})
         if option == "seguro_vida":
             send_message(phone_number,
-                "🏥 *Seguros de Vida y Salud Inbursa*\n\n"
-                "Protege a tu familia y tu salud:\n\n"
+                "🏥 Seguros de Vida y Salud Inbursa\n\n"
+                "Protege a tu familia y tu salud\n\n"
                 "✅ Seguro de vida\n"
                 "✅ Gastos médicos mayores\n"
                 "✅ Hospitalización\n"
@@ -790,8 +772,8 @@ def receive_message():
             return jsonify({"status": "ok", "funnel": "menu"})
         if option == "vrim":
             send_message(phone_number,
-                "💳 *Tarjetas Médicas VRIM*\n\n"
-                "Accede a la mejor atención médica:\n\n"
+                "💳 Tarjetas Médicas VRIM\n\n"
+                "Accede a la mejor atención médica\n\n"
                 "✅ Consultas médicas ilimitadas\n"
                 "✅ Especialistas y estudios de laboratorio\n"
                 "✅ Medicamentos con descuento\n"
@@ -802,8 +784,8 @@ def receive_message():
             return jsonify({"status": "ok", "funnel": "menu"})
         if option == "empresarial":
             send_message(phone_number,
-                "🏢 *Financiamiento Empresarial Inbursa*\n\n"
-                "Impulsa el crecimiento de tu negocio con:\n\n"
+                "🏢 Financiamiento Empresarial Inbursa\n\n"
+                "Impulsa el crecimiento de tu negocio con\n\n"
                 "✅ Créditos desde $100,000 hasta $100,000,000\n"
                 "✅ Tasas preferenciales\n"
                 "✅ Plazos flexibles\n"
@@ -828,7 +810,7 @@ def receive_message():
         return jsonify({"status": "ok", "funnel": "menu"})
 
     except Exception as e:
-        logging.exception(f"❌ Error en receive_message: {e}")
+        logging.exception(f"❌ Error en receive_message {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
