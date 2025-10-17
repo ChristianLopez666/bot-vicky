@@ -273,7 +273,7 @@ def funnel_prestamo_imss(user_id: str, user_message: str):
 
 
 # ---------------------------------------------------------------
-# EMBUDO – CRÉDITO EMPRESARIAL (Opción 5) – Simplificado
+# EMBUDO – CRÉDITO EMPRESARIAL (Opción 5) – **Corregido**
 # ---------------------------------------------------------------
 def funnel_credito_empresarial(user_id: str, user_message: str):
     state = user_state.get(user_id, "emp_beneficios")
@@ -339,10 +339,19 @@ def funnel_credito_empresarial(user_id: str, user_message: str):
         user_state[user_id] = "emp_ciudad"
         return jsonify({"status": "ok"})
 
+    # 🔧 BLOQUE CORREGIDO: cierre del embudo + notificación al 6682478005
     if state == "emp_ciudad":
         datos["ciudad"] = user_message.title()
         user_data[user_id] = datos
-        send_message(user_id, "✅ Gracias. Un asesor (Christian López) te contactará para continuar.")
+
+        # Mensaje de cierre al prospecto
+        send_message(
+            user_id,
+            "✅ Gracias por la información. Un asesor financiero (Christian López) "
+            "se pondrá en contacto contigo en breve para continuar con tu solicitud."
+        )
+
+        # Notificación al asesor con los datos del prospecto
         formatted = (
             "🔔 NUEVO PROSPECTO – CRÉDITO EMPRESARIAL\n"
             f"Nombre: {datos.get('nombre','ND')}\n"
@@ -352,12 +361,15 @@ def funnel_credito_empresarial(user_id: str, user_message: str):
             f"Actividad: {datos.get('actividad_empresa','ND')}\n"
             f"WhatsApp: {user_id}"
         )
-        send_whatsapp_message(ADVISOR_NUMBER, formatted)
+        send_whatsapp_message("6682478005", formatted)  # envío directo al número solicitado
+
+        # Regreso a menú y limpieza de estado
         send_main_menu(user_id)
         user_state.pop(user_id, None)
         user_data.pop(user_id, None)
         return jsonify({"status": "ok"})
 
+    # Fallback interno del embudo
     send_main_menu(user_id)
     return jsonify({"status": "ok"})
 
@@ -649,4 +661,6 @@ def health():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     logging.info(f"🚀 Iniciando Vicky Bot en puerto {port}")
+    app.run(host="0.0.0.0", port=port)
+
 
