@@ -448,14 +448,16 @@ def funnel_financiamiento_practico(user_id: str, user_message: str):
         next_state = orden[next_index]
         user_state[user_id] = next_state
 
-        # Pedir la siguiente pregunta correctamente
-        if next_state == "fp_comentario":
-            # En este punto ya se respondió "fp_q11_actual" (financiamiento actual);
-            # ahora pedimos el comentario adicional explícitamente.
-            send_message(user_id, preguntas["fp_q11_actual"])
-        else:
-            send_message(user_id, preguntas[next_state])
-        return jsonify({"status": "ok"})
+       # Pedir la siguiente pregunta correctamente
+if next_state == "fp_comentario":
+    # En "fp_comentario" ya no hay siguiente en el diccionario.
+    # Pedimos el comentario de forma explícita para evitar duplicados.
+    send_message(user_id, "📝 ¿Deseas dejar *algún comentario adicional* para el asesor?")
+else:
+    # El diccionario 'preguntas' guarda la PREGUNTA SIGUIENTE asociada al estado ACTUAL.
+    # Por eso aquí debe usarse 'preguntas[state]', no 'preguntas[next_state]'.
+    send_message(user_id, preguntas[state])
+return jsonify({"status": "ok"})
 
     # Último paso – recibir comentario y notificar
     if state == "fp_comentario":
