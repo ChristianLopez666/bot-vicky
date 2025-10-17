@@ -448,12 +448,13 @@ def funnel_financiamiento_practico(user_id: str, user_message: str):
         next_state = orden[next_index]
         user_state[user_id] = next_state
 
-        # Si el siguiente es "fp_comentario" pedimos comentario; si no, la pregunta definida
+        # Pedir la siguiente pregunta correctamente
         if next_state == "fp_comentario":
-            # Ya se pidió comentario en fp_q11_actual, aquí solo cae la respuesta
-            pass
+            # En este punto ya se respondió "fp_q11_actual" (financiamiento actual);
+            # ahora pedimos el comentario adicional explícitamente.
+            send_message(user_id, preguntas["fp_q11_actual"])
         else:
-            send_message(user_id, preguntas[state])
+            send_message(user_id, preguntas[next_state])
         return jsonify({"status": "ok"})
 
     # Último paso – recibir comentario y notificar
@@ -662,5 +663,3 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     logging.info(f"🚀 Iniciando Vicky Bot en puerto {port}")
     app.run(host="0.0.0.0", port=port)
-
-
