@@ -463,6 +463,178 @@ def funnel_credito_empresarial(user_id, user_message):
 
     send_main_menu(user_id)
     return jsonify({"status": "ok", "funnel": "credito_empresarial"})
+    # ---------------------------------------------------------------
+# EMBUDO OPCIÓN 6: FINANCIAMIENTO PRÁCTICO EMPRESARIAL 24HRS
+# ---------------------------------------------------------------
+def funnel_financiamiento_practico(user_id, user_message):
+    state = user_state.get(user_id, "practico_beneficios")
+    datos = user_data.get(user_id, {})
+
+    # Paso 1: Mostrar producto y preguntar interés
+    if state == "practico_beneficios":
+        send_message(user_id,
+            "💸 *Financiamiento Práctico Empresarial Inbursa (24hrs)*\n"
+            "- Crédito simple sin garantía\n"
+            "- Desde $100,000 pesos\n"
+            "- Respuesta y depósito desde 24 horas\n"
+            "- Sin aval ni garantía\n"
+            "- Perfil empresarial y fiscal requerido\n"
+            "- Asesoría personalizada\n\n"
+            "¿Te interesa este producto?"
+        )
+        user_state[user_id] = "practico_interes"
+        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+
+    # Paso 2: Preguntar si está interesado
+    if state == "practico_interes":
+        resp = interpret_response(user_message)
+        if resp == "negative":
+            send_message(user_id,
+                "¡Gracias! Un ejecutivo financiero se pondrá en contacto contigo para analizar tus necesidades y ofrecerte la mejor solución."
+            )
+            # Notificación de prospecto NO interesado
+            send_whatsapp_message(ADVISOR_NUMBER,
+                f"🔔 Prospecto NO interesado en Financiamiento Práctico Empresarial\nWhatsApp: {user_id}"
+            )
+            send_main_menu(user_id)
+            user_state.pop(user_id, None)
+            user_data.pop(user_id, None)
+            return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+        elif resp == "positive":
+            send_message(user_id,
+                "Perfecto, te haré unas preguntas para perfilar tu empresa y saber si eres candidato para este tipo de crédito.\n\n"
+                "Puedes escribir *cancelar* en cualquier momento para terminar."
+            )
+            send_message(user_id, "1. ¿Cuál es el giro de la empresa?")
+            user_state[user_id] = "practico_q1"
+            return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+        else:
+            send_message(user_id, "Por favor responde *sí* o *no* para continuar.")
+            return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+
+    # CUESTIONARIO DE PERFILAMIENTO
+    # 1. Giro empresa
+    if state == "practico_q1":
+        datos["giro"] = user_message
+        user_data[user_id] = datos
+        send_message(user_id, "2. ¿Qué antigüedad fiscal tiene la empresa?")
+        user_state[user_id] = "practico_q2"
+        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+
+    # 2. Antigüedad fiscal
+    if state == "practico_q2":
+        datos["antiguedad_fiscal"] = user_message
+        user_data[user_id] = datos
+        send_message(user_id, "3. ¿Es persona física con actividad empresarial o persona moral?")
+        user_state[user_id] = "practico_q3"
+        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+
+    # 3. Tipo de persona
+    if state == "practico_q3":
+        datos["tipo_persona"] = user_message
+        user_data[user_id] = datos
+        send_message(user_id, "4. ¿Qué edad tiene el Representante Legal de la empresa?")
+        user_state[user_id] = "practico_q4"
+        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+
+    # 4. Edad representante legal
+    if state == "practico_q4":
+        datos["edad_representante"] = user_message
+        user_data[user_id] = datos
+        send_message(user_id, "5. ¿Se encuentra en buró de crédito empresa y accionista con poderes al día en sus compromisos de créditos? (Si no tiene créditos no hay problema)\nResponde: *positivo* o *negativo*")
+        user_state[user_id] = "practico_q5"
+        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+
+    # 5. Buró de crédito
+    if state == "practico_q5":
+        datos["buro"] = user_message
+        user_data[user_id] = datos
+        send_message(user_id, "6. ¿Aproximadamente cuánto factura al año?")
+        user_state[user_id] = "practico_q6"
+        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+
+    # 6. Facturación anual
+    if state == "practico_q6":
+        datos["facturacion_anual"] = user_message
+        user_data[user_id] = datos
+        send_message(user_id, "7. ¿Tiene facturación constante en los últimos seis meses?\nResponde: *sí* o *no*")
+        user_state[user_id] = "practico_q7"
+        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+
+    # 7. Facturación constante
+    if state == "practico_q7":
+        datos["facturacion_constante"] = user_message
+        user_data[user_id] = datos
+        send_message(user_id, "8. ¿Cuánto es el monto de financiamiento que requiere?")
+        user_state[user_id] = "practico_q8"
+        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+
+    # 8. Monto requerido
+    if state == "practico_q8":
+        datos["monto_requerido"] = user_message
+        user_data[user_id] = datos
+        send_message(user_id, "9. ¿Cuenta con la opinión de cumplimiento positiva ante el SAT?")
+        user_state[user_id] = "practico_q9"
+        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+
+    # 9. Opinión de cumplimiento SAT
+    if state == "practico_q9":
+        datos["opinion_sat"] = user_message
+        user_data[user_id] = datos
+        send_message(user_id, "10. ¿Qué tipo de financiamiento requiere?")
+        user_state[user_id] = "practico_q10"
+        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+
+    # 10. Tipo de financiamiento
+    if state == "practico_q10":
+        datos["tipo_financiamiento"] = user_message
+        user_data[user_id] = datos
+        send_message(user_id, "11. ¿Cuenta con financiamiento actualmente? ¿Con quién?")
+        user_state[user_id] = "practico_q11"
+        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+
+    # 11. Financiamiento actual
+    if state == "practico_q11":
+        datos["financiamiento_actual"] = user_message
+        user_data[user_id] = datos
+        send_message(user_id, "¿Quieres agregar algún comentario o detalle adicional? (Opcional, escribe tu comentario o *no* si no deseas agregar nada.)")
+        user_state[user_id] = "practico_comentario"
+        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+
+    # Comentario final y notificación al asesor
+    if state == "practico_comentario":
+        datos["comentario"] = user_message
+        user_data[user_id] = datos
+
+        # Notificación al asesor con todos los datos del prospecto
+        formatted = (
+            f"🔔 NUEVO PROSPECTO – FINANCIAMIENTO PRÁCTICO EMPRESARIAL 24HRS\n"
+            f"WhatsApp: {user_id}\n"
+            f"Giro empresa: {datos.get('giro','')}\n"
+            f"Antigüedad fiscal: {datos.get('antiguedad_fiscal','')}\n"
+            f"Tipo de persona: {datos.get('tipo_persona','')}\n"
+            f"Edad representante legal: {datos.get('edad_representante','')}\n"
+            f"Buró de crédito: {datos.get('buro','')}\n"
+            f"Facturación anual: {datos.get('facturacion_anual','')}\n"
+            f"Facturación constante últimos 6 meses: {datos.get('facturacion_constante','')}\n"
+            f"Monto requerido: {datos.get('monto_requerido','')}\n"
+            f"Opinión SAT positiva: {datos.get('opinion_sat','')}\n"
+            f"Tipo de financiamiento requerido: {datos.get('tipo_financiamiento','')}\n"
+            f"Financiamiento actual: {datos.get('financiamiento_actual','')}\n"
+            f"Comentario adicional: {datos.get('comentario','')}\n"
+        )
+        send_whatsapp_message(ADVISOR_NUMBER, formatted)
+
+        send_message(user_id,
+            "¡Listo! Tu información fue enviada. Un ejecutivo de Inbursa se pondrá en contacto contigo para continuar con tu solicitud de financiamiento práctico empresarial."
+        )
+        send_main_menu(user_id)
+        user_state.pop(user_id, None)
+        user_data.pop(user_id, None)
+        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
+
+    send_main_menu(user_id)
+    return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
 
 @app.route("/health", methods=["GET"])
 def health():
