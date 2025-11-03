@@ -6,7 +6,7 @@ import re
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from datetime import datetime
-import openai  # ✅ Mantener importación antigua
+import openai
 
 # ---------------------------------------------------------------
 # Cargar variables de entorno
@@ -16,10 +16,9 @@ load_dotenv()
 META_TOKEN = os.getenv("META_TOKEN")
 WABA_PHONE_ID = os.getenv("WABA_PHONE_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")
+ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")  # ✅ Formato internacional
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# ✅ Configuración para versión antigua de OpenAI
 openai.api_key = OPENAI_API_KEY
 
 app = Flask(__name__)
@@ -34,13 +33,21 @@ user_data = {}
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # ---------------------------------------------------------------
-# ENVÍO DE MENSAJES WHATSAPP (TEXT)
+# ENVÍO DE MENSAJES WHATSAPP (TEXT) - FUNCIÓN MEJORADA
 # ---------------------------------------------------------------
 def send_message(to: str, text: str) -> bool:
     try:
         if not META_TOKEN or not WABA_PHONE_ID:
             logging.error("❌ Falta META_TOKEN o WABA_PHONE_ID.")
             return False
+
+        # ✅ Asegurar formato correcto del número
+        if to.startswith('521') and len(to) == 13:
+            to = to  # Ya está en formato internacional
+        elif to.startswith('1') and len(to) == 11:
+            to = f"52{to}"  # Convertir nacional a internacional
+        elif len(to) == 10:
+            to = f"52{to}"  # Convertir nacional a internacional
 
         url = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
         headers = {
@@ -53,34 +60,60 @@ def send_message(to: str, text: str) -> bool:
             "type": "text",
             "text": {"body": text},
         }
+        
+        logging.info(f"📤 Enviando mensaje a {to}: {text[:50]}...")
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        
         if resp.status_code in (200, 201):
             logging.info(f"✅ Mensaje enviado a {to}")
             return True
-        logging.error(f"❌ Error WhatsApp API {resp.status_code}: {resp.text}")
-        return False
+        else:
+            logging.error(f"❌ Error WhatsApp API {resp.status_code}: {resp.text}")
+            return False
+            
     except Exception as e:
         logging.exception(f"💥 Error en send_message: {e}")
         return False
 
-
 def send_whatsapp_message(to: str, text: str) -> bool:
     return send_message(to, text)
 
+# ---------------------------------------------------------------
+# FUNCIÓN ESPECÍFICA PARA NOTIFICAR AL ASESOR
+# ---------------------------------------------------------------
+def notify_advisor(message: str) -> bool:
+    """Envía notificación al asesor Christian"""
+    if not ADVISOR_NUMBER:
+        logging.error("❌ ADVISOR_NUMBER no configurado")
+        return False
+    
+    # ✅ Asegurar formato internacional
+    advisor_number = ADVISOR_NUMBER
+    if not advisor_number.startswith('521') and len(advisor_number) == 10:
+        advisor_number = f"521{advisor_number}"
+    
+    logging.info(f"📨 Notificando al asesor: {message[:100]}...")
+    success = send_message(advisor_number, message)
+    
+    if success:
+        logging.info("✅ Notificación enviada al asesor")
+    else:
+        logging.error("❌ Falló notificación al asesor")
+    
+    return success
 
 # ---------------------------------------------------------------
 # UTILIDADES
 # ---------------------------------------------------------------
 def interpret_response(text: str) -> str:
     t = (text or "").strip().lower()
-    positive = ["sí", "si", "sip", "claro", "ok", "vale", "afirmativo", "yes"]
-    negative = ["no", "nop", "negativo", "para nada", "not"]
+    positive = ["sí", "si", "sip", "claro", "ok", "vale", "afirmativo", "yes", "correcto"]
+    negative = ["no", "nop", "negativo", "para nada", "not", "nel"]
     if any(k in t for k in positive):
         return "positive"
     if any(k in t for k in negative):
         return "negative"
     return "neutral"
-
 
 def extract_number(text: str):
     if not text:
@@ -93,7 +126,6 @@ def extract_number(text: str):
         return float(m.group(1) + (m.group(2) or ""))
     except Exception:
         return None
-
 
 def send_main_menu(phone: str):
     menu = (
@@ -108,13 +140,11 @@ def send_main_menu(phone: str):
     )
     send_message(phone, menu)
 
-
 # ---------------------------------------------------------------
-# GPT (opcional por comando "sgpt: ...") - VERSIÓN ANTIGUA
+# GPT (opcional por comando "sgpt: ...")
 # ---------------------------------------------------------------
 def ask_gpt(prompt: str, model: str = "gpt-3.5-turbo", temperature: float = 0.7) -> str:
     try:
-        # ✅ Sintaxis para versión antigua de OpenAI
         resp = openai.ChatCompletion.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
@@ -126,13 +156,11 @@ def ask_gpt(prompt: str, model: str = "gpt-3.5-turbo", temperature: float = 0.7)
         logging.exception(f"Error OpenAI: {e}")
         return "Lo siento, ocurrió un error al consultar GPT."
 
-
 def is_gpt_command(msg: str) -> bool:
     return (msg or "").strip().lower().startswith("sgpt:")
 
-
 # ---------------------------------------------------------------
-# EMBUDO – PRÉSTAMO IMSS PENSIONADOS (Opción 1)
+# EMBUDO – PRÉSTAMO IMSS PENSIONADOS (Opción 1) - CORREGIDO
 # ---------------------------------------------------------------
 def funnel_prestamo_imss(user_id: str, user_message: str):
     state = user_state.get(user_id, "imss_beneficios")
@@ -200,7 +228,8 @@ def funnel_prestamo_imss(user_id: str, user_message: str):
                 f"Pensión mensual: ${datos.get('pension_mensual','ND')}\n"
                 "Estatus: Pensión baja, requiere opciones alternativas"
             )
-            send_whatsapp_message(ADVISOR_NUMBER, formatted)
+            # ✅ NOTIFICAR AL ASESOR
+            notify_advisor(formatted)
             send_message(user_id, "¡Listo! Un asesor te contactará con opciones alternativas.")
             send_main_menu(user_id)
             user_state.pop(user_id, None)
@@ -250,21 +279,26 @@ def funnel_prestamo_imss(user_id: str, user_message: str):
         if resp not in ("positive", "negative"):
             send_message(user_id, "Por favor responde *sí* o *no* para continuar.")
             return jsonify({"status": "ok"})
+        
+        # ✅ MENSAJE DE ÉXITO AL USUARIO
         send_message(
             user_id,
             "✅ ¡Listo! Tu crédito ha sido *preautorizado*.\n"
             "Un asesor financiero (Christian López) se pondrá en contacto contigo."
         )
+        
+        # ✅ NOTIFICACIÓN COMPLETA AL ASESOR
         formatted = (
             "🔔 NUEVO PROSPECTO – PRÉSTAMO IMSS\n"
             f"Nombre: {datos.get('nombre','ND')}\n"
             f"WhatsApp: {user_id}\n"
             f"Teléfono: {datos.get('telefono_contacto','ND')}\n"
             f"Ciudad: {datos.get('ciudad','ND')}\n"
-            f"Monto solicitado: ${datos.get('monto_solicitado','ND')}\n"
+            f"Monto solicitado: ${datos.get('monto_solicitado',0):,.0f}\n"
             f"Nómina Inbursa: {datos.get('nomina_inbursa','ND')}"
         )
-        send_whatsapp_message(ADVISOR_NUMBER, formatted)
+        notify_advisor(formatted)
+        
         send_main_menu(user_id)
         user_state.pop(user_id, None)
         user_data.pop(user_id, None)
@@ -273,9 +307,8 @@ def funnel_prestamo_imss(user_id: str, user_message: str):
     send_main_menu(user_id)
     return jsonify({"status": "ok"})
 
-
 # ---------------------------------------------------------------
-# EMBUDO – CRÉDITO EMPRESARIAL (Opción 5) – **Corregido**
+# EMBUDO – CRÉDITO EMPRESARIAL (Opción 5) - CORREGIDO
 # ---------------------------------------------------------------
 def funnel_credito_empresarial(user_id: str, user_message: str):
     state = user_state.get(user_id, "emp_beneficios")
@@ -341,7 +374,6 @@ def funnel_credito_empresarial(user_id: str, user_message: str):
         user_state[user_id] = "emp_ciudad"
         return jsonify({"status": "ok"})
 
-    # ✅ CORREGIDO: Usa ADVISOR_NUMBER en lugar de número hardcodeado
     if state == "emp_ciudad":
         datos["ciudad"] = user_message.title()
         user_data[user_id] = datos
@@ -353,17 +385,17 @@ def funnel_credito_empresarial(user_id: str, user_message: str):
             "se pondrá en contacto contigo en breve para continuar con tu solicitud."
         )
 
-        # Notificación al asesor con los datos del prospecto
+        # ✅ NOTIFICACIÓN AL ASESOR
         formatted = (
             "🔔 NUEVO PROSPECTO – CRÉDITO EMPRESARIAL\n"
             f"Nombre: {datos.get('nombre','ND')}\n"
             f"Teléfono: {datos.get('telefono','ND')}\n"
             f"Ciudad: {datos.get('ciudad','ND')}\n"
-            f"Monto solicitado: ${datos.get('monto_solicitado','ND')}\n"
+            f"Monto solicitado: ${datos.get('monto_solicitado',0):,.0f}\n"
             f"Actividad: {datos.get('actividad_empresa','ND')}\n"
             f"WhatsApp: {user_id}"
         )
-        send_whatsapp_message(ADVISOR_NUMBER, formatted)  # ✅ Usa variable de entorno
+        notify_advisor(formatted)
 
         # Regreso a menú y limpieza de estado
         send_main_menu(user_id)
@@ -371,127 +403,8 @@ def funnel_credito_empresarial(user_id: str, user_message: str):
         user_data.pop(user_id, None)
         return jsonify({"status": "ok"})
 
-    # Fallback interno del embudo
     send_main_menu(user_id)
     return jsonify({"status": "ok"})
-
-
-# ---------------------------------------------------------------
-# EMBUDO – FINANCIAMIENTO PRÁCTICO EMPRESARIAL (Opción 6)
-# ---------------------------------------------------------------
-def funnel_financiamiento_practico(user_id: str, user_message: str):
-    state = user_state.get(user_id, "fp_intro")
-    datos = user_data.get(user_id, {})
-
-    # Paso 1 – Intro
-    if state == "fp_intro":
-        send_message(
-            user_id,
-            "💼 *Financiamiento Práctico Empresarial – Inbursa*\n\n"
-            "⏱️ *Aprobación desde 24 horas*\n"
-            "💰 *Crédito simple sin garantía* desde $100,000 MXN\n"
-            "🏢 Para empresas y *personas físicas con actividad empresarial*.\n\n"
-            "¿Deseas conocer si puedes acceder a este financiamiento? (Sí/No)"
-        )
-        user_state[user_id] = "fp_confirmar_interes"
-        return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
-
-    # Paso 2 – Confirmar interés
-    if state == "fp_confirmar_interes":
-        resp = interpret_response(user_message)
-        if resp == "negative":
-            send_message(
-                user_id,
-                "Perfecto 👍. Un ejecutivo te contactará para conocer tus necesidades y "
-                "ofrecerte otras opciones."
-            )
-            send_whatsapp_message(
-                ADVISOR_NUMBER,
-                f"📩 Prospecto NO interesado en Financiamiento Práctico\nNúmero: {user_id}"
-            )
-            send_main_menu(user_id)
-            user_state.pop(user_id, None)
-            user_data.pop(user_id, None)
-            return jsonify({"status": "ok"})
-        if resp == "positive":
-            send_message(
-                user_id,
-                "Excelente 🙌. Comencemos con un *perfilamiento* rápido.\n"
-                "1️⃣ ¿Cuál es el *giro de la empresa*?"
-            )
-            user_state[user_id] = "fp_q1_giro"
-            return jsonify({"status": "ok"})
-        send_message(user_id, "Responde *sí* o *no* para continuar.")
-        return jsonify({"status": "ok"})
-
-    # ✅ CORREGIDO: Diccionario de preguntas mejor estructurado
-    preguntas = {
-        "fp_q1_giro": "2️⃣ ¿Qué *antigüedad fiscal* tiene la empresa?",
-        "fp_q2_antiguedad": "3️⃣ ¿Es *persona física con actividad empresarial* o *persona moral*?",
-        "fp_q3_tipo": "4️⃣ ¿Qué *edad tiene el representante legal*?",
-        "fp_q4_edad": "5️⃣ ¿Buró de crédito empresa y accionistas al día? (Responde *positivo* o *negativo*).",
-        "fp_q5_buro": "6️⃣ ¿Aproximadamente *cuánto factura al año* la empresa?",
-        "fp_q6_facturacion": "7️⃣ ¿Tiene *facturación constante* en los últimos seis meses? (Sí/No)",
-        "fp_q7_constancia": "8️⃣ ¿Cuánto es el *monto de financiamiento* que requiere?",
-        "fp_q8_monto": "9️⃣ ¿Cuenta con la *opinión de cumplimiento positiva* ante el SAT?",
-        "fp_q9_opinion": "🔟 ¿Qué *tipo de financiamiento* requiere?",
-        "fp_q10_tipo": "1️⃣1️⃣ ¿Cuenta con financiamiento actualmente? ¿Con quién?",
-    }
-
-    orden = [
-        "fp_q1_giro", "fp_q2_antiguedad", "fp_q3_tipo", "fp_q4_edad", "fp_q5_buro",
-        "fp_q6_facturacion", "fp_q7_constancia", "fp_q8_monto", "fp_q9_opinion",
-        "fp_q10_tipo", "fp_q11_actual", "fp_comentario"
-    ]
-
-    if state in orden[:-1]:
-        # Guardar respuesta actual y avanzar
-        datos[state] = user_message
-        user_data[user_id] = datos
-        next_index = orden.index(state) + 1
-        next_state = orden[next_index]
-        user_state[user_id] = next_state
-
-        # Pedir la siguiente pregunta
-        if next_state == "fp_comentario":
-            send_message(user_id, "📝 ¿Deseas dejar *algún comentario adicional* para el asesor?")
-        else:
-            send_message(user_id, preguntas.get(state, "Por favor continúa con la siguiente información."))
-        return jsonify({"status": "ok"})
-
-    # Último paso – recibir comentario y notificar
-    if state == "fp_comentario":
-        datos["comentario"] = user_message
-        formatted = (
-            "🔔 *NUEVO PROSPECTO – FINANCIAMIENTO PRÁCTICO EMPRESARIAL*\n\n"
-            f"📱 WhatsApp: {user_id}\n"
-            f"🏢 Giro: {datos.get('fp_q1_giro','ND')}\n"
-            f"📆 Antigüedad Fiscal: {datos.get('fp_q2_antiguedad','ND')}\n"
-            f"👤 Tipo de Persona: {datos.get('fp_q3_tipo','ND')}\n"
-            f"🧑‍⚖️ Edad Rep. Legal: {datos.get('fp_q4_edad','ND')}\n"
-            f"📊 Buró empresa/accionistas: {datos.get('fp_q5_buro','ND')}\n"
-            f"💵 Facturación anual: {datos.get('fp_q6_facturacion','ND')}\n"
-            f"📈 6 meses constantes: {datos.get('fp_q7_constancia','ND')}\n"
-            f"🎯 Monto requerido: {datos.get('fp_q8_monto','ND')}\n"
-            f"🧾 Opinión SAT: {datos.get('fp_q9_opinion','ND')}\n"
-            f"🏦 Tipo de financiamiento: {datos.get('fp_q10_tipo','ND')}\n"
-            f"💼 Financiamiento actual: {datos.get('fp_q11_actual','ND')}\n"
-            f"💬 Comentario: {datos.get('comentario','Ninguno')}"
-        )
-        send_whatsapp_message(ADVISOR_NUMBER, formatted)
-        send_message(
-            user_id,
-            "✅ Gracias por la información. Un asesor financiero (Christian López) "
-            "se pondrá en contacto contigo en breve para continuar con tu solicitud."
-        )
-        send_main_menu(user_id)
-        user_state.pop(user_id, None)
-        user_data.pop(user_id, None)
-        return jsonify({"status": "ok"})
-
-    send_main_menu(user_id)
-    return jsonify({"status": "ok"})
-
 
 # ---------------------------------------------------------------
 # RUTA RAÍZ PARA HEALTH CHECKS DE RENDER
@@ -499,7 +412,6 @@ def funnel_financiamiento_practico(user_id: str, user_message: str):
 @app.route('/')
 def root():
     return jsonify({"status": "online", "service": "Vicky Bot Inbursa", "timestamp": datetime.utcnow().isoformat()}), 200
-
 
 # ---------------------------------------------------------------
 # WEBHOOK – VERIFICACIÓN (GET) Y RECEPCIÓN (POST)
@@ -552,8 +464,6 @@ def webhook():
             return funnel_prestamo_imss(phone_number, user_message)
         if state.startswith("emp_"):
             return funnel_credito_empresarial(phone_number, user_message)
-        if state.startswith("fp_"):
-            return funnel_financiamiento_practico(phone_number, user_message)
 
         # Menú / opciones
         menu_options = {
@@ -587,11 +497,6 @@ def webhook():
             "pyme": "empresarial",
             "crédito empresarial": "empresarial",
             "credito empresarial": "empresarial",
-
-            "6": "financiamiento_practico",
-            "financiamiento practico": "financiamiento_practico",
-            "crédito simple": "financiamiento_practico",
-            "credito simple": "financiamiento_practico",
         }
 
         option = menu_options.get(user_message.lower())
@@ -605,11 +510,6 @@ def webhook():
             user_state[phone_number] = "emp_beneficios"
             user_data.setdefault(phone_number, {})
             return funnel_credito_empresarial(phone_number, user_message)
-
-        if option == "financiamiento_practico":
-            user_state[phone_number] = "fp_intro"
-            user_data.setdefault(phone_number, {})
-            return funnel_financiamiento_practico(phone_number, user_message)
 
         # Rutas rápidas de menú
         if user_message.lower() in ["menu", "menú", "hola", "buenas", "servicios", "opciones"]:
@@ -626,7 +526,8 @@ def webhook():
                 "✅ Cobertura amplia\n✅ Asistencia vial 24/7\n✅ RC, robo total/parcial\n\n"
                 "📞 Un asesor te contactará para cotizar."
             )
-            send_whatsapp_message(ADVISOR_NUMBER, f"🚗 Interesado en Seguro Auto · {phone_number}")
+            # ✅ NOTIFICAR AL ASESOR
+            notify_advisor(f"🚗 Interesado en Seguro Auto · WhatsApp: {phone_number}")
             return jsonify({"status": "ok"})
 
         if option == "seguro_vida":
@@ -636,7 +537,8 @@ def webhook():
                 "✅ Vida\n✅ Gastos médicos\n✅ Hospitalización\n✅ Atención 24/7\n\n"
                 "📞 Un asesor te contactará para explicar coberturas."
             )
-            send_whatsapp_message(ADVISOR_NUMBER, f"🏥 Interesado en Vida/Salud · {phone_number}")
+            # ✅ NOTIFICAR AL ASESOR
+            notify_advisor(f"🏥 Interesado en Vida/Salud · WhatsApp: {phone_number}")
             return jsonify({"status": "ok"})
 
         if option == "vrim":
@@ -646,7 +548,8 @@ def webhook():
                 "✅ Consultas ilimitadas\n✅ Especialistas y laboratorios\n✅ Descuentos en medicamentos\n\n"
                 "📞 Un asesor te contactará para explicar beneficios."
             )
-            send_whatsapp_message(ADVISOR_NUMBER, f"💳 Interesado en VRIM · {phone_number}")
+            # ✅ NOTIFICAR AL ASESOR
+            notify_advisor(f"💳 Interesado en VRIM · WhatsApp: {phone_number}")
             return jsonify({"status": "ok"})
 
         # Fallback a menú
@@ -657,14 +560,12 @@ def webhook():
         logging.exception(f"❌ Error en webhook POST: {e}")
         return jsonify({"error": str(e)}), 500
 
-
 # ---------------------------------------------------------------
 # HEALTHCHECK
 # ---------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "Vicky Bot Inbursa"}), 200
-
 
 # ---------------------------------------------------------------
 # MAIN
