@@ -6,7 +6,7 @@ import re
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from datetime import datetime
-import openai
+from openai import OpenAI  # ✅ SDK actualizado
 
 # ---------------------------------------------------------------
 # Cargar variables de entorno
@@ -19,7 +19,8 @@ VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-openai.api_key = OPENAI_API_KEY
+# ✅ OpenAI SDK actualizado
+client_oa = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 app = Flask(__name__)
 
@@ -113,13 +114,14 @@ def send_main_menu(phone: str):
 # ---------------------------------------------------------------
 def ask_gpt(prompt: str, model: str = "gpt-3.5-turbo", temperature: float = 0.7) -> str:
     try:
-        resp = openai.ChatCompletion.create(
+        # ✅ SDK OpenAI actualizado
+        resp = client_oa.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
             max_tokens=400,
         )
-        return resp.choices[0].message["content"].strip()
+        return resp.choices[0].message.content.strip()
     except Exception as e:
         logging.exception(f"Error OpenAI: {e}")
         return "Lo siento, ocurrió un error al consultar GPT."
@@ -339,7 +341,7 @@ def funnel_credito_empresarial(user_id: str, user_message: str):
         user_state[user_id] = "emp_ciudad"
         return jsonify({"status": "ok"})
 
-    # 🔧 BLOQUE CORREGIDO: cierre del embudo + notificación al 6682478005
+    # ✅ CORREGIDO: Usa ADVISOR_NUMBER en lugar de número hardcodeado
     if state == "emp_ciudad":
         datos["ciudad"] = user_message.title()
         user_data[user_id] = datos
@@ -361,7 +363,7 @@ def funnel_credito_empresarial(user_id: str, user_message: str):
             f"Actividad: {datos.get('actividad_empresa','ND')}\n"
             f"WhatsApp: {user_id}"
         )
-        send_whatsapp_message("6682478005", formatted)  # envío directo al número solicitado
+        send_whatsapp_message(ADVISOR_NUMBER, formatted)  # ✅ Usa variable de entorno
 
         # Regreso a menú y limpieza de estado
         send_main_menu(user_id)
@@ -422,7 +424,7 @@ def funnel_financiamiento_practico(user_id: str, user_message: str):
         send_message(user_id, "Responde *sí* o *no* para continuar.")
         return jsonify({"status": "ok"})
 
-    # Cuestionario – 11 preguntas + comentario
+    # ✅ CORREGIDO: Diccionario de preguntas mejor estructurado
     preguntas = {
         "fp_q1_giro": "2️⃣ ¿Qué *antigüedad fiscal* tiene la empresa?",
         "fp_q2_antiguedad": "3️⃣ ¿Es *persona física con actividad empresarial* o *persona moral*?",
@@ -434,7 +436,6 @@ def funnel_financiamiento_practico(user_id: str, user_message: str):
         "fp_q8_monto": "9️⃣ ¿Cuenta con la *opinión de cumplimiento positiva* ante el SAT?",
         "fp_q9_opinion": "🔟 ¿Qué *tipo de financiamiento* requiere?",
         "fp_q10_tipo": "1️⃣1️⃣ ¿Cuenta con financiamiento actualmente? ¿Con quién?",
-        "fp_q11_actual": "📝 ¿Deseas dejar *algún comentario adicional* para el asesor?",
     }
 
     orden = [
@@ -451,14 +452,11 @@ def funnel_financiamiento_practico(user_id: str, user_message: str):
         next_state = orden[next_index]
         user_state[user_id] = next_state
 
-        # Pedir la siguiente pregunta correctamente
+        # Pedir la siguiente pregunta
         if next_state == "fp_comentario":
-            # En "fp_comentario" ya no hay siguiente pregunta en el diccionario.
-            # Pedimos el comentario explícitamente para evitar duplicados.
             send_message(user_id, "📝 ¿Deseas dejar *algún comentario adicional* para el asesor?")
         else:
-            # El diccionario guarda la pregunta del SIGUIENTE paso asociada al estado ACTUAL.
-            send_message(user_id, preguntas[state])
+            send_message(user_id, preguntas.get(state, "Por favor continúa con la siguiente información."))
         return jsonify({"status": "ok"})
 
     # Último paso – recibir comentario y notificar
@@ -493,6 +491,14 @@ def funnel_financiamiento_practico(user_id: str, user_message: str):
 
     send_main_menu(user_id)
     return jsonify({"status": "ok"})
+
+
+# ---------------------------------------------------------------
+# RUTA RAÍZ PARA HEALTH CHECKS DE RENDER
+# ---------------------------------------------------------------
+@app.route('/')
+def root():
+    return jsonify({"status": "online", "service": "Vicky Bot Inbursa", "timestamp": datetime.utcnow().isoformat()}), 200
 
 
 # ---------------------------------------------------------------
