@@ -6,7 +6,7 @@ import re
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from datetime import datetime
-from openai import OpenAI  # ✅ SDK actualizado
+import openai  # ✅ Mantener importación antigua
 
 # ---------------------------------------------------------------
 # Cargar variables de entorno
@@ -19,8 +19,8 @@ VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# ✅ OpenAI SDK actualizado
-client_oa = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+# ✅ Configuración para versión antigua de OpenAI
+openai.api_key = OPENAI_API_KEY
 
 app = Flask(__name__)
 
@@ -110,18 +110,18 @@ def send_main_menu(phone: str):
 
 
 # ---------------------------------------------------------------
-# GPT (opcional por comando "sgpt: ...")
+# GPT (opcional por comando "sgpt: ...") - VERSIÓN ANTIGUA
 # ---------------------------------------------------------------
 def ask_gpt(prompt: str, model: str = "gpt-3.5-turbo", temperature: float = 0.7) -> str:
     try:
-        # ✅ SDK OpenAI actualizado
-        resp = client_oa.chat.completions.create(
+        # ✅ Sintaxis para versión antigua de OpenAI
+        resp = openai.ChatCompletion.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
             max_tokens=400,
         )
-        return resp.choices[0].message.content.strip()
+        return resp.choices[0].message["content"].strip()
     except Exception as e:
         logging.exception(f"Error OpenAI: {e}")
         return "Lo siento, ocurrió un error al consultar GPT."
