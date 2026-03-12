@@ -1,44 +1,324 @@
 import os
 import json
 import logging
-import requests
 import re
+import hmac
+import hashlib
+import threading
+from collections import deque
+from datetime import datetime, timezone, timedelta
+
+import requests
+import openai
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-from datetime import datetime
-import openai
 
 # ---------------------------------------------------------------
-# Cargar variables de entorno
+# LOGGING — configurado primero para que todos los warnings posteriores lo usen
+# ---------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# Zona horaria operativa — Ciudad de México (UTC-6 invierno / UTC-5 verano)
+# Usamos pytz si está disponible; si no, fallback a UTC-6 fijo.
+try:
+    import pytz as _pytz
+    _TZ_MX = _pytz.timezone("America/Mexico_City")
+    def _now_mx() -> str:
+        return datetime.now(_TZ_MX).strftime("%Y-%m-%d %H:%M:%S")
+except ImportError:
+    _TZ_MX = timezone(timedelta(hours=-6))
+    def _now_mx() -> str:
+        return datetime.now(_TZ_MX).strftime("%Y-%m-%d %H:%M:%S")
+
+# ---------------------------------------------------------------
+# Librerías Google — importación condicional (modo degradado si no están instaladas)
+# ---------------------------------------------------------------
+try:
+    from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+    _google_libs_ok = True
+except ImportError:
+    _google_libs_ok = False
+    log.warning("⚠️ Librerías Google no instaladas. Sheets deshabilitado. "
+                "Agrega google-api-python-client google-auth a requirements.txt")
+
+# ---------------------------------------------------------------
+# Variables de entorno
 # ---------------------------------------------------------------
 load_dotenv()
 
-META_TOKEN = os.getenv("META_TOKEN")
-WABA_PHONE_ID = os.getenv("WABA_PHONE_ID")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+META_TOKEN        = os.getenv("META_TOKEN")
+WABA_PHONE_ID     = os.getenv("WABA_PHONE_ID")
+VERIFY_TOKEN      = os.getenv("VERIFY_TOKEN")
+ADVISOR_NUMBER    = os.getenv("ADVISOR_NUMBER", "5216682478005")
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
+META_APP_SECRET   = os.getenv("META_APP_SECRET", "").strip()
 
-openai.api_key = OPENAI_API_KEY
+# Google Sheets — bitácora de conversaciones
+GOOGLE_CREDENTIALS_JSON      = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
+SHEETS_ID_CONVERSACIONES     = os.getenv("SHEETS_ID_CONVERSACIONES", "").strip()
+SHEETS_TAB_CONVERSACIONES    = os.getenv("SHEETS_TAB_CONVERSACIONES", "Conversaciones").strip()
 
+# ---------------------------------------------------------------
+# Cliente OpenAI — instanciación explícita compatible con SDK >= 1.0
+# openai.api_key = ... es patrón SDK v0 y puede fallar en SDK moderno.
+# Usamos openai.OpenAI(api_key=...) que funciona desde SDK 1.0 en adelante.
+# ---------------------------------------------------------------
+try:
+    _openai_client = openai.OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+    if _openai_client:
+        log.info("✅ Cliente OpenAI inicializado (SDK >= 1.0).")
+    else:
+        log.warning("⚠️ OPENAI_API_KEY no configurado. Comando sgpt: deshabilitado.")
+except AttributeError:
+    # Fallback para instalaciones muy antiguas del SDK (< 1.0) — improbable en Render actual
+    log.warning("⚠️ SDK OpenAI antiguo detectado. Intentando modo legacy.")
+    try:
+        import openai as _openai_legacy
+        _openai_legacy.api_key = OPENAI_API_KEY
+        _openai_client = _openai_legacy
+    except Exception:
+        log.exception("❌ No se pudo inicializar OpenAI.")
+        _openai_client = None
+
+# ---------------------------------------------------------------
+# Flask app + estado de usuarios
+# ---------------------------------------------------------------
 app = Flask(__name__)
-
-# Estados y datos por usuario
-user_state = {}
-user_data = {}
+user_state: dict = {}
+user_data: dict  = {}
 
 # ---------------------------------------------------------------
-# LOGGING
+# Idempotencia de mensajes entrantes (Meta puede reenviar eventos)
 # ---------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+_processed_ids: set      = set()
+_processed_deque: deque  = deque(maxlen=3000)
+_idempotency_lock        = threading.Lock()
 
 # ---------------------------------------------------------------
-# ENVÍO DE MENSAJES WHATSAPP (TEXT) - FUNCIÓN MEJORADA
+# GOOGLE SHEETS — Inicialización y helpers
 # ---------------------------------------------------------------
-def send_message(to: str, text: str) -> bool:
+_sheets_service  = None   # cliente global reutilizable
+_sheets_ready    = False  # True si la conexión fue exitosa al arrancar
+
+_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+# Cabeceras esperadas en la hoja (en este orden exacto)
+_SHEET_HEADERS = [
+    "Phone", "Nombre", "Mensaje", "Fecha", "Tipo",
+    "Origen", "Servicio", "EstadoEmbudo",
+    "ResultadoEnvio", "DetalleError", "MessageID",
+]
+
+
+def _sheets_init() -> bool:
+    """
+    Inicializa el cliente de Google Sheets API desde la variable de entorno
+    GOOGLE_CREDENTIALS_JSON. Retorna True si fue exitoso.
+    Llama una sola vez al arrancar; el cliente se reutiliza.
+    """
+    global _sheets_service, _sheets_ready
+
+    if not _google_libs_ok:
+        return False
+    if not GOOGLE_CREDENTIALS_JSON:
+        log.warning("⚠️ GOOGLE_CREDENTIALS_JSON no configurado. Sheets deshabilitado.")
+        return False
+    if not SHEETS_ID_CONVERSACIONES:
+        log.warning("⚠️ SHEETS_ID_CONVERSACIONES no configurado. Sheets deshabilitado.")
+        return False
+
+    try:
+        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=_SHEETS_SCOPES)
+        _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+        _sheets_ready = True
+        log.info("✅ Google Sheets API inicializado correctamente.")
+        _sheets_ensure_headers()   # garantiza que la fila 1 tenga los encabezados correctos
+        return True
+    except json.JSONDecodeError:
+        log.exception("❌ GOOGLE_CREDENTIALS_JSON no es JSON válido.")
+    except Exception:
+        log.exception("❌ Error inicializando Google Sheets API.")
+    return False
+
+
+def _sheets_ensure_headers() -> None:
+    """
+    Verifica que la fila 1 del tab contenga los encabezados correctos.
+    Si está vacía, los escribe. Si tiene contenido distinto, solo registra advertencia
+    (no sobreescribe para proteger datos existentes).
+    """
+    if not _sheets_ready or not _sheets_service:
+        return
+    try:
+        rng = f"{SHEETS_TAB_CONVERSACIONES}!A1:K1"
+        result = _sheets_service.spreadsheets().values().get(
+            spreadsheetId=SHEETS_ID_CONVERSACIONES,
+            range=rng,
+        ).execute()
+        existing = result.get("values", [[]])[0] if result.get("values") else []
+
+        if not existing:
+            # Fila 1 vacía — escribir encabezados
+            _sheets_service.spreadsheets().values().update(
+                spreadsheetId=SHEETS_ID_CONVERSACIONES,
+                range=rng,
+                valueInputOption="RAW",
+                body={"values": [_SHEET_HEADERS]},
+            ).execute()
+            log.info("✅ Encabezados escritos en Sheets (fila 1).")
+        elif existing != _SHEET_HEADERS:
+            log.warning(
+                f"⚠️ Fila 1 del tab '{SHEETS_TAB_CONVERSACIONES}' tiene contenido diferente al esperado. "
+                f"No se sobreescribió. Encabezados esperados: {_SHEET_HEADERS}"
+            )
+        else:
+            log.info("✅ Encabezados en Sheets verificados correctamente.")
+    except Exception:
+        log.exception("❌ Error verificando/escribiendo encabezados en Sheets.")
+
+
+
+def _safe_str(value, max_len: int = 500) -> str:
+    """Convierte cualquier valor a string limpio, truncado y sin None."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if len(text) > max_len:
+        text = text[:max_len] + "…"
+    return text
+
+
+def _normalize_phone(phone) -> str:
+    """Devuelve el teléfono como string limpio de dígitos."""
+    if not phone:
+        return ""
+    return re.sub(r"\D", "", str(phone))
+
+
+# Thread-local para propagar msg_id activo a send_message/notify_advisor
+# desde los embudos sin necesidad de cambiar cada firma.
+_tl = threading.local()
+
+
+def _active_msg_id() -> str:
+    """Retorna el message_id activo en el hilo actual (vacío si no hay ninguno)."""
+    return getattr(_tl, "msg_id", "")
+
+
+
+_last_service: dict = {}
+
+
+def _detect_service(phone: str) -> str:
+    """
+    Infiere el servicio del usuario a partir de su estado en el embudo.
+    Si no hay embudo activo, usa el último servicio registrado.
+    Cubre todos los servicios: imss, empresarial, financiamiento_practico,
+    seguro_auto, seguro_vida, vrim.
+    """
+    state = user_state.get(phone, "")
+    if state.startswith("imss_"):
+        return "imss"
+    if state.startswith("emp_"):
+        return "empresarial"
+    if state.startswith("fp_"):
+        return "financiamiento_practico"
+    # Sin estado de embudo activo: usar último servicio registrado
+    return _last_service.get(phone, "desconocido")
+
+
+def _sheets_append_row(
+    phone: str,
+    nombre: str,
+    mensaje: str,
+    tipo: str,          # "entrante" | "saliente"
+    origen: str,        # "cliente" | "bot" | "asesor"
+    servicio: str = "",
+    resultado: str = "",   # "ok" | "error" | ""
+    detalle_error: str = "",
+    message_id: str = "",
+) -> None:
+    """
+    Appends una fila de bitácora en la hoja de Google Sheets.
+    Si Sheets no está disponible o falla, solo registra en log — el bot no se detiene.
+
+    Columnas (en orden): Phone, Nombre, Mensaje, Fecha, Tipo, Origen,
+                         Servicio, EstadoEmbudo, ResultadoEnvio, DetalleError, MessageID
+    """
+    if not _sheets_ready or not _sheets_service:
+        return
+
+    try:
+        estado_embudo = _safe_str(user_state.get(_normalize_phone(phone), ""), 100)
+        if not servicio:
+            servicio = _detect_service(_normalize_phone(phone))
+
+        row = [
+            _normalize_phone(phone),
+            _safe_str(nombre, 100),
+            _safe_str(mensaje, 500),
+            _now_mx(),
+            _safe_str(tipo, 20),
+            _safe_str(origen, 20),
+            _safe_str(servicio, 50),
+            estado_embudo,
+            _safe_str(resultado, 20),
+            _safe_str(detalle_error, 300),
+            _safe_str(message_id, 100),
+        ]
+
+        rng = f"{SHEETS_TAB_CONVERSACIONES}!A:K"
+        body = {"values": [row]}
+        _sheets_service.spreadsheets().values().append(
+            spreadsheetId=SHEETS_ID_CONVERSACIONES,
+            range=rng,
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body=body,
+        ).execute()
+
+    except HttpError as e:
+        log.exception(f"❌ HttpError al escribir en Sheets (phone={phone}): {e}")
+    except Exception:
+        log.exception(f"❌ Error inesperado al escribir en Sheets (phone={phone})")
+
+
+def _get_nombre(phone: str) -> str:
+    """Obtiene el nombre del usuario desde user_data si existe."""
+    datos = user_data.get(phone) or user_data.get(_normalize_phone(phone)) or {}
+    return _safe_str(datos.get("nombre", ""), 100)
+
+
+# ---------------------------------------------------------------
+# ENVÍO DE MENSAJES WHATSAPP
+# Modificado para registrar en Sheets cada intento (éxito o error)
+# ---------------------------------------------------------------
+def send_message(to: str, text: str, _message_id: str = "") -> bool:
+    """
+    Envía un mensaje de texto por WhatsApp Cloud API.
+    Registra el intento en Google Sheets (saliente / bot).
+    _message_id: id del mensaje entrante que disparó este envío (opcional).
+                 Si no se pasa, se usa el msg_id activo del hilo actual.
+    """
+    if not _message_id:
+        _message_id = _active_msg_id()
+    resultado    = ""
+    detalle_err  = ""
+    success      = False
+
     try:
         if not META_TOKEN or not WABA_PHONE_ID:
-            logging.error("❌ Falta META_TOKEN o WABA_PHONE_ID.")
+            log.error("❌ Falta META_TOKEN o WABA_PHONE_ID.")
+            resultado   = "error"
+            detalle_err = "META_TOKEN o WABA_PHONE_ID no configurados"
             return False
 
         url = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
@@ -52,42 +332,120 @@ def send_message(to: str, text: str) -> bool:
             "type": "text",
             "text": {"body": text},
         }
-        
-        logging.info(f"📤 Enviando mensaje a {to}: {text[:50]}...")
+
+        log.info(f"📤 Enviando mensaje a {to}: {text[:60]}...")
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
-        
+
         if resp.status_code in (200, 201):
-            logging.info(f"✅ Mensaje enviado a {to}")
-            return True
+            log.info(f"✅ Mensaje enviado a {to}")
+            resultado = "ok"
+            success   = True
         else:
-            logging.error(f"❌ Error WhatsApp API {resp.status_code}: {resp.text}")
-            return False
-            
+            log.error(f"❌ Error WhatsApp API {resp.status_code}: {resp.text}")
+            resultado   = "error"
+            detalle_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+
     except Exception as e:
-        logging.exception(f"💥 Error en send_message: {e}")
-        return False
+        log.exception(f"💥 Excepción en send_message a {to}: {e}")
+        resultado   = "error"
+        detalle_err = str(e)[:300]
 
-def send_whatsapp_message(to: str, text: str) -> bool:
-    return send_message(to, text)
+    finally:
+        # Registrar en Sheets — no detiene el bot si falla
+        try:
+            _sheets_append_row(
+                phone       = str(to),
+                nombre      = _get_nombre(str(to)),
+                mensaje     = text,
+                tipo        = "saliente",
+                origen      = "bot",
+                resultado   = resultado,
+                detalle_error = detalle_err,
+                message_id  = _message_id,
+            )
+        except Exception:
+            log.exception("❌ Error registrando send_message en Sheets")
 
-# ---------------------------------------------------------------
-# FUNCIÓN ESPECÍFICA PARA NOTIFICAR AL ASESOR
-# ---------------------------------------------------------------
-def notify_advisor(message: str) -> bool:
-    """Envía notificación al asesor Christian"""
-    if not ADVISOR_NUMBER:
-        logging.error("❌ ADVISOR_NUMBER no configurado")
-        return False
-    
-    logging.info(f"📨 Notificando al asesor: {message[:100]}...")
-    success = send_message(ADVISOR_NUMBER, message)
-    
-    if success:
-        logging.info("✅ Notificación enviada al asesor")
-    else:
-        logging.error("❌ Falló notificación al asesor")
-    
     return success
+
+
+
+# send_whatsapp_message eliminado — era alias redundante de send_message.
+
+
+
+
+# ---------------------------------------------------------------
+# NOTIFICAR AL ASESOR
+# Modificado para registrar en Sheets con Origen = "asesor"
+# ---------------------------------------------------------------
+def notify_advisor(message: str, _message_id: str = "") -> bool:
+    """
+    Envía una notificación al asesor.
+    Registra en Sheets con Origen=asesor y Tipo=saliente.
+    """
+    if not _message_id:
+        _message_id = _active_msg_id()
+    if not ADVISOR_NUMBER:
+        log.error("❌ ADVISOR_NUMBER no configurado")
+        return False
+
+    log.info(f"📨 Notificando al asesor: {message[:100]}...")
+
+    resultado   = ""
+    detalle_err = ""
+    success     = False
+
+    try:
+        if not META_TOKEN or not WABA_PHONE_ID:
+            resultado   = "error"
+            detalle_err = "META_TOKEN o WABA_PHONE_ID no configurados"
+            return False
+
+        url = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
+        headers = {
+            "Authorization": f"Bearer {META_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": str(ADVISOR_NUMBER),
+            "type": "text",
+            "text": {"body": message},
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+
+        if resp.status_code in (200, 201):
+            log.info("✅ Notificación enviada al asesor")
+            resultado = "ok"
+            success   = True
+        else:
+            log.error(f"❌ Falló notificación al asesor {resp.status_code}: {resp.text}")
+            resultado   = "error"
+            detalle_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+
+    except Exception as e:
+        log.exception(f"💥 Excepción en notify_advisor: {e}")
+        resultado   = "error"
+        detalle_err = str(e)[:300]
+
+    finally:
+        try:
+            _sheets_append_row(
+                phone         = str(ADVISOR_NUMBER),
+                nombre        = "Asesor",
+                mensaje       = message,
+                tipo          = "saliente",
+                origen        = "asesor",
+                resultado     = resultado,
+                detalle_error = detalle_err,
+                message_id    = _message_id,
+            )
+        except Exception:
+            log.exception("❌ Error registrando notify_advisor en Sheets")
+
+    return success
+
 
 # ---------------------------------------------------------------
 # UTILIDADES
@@ -102,6 +460,7 @@ def interpret_response(text: str) -> str:
         return "negative"
     return "neutral"
 
+
 def extract_number(text: str):
     if not text:
         return None
@@ -113,6 +472,7 @@ def extract_number(text: str):
         return float(m.group(1) + (m.group(2) or ""))
     except Exception:
         return None
+
 
 def send_main_menu(phone: str):
     menu = (
@@ -127,18 +487,19 @@ def send_main_menu(phone: str):
     )
     send_message(phone, menu)
 
+
 # ---------------------------------------------------------------
 # GPT (opcional por comando "sgpt: ...")
 # ---------------------------------------------------------------
 def ask_gpt(prompt: str, model: str = "gpt-4o-mini", temperature: float = 0.3) -> str:
     """
-    [C-1] Corregido: openai.ChatCompletion.create es SDK v0 (roto en SDK >= 1.0).
-    Ahora usa openai.chat.completions.create con acceso de atributo, no dict.
-    [M-5] Modelo actualizado a gpt-4o-mini (más capaz, más económico, soporte vigente).
-    [B-1] Temperature bajada a 0.3 — más preciso para contexto financiero.
+    Llama a OpenAI usando el cliente instanciado explícitamente (_openai_client).
+    Funciona con SDK >= 1.0. Temperature 0.3 — preciso para contexto financiero.
     """
+    if not _openai_client:
+        return "Lo siento, el servicio de consulta GPT no está configurado."
     try:
-        resp = openai.chat.completions.create(
+        resp = _openai_client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
@@ -146,14 +507,16 @@ def ask_gpt(prompt: str, model: str = "gpt-4o-mini", temperature: float = 0.3) -
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:
-        logging.exception(f"Error OpenAI: {e}")
+        log.exception(f"Error OpenAI: {e}")
         return "Lo siento, ocurrió un error al consultar GPT."
+
 
 def is_gpt_command(msg: str) -> bool:
     return (msg or "").strip().lower().startswith("sgpt:")
 
+
 # ---------------------------------------------------------------
-# EMBUDO – PRÉSTAMO IMSS PENSIONADOS (Opción 1) - CORREGIDO
+# EMBUDO – PRÉSTAMO IMSS PENSIONADOS (Opción 1)
 # ---------------------------------------------------------------
 def funnel_prestamo_imss(user_id: str, user_message: str):
     state = user_state.get(user_id, "imss_beneficios")
@@ -185,6 +548,7 @@ def funnel_prestamo_imss(user_id: str, user_message: str):
             send_main_menu(user_id)
             user_state.pop(user_id, None)
             user_data.pop(user_id, None)
+            _last_service.pop(user_id, None)
             return jsonify({"status": "ok"})
         if resp == "positive":
             send_message(user_id, "¿Cuánto recibes aproximadamente al mes por concepto de pensión?")
@@ -226,11 +590,13 @@ def funnel_prestamo_imss(user_id: str, user_message: str):
             send_main_menu(user_id)
             user_state.pop(user_id, None)
             user_data.pop(user_id, None)
+            _last_service.pop(user_id, None)
             return jsonify({"status": "ok"})
         send_message(user_id, "Perfecto, si deseas podemos continuar con otros servicios.")
         send_main_menu(user_id)
         user_state.pop(user_id, None)
         user_data.pop(user_id, None)
+        _last_service.pop(user_id, None)
         return jsonify({"status": "ok"})
 
     if state == "imss_preg_monto_solicitado":
@@ -271,13 +637,12 @@ def funnel_prestamo_imss(user_id: str, user_message: str):
         if resp not in ("positive", "negative"):
             send_message(user_id, "Por favor responde *sí* o *no* para continuar.")
             return jsonify({"status": "ok"})
-        
+
         send_message(
             user_id,
             "✅ ¡Listo! Tu crédito ha sido *preautorizado*.\n"
             "Un asesor financiero (Christian López) se pondrá en contacto contigo."
         )
-        
         formatted = (
             "🔔 NUEVO PROSPECTO – PRÉSTAMO IMSS\n"
             f"Nombre: {datos.get('nombre','ND')}\n"
@@ -288,17 +653,18 @@ def funnel_prestamo_imss(user_id: str, user_message: str):
             f"Nómina Inbursa: {datos.get('nomina_inbursa','ND')}"
         )
         notify_advisor(formatted)
-        
         send_main_menu(user_id)
         user_state.pop(user_id, None)
         user_data.pop(user_id, None)
+        _last_service.pop(user_id, None)
         return jsonify({"status": "ok"})
 
     send_main_menu(user_id)
     return jsonify({"status": "ok"})
 
+
 # ---------------------------------------------------------------
-# EMBUDO – CRÉDITO EMPRESARIAL (Opción 5) - CORREGIDO
+# EMBUDO – CRÉDITO EMPRESARIAL (Opción 5)
 # ---------------------------------------------------------------
 def funnel_credito_empresarial(user_id: str, user_message: str):
     state = user_state.get(user_id, "emp_beneficios")
@@ -328,6 +694,7 @@ def funnel_credito_empresarial(user_id: str, user_message: str):
             send_main_menu(user_id)
             user_state.pop(user_id, None)
             user_data.pop(user_id, None)
+            _last_service.pop(user_id, None)
             return jsonify({"status": "ok"})
         send_message(user_id, "Responde *sí* o *no* para continuar.")
         return jsonify({"status": "ok"})
@@ -367,13 +734,11 @@ def funnel_credito_empresarial(user_id: str, user_message: str):
     if state == "emp_ciudad":
         datos["ciudad"] = user_message.title()
         user_data[user_id] = datos
-
         send_message(
             user_id,
             "✅ Gracias por la información. Un asesor financiero (Christian López) "
             "se pondrá en contacto contigo en breve para continuar con tu solicitud."
         )
-
         formatted = (
             "🔔 NUEVO PROSPECTO – CRÉDITO EMPRESARIAL\n"
             f"Nombre: {datos.get('nombre','ND')}\n"
@@ -384,23 +749,23 @@ def funnel_credito_empresarial(user_id: str, user_message: str):
             f"WhatsApp: {user_id}"
         )
         notify_advisor(formatted)
-
         send_main_menu(user_id)
         user_state.pop(user_id, None)
         user_data.pop(user_id, None)
+        _last_service.pop(user_id, None)
         return jsonify({"status": "ok"})
 
     send_main_menu(user_id)
     return jsonify({"status": "ok"})
 
+
 # ---------------------------------------------------------------
-# EMBUDO – FINANCIAMIENTO PRÁCTICO EMPRESARIAL (Opción 6) - COMPLETO
+# EMBUDO – FINANCIAMIENTO PRÁCTICO EMPRESARIAL (Opción 6)
 # ---------------------------------------------------------------
 def funnel_financiamiento_practico(user_id: str, user_message: str):
     state = user_state.get(user_id, "fp_intro")
     datos = user_data.get(user_id, {})
 
-    # Paso 1 – Intro
     if state == "fp_intro":
         send_message(
             user_id,
@@ -413,7 +778,6 @@ def funnel_financiamiento_practico(user_id: str, user_message: str):
         user_state[user_id] = "fp_confirmar_interes"
         return jsonify({"status": "ok", "funnel": "financiamiento_practico"})
 
-    # Paso 2 – Confirmar interés
     if state == "fp_confirmar_interes":
         resp = interpret_response(user_message)
         if resp == "negative":
@@ -426,6 +790,7 @@ def funnel_financiamiento_practico(user_id: str, user_message: str):
             send_main_menu(user_id)
             user_state.pop(user_id, None)
             user_data.pop(user_id, None)
+            _last_service.pop(user_id, None)
             return jsonify({"status": "ok"})
         if resp == "positive":
             send_message(
@@ -438,24 +803,25 @@ def funnel_financiamiento_practico(user_id: str, user_message: str):
         send_message(user_id, "Responde *sí* o *no* para continuar.")
         return jsonify({"status": "ok"})
 
-    # Diccionario de preguntas
+    # Preguntas secuenciales — el valor del estado actual es la respuesta anterior;
+    # el dict `preguntas` mapea estado_actual → texto de la SIGUIENTE pregunta.
     preguntas = {
-        "fp_q1_giro": "2️⃣ ¿Qué *antigüedad fiscal* tiene la empresa?",
-        "fp_q2_antiguedad": "3️⃣ ¿Es *persona física con actividad empresarial* o *persona moral*?",
-        "fp_q3_tipo": "4️⃣ ¿Qué *edad tiene el representante legal*?",
-        "fp_q4_edad": "5️⃣ ¿Buró de crédito empresa y accionistas al día? (Responde *positivo* o *negativo*).",
-        "fp_q5_buro": "6️⃣ ¿Aproximadamente *cuánto factura al año* la empresa?",
+        "fp_q1_giro":        "2️⃣ ¿Qué *antigüedad fiscal* tiene la empresa?",
+        "fp_q2_antiguedad":  "3️⃣ ¿Es *persona física con actividad empresarial* o *persona moral*?",
+        "fp_q3_tipo":        "4️⃣ ¿Qué *edad tiene el representante legal*?",
+        "fp_q4_edad":        "5️⃣ ¿Buró de crédito empresa y accionistas al día? (Responde *positivo* o *negativo*).",
+        "fp_q5_buro":        "6️⃣ ¿Aproximadamente *cuánto factura al año* la empresa?",
         "fp_q6_facturacion": "7️⃣ ¿Tiene *facturación constante* en los últimos seis meses? (Sí/No)",
-        "fp_q7_constancia": "8️⃣ ¿Cuánto es el *monto de financiamiento* que requiere?",
-        "fp_q8_monto": "9️⃣ ¿Cuenta con la *opinión de cumplimiento positiva* ante el SAT?",
-        "fp_q9_opinion": "🔟 ¿Qué *tipo de financiamiento* requiere?",
-        "fp_q10_tipo": "1️⃣1️⃣ ¿Cuenta con financiamiento actualmente? ¿Con quién?",
+        "fp_q7_constancia":  "8️⃣ ¿Cuánto es el *monto de financiamiento* que requiere?",
+        "fp_q8_monto":       "9️⃣ ¿Cuenta con la *opinión de cumplimiento positiva* ante el SAT?",
+        "fp_q9_opinion":     "🔟 ¿Qué *tipo de financiamiento* requiere?",
+        "fp_q10_tipo":       "1️⃣1️⃣ ¿Cuenta con financiamiento actualmente? ¿Con quién?",
     }
 
     orden = [
         "fp_q1_giro", "fp_q2_antiguedad", "fp_q3_tipo", "fp_q4_edad", "fp_q5_buro",
         "fp_q6_facturacion", "fp_q7_constancia", "fp_q8_monto", "fp_q9_opinion",
-        "fp_q10_tipo", "fp_q11_actual", "fp_comentario"
+        "fp_q10_tipo", "fp_q11_actual", "fp_comentario",
     ]
 
     if state in orden[:-1]:
@@ -471,7 +837,6 @@ def funnel_financiamiento_practico(user_id: str, user_message: str):
             send_message(user_id, preguntas.get(state, "Por favor continúa con la siguiente información."))
         return jsonify({"status": "ok"})
 
-    # Último paso – recibir comentario y notificar
     if state == "fp_comentario":
         datos["comentario"] = user_message
         formatted = (
@@ -499,35 +864,23 @@ def funnel_financiamiento_practico(user_id: str, user_message: str):
         send_main_menu(user_id)
         user_state.pop(user_id, None)
         user_data.pop(user_id, None)
+        _last_service.pop(user_id, None)
         return jsonify({"status": "ok"})
 
     send_main_menu(user_id)
     return jsonify({"status": "ok"})
 
+
 # ---------------------------------------------------------------
-# RUTA RAÍZ PARA HEALTH CHECKS DE RENDER
+# Verificación de firma Meta (HMAC-SHA256)
 # ---------------------------------------------------------------
-@app.route('/')
-def root():
-    return jsonify({"status": "online", "service": "Vicky Bot Inbursa", "timestamp": datetime.utcnow().isoformat()}), 200
-
-META_APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
-
-# [M-1] Idempotencia: evita reprocesar el mismo message_id si Meta reenvía el evento
-import threading
-from collections import deque
-_processed_ids: set = set()
-_processed_deque: deque = deque(maxlen=3000)
-_idempotency_lock = threading.Lock()
-
-# [A-3] Verificación de firma HMAC-SHA256 de Meta
-import hmac
-import hashlib
-
 def _verify_meta_signature(raw_body: bytes, sig_header: str) -> bool:
-    """Valida la firma X-Hub-Signature-256 de Meta. Si META_APP_SECRET no está configurado, pasa en modo degradado."""
+    """
+    Valida X-Hub-Signature-256 de Meta.
+    Si META_APP_SECRET no está configurado, pasa en modo degradado (no bloquea).
+    """
     if not META_APP_SECRET:
-        return True  # modo degradado: sin secreto configurado, no bloquea
+        return True
     if not sig_header.startswith("sha256="):
         return False
     expected = "sha256=" + hmac.new(
@@ -536,24 +889,27 @@ def _verify_meta_signature(raw_body: bytes, sig_header: str) -> bool:
     return hmac.compare_digest(expected, sig_header)
 
 
+# ---------------------------------------------------------------
+# Procesamiento de un mensaje individual
+# ---------------------------------------------------------------
 def _handle_message(message: dict) -> None:
     """
-    [A-2] Lógica de procesamiento de un mensaje individual.
-    Separada del webhook para poder iterar sobre múltiples mensajes por payload.
+    Procesa un mensaje individual del webhook.
+    Separado para permitir iterar sobre múltiples mensajes por payload [A-2].
+    Registra el mensaje entrante en Sheets antes de procesarlo.
     """
     try:
         phone_number = message.get("from")
-        # [A-4] Validar phone_number antes de cualquier operación
         if not phone_number:
-            logging.warning("⚠️ Mensaje sin número de teléfono — ignorado")
+            log.warning("⚠️ Mensaje sin número de teléfono — ignorado")
             return
 
-        # [M-1] Idempotencia por message_id
+        # Idempotencia [M-1]
         msg_id = message.get("id", "")
         if msg_id:
             with _idempotency_lock:
                 if msg_id in _processed_ids:
-                    logging.info(f"⚠️ Mensaje duplicado ignorado: {msg_id}")
+                    log.info(f"⚠️ Mensaje duplicado ignorado: {msg_id}")
                     return
                 if len(_processed_deque) >= 3000:
                     oldest = _processed_deque[0]
@@ -561,28 +917,56 @@ def _handle_message(message: dict) -> None:
                 _processed_deque.append(msg_id)
                 _processed_ids.add(msg_id)
 
+        # Propagar msg_id al hilo para que send_message/notify_advisor lo hereden
+        # automáticamente desde los embudos sin refactorizar cada llamada.
+        _tl.msg_id = msg_id
+
         mtype = message.get("type")
         if mtype != "text":
-            send_message(phone_number, "Por ahora solo puedo procesar mensajes de texto 📩")
+            # Registrar evento multimedia entrante en Sheets antes de responder
+            try:
+                _sheets_append_row(
+                    phone      = phone_number,
+                    nombre     = _get_nombre(phone_number),
+                    mensaje    = f"[{mtype}]",
+                    tipo       = "entrante",
+                    origen     = "cliente",
+                    message_id = msg_id,
+                )
+            except Exception:
+                log.exception("❌ Error registrando multimedia entrante en Sheets")
+            send_message(phone_number, "Por ahora solo puedo procesar mensajes de texto 📩", msg_id)
             return
 
         user_message = (message.get("text") or {}).get("body", "").strip()
-        # [B-3] Limitar longitud de inputs para evitar abuso
-        user_message = user_message[:500]
+        user_message = user_message[:500]   # [B-3] límite de longitud
 
-        logging.info(f"📱 {phone_number}: {user_message}")
+        log.info(f"📱 {phone_number}: {user_message}")
+
+        # Registrar mensaje ENTRANTE en Sheets
+        try:
+            _sheets_append_row(
+                phone      = phone_number,
+                nombre     = _get_nombre(phone_number),
+                mensaje    = user_message,
+                tipo       = "entrante",
+                origen     = "cliente",
+                message_id = msg_id,
+            )
+        except Exception:
+            log.exception("❌ Error registrando mensaje entrante en Sheets")
 
         # Comando GPT
         if is_gpt_command(user_message):
             prompt = user_message.split(":", 1)[1].strip() if ":" in user_message else ""
             if not prompt:
-                send_message(phone_number, "Ejemplo: sgpt: ¿Qué ventajas tiene el crédito IMSS?")
+                send_message(phone_number, "Ejemplo: sgpt: ¿Qué ventajas tiene el crédito IMSS?", msg_id)
                 return
             gpt_reply = ask_gpt(prompt)
-            send_message(phone_number, gpt_reply)
+            send_message(phone_number, gpt_reply, msg_id)
             return
 
-        # Si está en algún embudo activo, continuar
+        # Continuar embudo activo
         state = user_state.get(phone_number, "")
         if state.startswith("imss_"):
             funnel_prestamo_imss(phone_number, user_message)
@@ -594,7 +978,7 @@ def _handle_message(message: dict) -> None:
             funnel_financiamiento_practico(phone_number, user_message)
             return
 
-        # Menú / opciones
+        # Mapa de opciones del menú
         menu_options = {
             "1": "prestamo_imss", "imss": "prestamo_imss", "préstamo": "prestamo_imss",
             "prestamo": "prestamo_imss", "ley 73": "prestamo_imss",
@@ -614,18 +998,21 @@ def _handle_message(message: dict) -> None:
         option = menu_options.get(user_message.lower())
 
         if option == "prestamo_imss":
+            _last_service[phone_number] = "imss"
             user_state[phone_number] = "imss_beneficios"
             user_data.setdefault(phone_number, {})
             funnel_prestamo_imss(phone_number, user_message)
             return
 
         if option == "empresarial":
+            _last_service[phone_number] = "empresarial"
             user_state[phone_number] = "emp_beneficios"
             user_data.setdefault(phone_number, {})
             funnel_credito_empresarial(phone_number, user_message)
             return
 
         if option == "financiamiento_practico":
+            _last_service[phone_number] = "financiamiento_practico"
             user_state[phone_number] = "fp_intro"
             user_data.setdefault(phone_number, {})
             funnel_financiamiento_practico(phone_number, user_message)
@@ -634,75 +1021,95 @@ def _handle_message(message: dict) -> None:
         if user_message.lower() in ["menu", "menú", "hola", "buenas", "servicios", "opciones"]:
             user_state.pop(phone_number, None)
             user_data.pop(phone_number, None)
+            _last_service.pop(phone_number, None)
             send_main_menu(phone_number)
             return
 
         if option == "seguro_auto":
+            _last_service[phone_number] = "seguro_auto"
             send_message(
                 phone_number,
                 "🚗 *Seguros de Auto Inbursa*\n"
                 "✅ Cobertura amplia\n✅ Asistencia vial 24/7\n✅ RC, robo total/parcial\n\n"
-                "📞 Un asesor te contactará para cotizar."
+                "📞 Un asesor te contactará para cotizar.",
+                msg_id,
             )
-            notify_advisor(f"🚗 Interesado en Seguro Auto · WhatsApp: {phone_number}")
+            notify_advisor(f"🚗 Interesado en Seguro Auto · WhatsApp: {phone_number}", msg_id)
             return
 
         if option == "seguro_vida":
+            _last_service[phone_number] = "seguro_vida"
             send_message(
                 phone_number,
                 "🏥 *Seguros de Vida y Salud Inbursa*\n"
                 "✅ Vida\n✅ Gastos médicos\n✅ Hospitalización\n✅ Atención 24/7\n\n"
-                "📞 Un asesor te contactará para explicar coberturas."
+                "📞 Un asesor te contactará para explicar coberturas.",
+                msg_id,
             )
-            notify_advisor(f"🏥 Interesado en Vida/Salud · WhatsApp: {phone_number}")
+            notify_advisor(f"🏥 Interesado en Vida/Salud · WhatsApp: {phone_number}", msg_id)
             return
 
         if option == "vrim":
+            _last_service[phone_number] = "vrim"
             send_message(
                 phone_number,
                 "💳 *Tarjetas Médicas VRIM*\n"
                 "✅ Consultas ilimitadas\n✅ Especialistas y laboratorios\n✅ Descuentos en medicamentos\n\n"
-                "📞 Un asesor te contactará para explicar beneficios."
+                "📞 Un asesor te contactará para explicar beneficios.",
+                msg_id,
             )
-            notify_advisor(f"💳 Interesado en VRIM · WhatsApp: {phone_number}")
+            notify_advisor(f"💳 Interesado en VRIM · WhatsApp: {phone_number}", msg_id)
             return
 
         # Fallback
         send_main_menu(phone_number)
 
     except Exception:
-        logging.exception(f"❌ Error procesando mensaje de {message.get('from', '?')}")
+        log.exception(f"❌ Error procesando mensaje de {message.get('from', '?')}")
+    finally:
+        # Limpiar msg_id del hilo para evitar rastro si el worker se reutiliza
+        _tl.msg_id = ""
 
 
 # ---------------------------------------------------------------
-# WEBHOOK – VERIFICACIÓN (GET) Y RECEPCIÓN (POST) - COMPLETO
+# RUTAS FLASK
 # ---------------------------------------------------------------
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({
+        "status": "online",
+        "service": "Vicky Bot Inbursa",
+        "sheets_ready": _sheets_ready,
+        "timestamp": _now_mx(),
+    }), 200
+
+
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
-        mode = request.args.get("hub.mode")
-        token = request.args.get("hub.verify_token")
+        mode      = request.args.get("hub.mode")
+        token     = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
+        # [C-3] Guardia explícita: VERIFY_TOKEN vacío nunca valida
         if mode == "subscribe" and VERIFY_TOKEN and token == VERIFY_TOKEN:
-            # [C-3] Guardia explícita: si VERIFY_TOKEN no está configurado, nunca valida.
             return challenge, 200
         return "forbidden", 403
 
     # POST
     try:
-        # [A-3] Verificar firma Meta (HMAC-SHA256)
-        raw_body = request.get_data()
+        # [A-3] Verificar firma HMAC-SHA256 de Meta
+        raw_body   = request.get_data()
         sig_header = request.headers.get("X-Hub-Signature-256", "")
         if not _verify_meta_signature(raw_body, sig_header):
-            logging.warning("⚠️ Firma Meta inválida — rechazando webhook")
+            log.warning("⚠️ Firma Meta inválida — rechazando webhook")
             return jsonify({"status": "forbidden"}), 403
 
         data = request.get_json(force=True, silent=True) or {}
 
-        # [A-2] Iterar sobre todos los entries/changes/messages (antes solo procesaba [0])
+        # [A-2] Iterar sobre TODOS los entries/changes/messages
         for entry in data.get("entry", []):
             for change in entry.get("changes", []):
-                value = change.get("value") or {}
+                value    = change.get("value") or {}
                 messages = value.get("messages") or []
                 for message in messages:
                     _handle_message(message)
@@ -710,22 +1117,27 @@ def webhook():
         return jsonify({"status": "ok"}), 200
 
     except Exception:
-        logging.exception("❌ Error en webhook POST")
-        # [C-2] Retorna 200 para evitar reintentos infinitos de Meta.
-        # El detalle del error queda en logs, no expuesto al exterior.
+        log.exception("❌ Error en webhook POST")
+        # [C-2] Siempre 200 para evitar reintentos infinitos de Meta
         return jsonify({"status": "ok"}), 200
 
-# ---------------------------------------------------------------
-# HEALTHCHECK
-# ---------------------------------------------------------------
+
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "Vicky Bot Inbursa"}), 200
+    return jsonify({
+        "status": "ok",
+        "service": "Vicky Bot Inbursa",
+        "sheets_ready": _sheets_ready,
+    }), 200
+
 
 # ---------------------------------------------------------------
-# MAIN
+# ARRANQUE
 # ---------------------------------------------------------------
+# Inicializar Google Sheets al arrancar (antes de recibir requests)
+_sheets_init()
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    logging.info(f"🚀 Iniciando Vicky Bot en puerto {port}")
+    log.info(f"🚀 Iniciando Vicky Bot en puerto {port}")
     app.run(host="0.0.0.0", port=port)
