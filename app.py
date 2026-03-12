@@ -130,15 +130,21 @@ def send_main_menu(phone: str):
 # ---------------------------------------------------------------
 # GPT (opcional por comando "sgpt: ...")
 # ---------------------------------------------------------------
-def ask_gpt(prompt: str, model: str = "gpt-3.5-turbo", temperature: float = 0.7) -> str:
+def ask_gpt(prompt: str, model: str = "gpt-4o-mini", temperature: float = 0.3) -> str:
+    """
+    [C-1] Corregido: openai.ChatCompletion.create es SDK v0 (roto en SDK >= 1.0).
+    Ahora usa openai.chat.completions.create con acceso de atributo, no dict.
+    [M-5] Modelo actualizado a gpt-4o-mini (más capaz, más económico, soporte vigente).
+    [B-1] Temperature bajada a 0.3 — más preciso para contexto financiero.
+    """
     try:
-        resp = openai.ChatCompletion.create(
+        resp = openai.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
             max_tokens=400,
         )
-        return resp.choices[0].message["content"].strip()
+        return resp.choices[0].message.content.strip()
     except Exception as e:
         logging.exception(f"Error OpenAI: {e}")
         return "Lo siento, ocurrió un error al consultar GPT."
@@ -505,39 +511,65 @@ def funnel_financiamiento_practico(user_id: str, user_message: str):
 def root():
     return jsonify({"status": "online", "service": "Vicky Bot Inbursa", "timestamp": datetime.utcnow().isoformat()}), 200
 
-# ---------------------------------------------------------------
-# WEBHOOK – VERIFICACIÓN (GET) Y RECEPCIÓN (POST) - COMPLETO
-# ---------------------------------------------------------------
-@app.route("/webhook", methods=["GET", "POST"])
-def webhook():
-    if request.method == "GET":
-        mode = request.args.get("hub.mode")
-        token = request.args.get("hub.verify_token")
-        challenge = request.args.get("hub.challenge")
-        if mode == "subscribe" and token == VERIFY_TOKEN:
-            return challenge, 200
-        return "forbidden", 403
+META_APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
 
-    # POST
+# [M-1] Idempotencia: evita reprocesar el mismo message_id si Meta reenvía el evento
+import threading
+from collections import deque
+_processed_ids: set = set()
+_processed_deque: deque = deque(maxlen=3000)
+_idempotency_lock = threading.Lock()
+
+# [A-3] Verificación de firma HMAC-SHA256 de Meta
+import hmac
+import hashlib
+
+def _verify_meta_signature(raw_body: bytes, sig_header: str) -> bool:
+    """Valida la firma X-Hub-Signature-256 de Meta. Si META_APP_SECRET no está configurado, pasa en modo degradado."""
+    if not META_APP_SECRET:
+        return True  # modo degradado: sin secreto configurado, no bloquea
+    if not sig_header.startswith("sha256="):
+        return False
+    expected = "sha256=" + hmac.new(
+        META_APP_SECRET.encode(), raw_body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, sig_header)
+
+
+def _handle_message(message: dict) -> None:
+    """
+    [A-2] Lógica de procesamiento de un mensaje individual.
+    Separada del webhook para poder iterar sobre múltiples mensajes por payload.
+    """
     try:
-        data = request.get_json(force=True, silent=True) or {}
-        entry = (data.get("entry") or [{}])[0]
-        change = (entry.get("changes") or [{}])[0]
-        value = change.get("value") or {}
-        messages = value.get("messages") or []
-
-        if not messages:
-            return jsonify({"status": "ignored"}), 200
-
-        message = messages[0]
         phone_number = message.get("from")
-        mtype = message.get("type")
+        # [A-4] Validar phone_number antes de cualquier operación
+        if not phone_number:
+            logging.warning("⚠️ Mensaje sin número de teléfono — ignorado")
+            return
 
+        # [M-1] Idempotencia por message_id
+        msg_id = message.get("id", "")
+        if msg_id:
+            with _idempotency_lock:
+                if msg_id in _processed_ids:
+                    logging.info(f"⚠️ Mensaje duplicado ignorado: {msg_id}")
+                    return
+                if len(_processed_deque) >= 3000:
+                    oldest = _processed_deque[0]
+                    _processed_ids.discard(oldest)
+                _processed_deque.append(msg_id)
+                _processed_ids.add(msg_id)
+
+        mtype = message.get("type")
         if mtype != "text":
             send_message(phone_number, "Por ahora solo puedo procesar mensajes de texto 📩")
-            return jsonify({"status": "ok"}), 200
+            return
 
         user_message = (message.get("text") or {}).get("body", "").strip()
+        # [B-3] Limitar longitud de inputs para evitar abuso
+        user_message = user_message[:500]
+
         logging.info(f"📱 {phone_number}: {user_message}")
 
         # Comando GPT
@@ -545,58 +577,38 @@ def webhook():
             prompt = user_message.split(":", 1)[1].strip() if ":" in user_message else ""
             if not prompt:
                 send_message(phone_number, "Ejemplo: sgpt: ¿Qué ventajas tiene el crédito IMSS?")
-                return jsonify({"status": "ok", "source": "gpt"})
+                return
             gpt_reply = ask_gpt(prompt)
             send_message(phone_number, gpt_reply)
-            return jsonify({"status": "ok", "source": "gpt"})
+            return
 
-        # Si está en algún embudo, continuar
+        # Si está en algún embudo activo, continuar
         state = user_state.get(phone_number, "")
         if state.startswith("imss_"):
-            return funnel_prestamo_imss(phone_number, user_message)
+            funnel_prestamo_imss(phone_number, user_message)
+            return
         if state.startswith("emp_"):
-            return funnel_credito_empresarial(phone_number, user_message)
+            funnel_credito_empresarial(phone_number, user_message)
+            return
         if state.startswith("fp_"):
-            return funnel_financiamiento_practico(phone_number, user_message)
+            funnel_financiamiento_practico(phone_number, user_message)
+            return
 
-        # Menú / opciones COMPLETO
+        # Menú / opciones
         menu_options = {
-            "1": "prestamo_imss",
-            "imss": "prestamo_imss",
-            "préstamo": "prestamo_imss",
-            "prestamo": "prestamo_imss",
-            "ley 73": "prestamo_imss",
-            "pensión": "prestamo_imss",
-            "pension": "prestamo_imss",
-
-            "2": "seguro_auto",
-            "auto": "seguro_auto",
-            "seguros de auto": "seguro_auto",
-
-            "3": "seguro_vida",
-            "seguro vida": "seguro_vida",
-            "seguros de vida": "seguro_vida",
-            "seguro salud": "seguro_vida",
-            "vida": "seguro_vida",
-
-            "4": "vrim",
-            "tarjetas médicas": "vrim",
-            "tarjetas medicas": "vrim",
-            "vrim": "vrim",
-
-            "5": "empresarial",
-            "financiamiento empresarial": "empresarial",
-            "empresa": "empresarial",
-            "negocio": "empresarial",
-            "pyme": "empresarial",
-            "crédito empresarial": "empresarial",
-            "credito empresarial": "empresarial",
-
-            "6": "financiamiento_practico",
-            "financiamiento practico": "financiamiento_practico",
+            "1": "prestamo_imss", "imss": "prestamo_imss", "préstamo": "prestamo_imss",
+            "prestamo": "prestamo_imss", "ley 73": "prestamo_imss",
+            "pensión": "prestamo_imss", "pension": "prestamo_imss",
+            "2": "seguro_auto", "auto": "seguro_auto", "seguros de auto": "seguro_auto",
+            "3": "seguro_vida", "seguro vida": "seguro_vida", "seguros de vida": "seguro_vida",
+            "seguro salud": "seguro_vida", "vida": "seguro_vida",
+            "4": "vrim", "tarjetas médicas": "vrim", "tarjetas medicas": "vrim", "vrim": "vrim",
+            "5": "empresarial", "financiamiento empresarial": "empresarial",
+            "empresa": "empresarial", "negocio": "empresarial", "pyme": "empresarial",
+            "crédito empresarial": "empresarial", "credito empresarial": "empresarial",
+            "6": "financiamiento_practico", "financiamiento practico": "financiamiento_practico",
             "financiamiento práctico": "financiamiento_practico",
-            "crédito simple": "financiamiento_practico",
-            "credito simple": "financiamiento_practico",
+            "crédito simple": "financiamiento_practico", "credito simple": "financiamiento_practico",
         }
 
         option = menu_options.get(user_message.lower())
@@ -604,26 +616,27 @@ def webhook():
         if option == "prestamo_imss":
             user_state[phone_number] = "imss_beneficios"
             user_data.setdefault(phone_number, {})
-            return funnel_prestamo_imss(phone_number, user_message)
+            funnel_prestamo_imss(phone_number, user_message)
+            return
 
         if option == "empresarial":
             user_state[phone_number] = "emp_beneficios"
             user_data.setdefault(phone_number, {})
-            return funnel_credito_empresarial(phone_number, user_message)
+            funnel_credito_empresarial(phone_number, user_message)
+            return
 
         if option == "financiamiento_practico":
             user_state[phone_number] = "fp_intro"
             user_data.setdefault(phone_number, {})
-            return funnel_financiamiento_practico(phone_number, user_message)
+            funnel_financiamiento_practico(phone_number, user_message)
+            return
 
-        # Rutas rápidas de menú
         if user_message.lower() in ["menu", "menú", "hola", "buenas", "servicios", "opciones"]:
             user_state.pop(phone_number, None)
             user_data.pop(phone_number, None)
             send_main_menu(phone_number)
-            return jsonify({"status": "ok"})
+            return
 
-        # Info rápida para opciones 2,3,4 (notificación + texto)
         if option == "seguro_auto":
             send_message(
                 phone_number,
@@ -632,7 +645,7 @@ def webhook():
                 "📞 Un asesor te contactará para cotizar."
             )
             notify_advisor(f"🚗 Interesado en Seguro Auto · WhatsApp: {phone_number}")
-            return jsonify({"status": "ok"})
+            return
 
         if option == "seguro_vida":
             send_message(
@@ -642,7 +655,7 @@ def webhook():
                 "📞 Un asesor te contactará para explicar coberturas."
             )
             notify_advisor(f"🏥 Interesado en Vida/Salud · WhatsApp: {phone_number}")
-            return jsonify({"status": "ok"})
+            return
 
         if option == "vrim":
             send_message(
@@ -652,15 +665,55 @@ def webhook():
                 "📞 Un asesor te contactará para explicar beneficios."
             )
             notify_advisor(f"💳 Interesado en VRIM · WhatsApp: {phone_number}")
-            return jsonify({"status": "ok"})
+            return
 
-        # Fallback a menú
+        # Fallback
         send_main_menu(phone_number)
-        return jsonify({"status": "ok"})
 
-    except Exception as e:
-        logging.exception(f"❌ Error en webhook POST: {e}")
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        logging.exception(f"❌ Error procesando mensaje de {message.get('from', '?')}")
+
+
+# ---------------------------------------------------------------
+# WEBHOOK – VERIFICACIÓN (GET) Y RECEPCIÓN (POST) - COMPLETO
+# ---------------------------------------------------------------
+@app.route("/webhook", methods=["GET", "POST"])
+def webhook():
+    if request.method == "GET":
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
+        if mode == "subscribe" and VERIFY_TOKEN and token == VERIFY_TOKEN:
+            # [C-3] Guardia explícita: si VERIFY_TOKEN no está configurado, nunca valida.
+            return challenge, 200
+        return "forbidden", 403
+
+    # POST
+    try:
+        # [A-3] Verificar firma Meta (HMAC-SHA256)
+        raw_body = request.get_data()
+        sig_header = request.headers.get("X-Hub-Signature-256", "")
+        if not _verify_meta_signature(raw_body, sig_header):
+            logging.warning("⚠️ Firma Meta inválida — rechazando webhook")
+            return jsonify({"status": "forbidden"}), 403
+
+        data = request.get_json(force=True, silent=True) or {}
+
+        # [A-2] Iterar sobre todos los entries/changes/messages (antes solo procesaba [0])
+        for entry in data.get("entry", []):
+            for change in entry.get("changes", []):
+                value = change.get("value") or {}
+                messages = value.get("messages") or []
+                for message in messages:
+                    _handle_message(message)
+
+        return jsonify({"status": "ok"}), 200
+
+    except Exception:
+        logging.exception("❌ Error en webhook POST")
+        # [C-2] Retorna 200 para evitar reintentos infinitos de Meta.
+        # El detalle del error queda en logs, no expuesto al exterior.
+        return jsonify({"status": "ok"}), 200
 
 # ---------------------------------------------------------------
 # HEALTHCHECK
@@ -676,4 +729,3 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     logging.info(f"🚀 Iniciando Vicky Bot en puerto {port}")
     app.run(host="0.0.0.0", port=port)
-
