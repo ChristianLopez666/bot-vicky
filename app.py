@@ -66,26 +66,19 @@ SHEETS_ID_CONVERSACIONES     = os.getenv("SHEETS_ID_CONVERSACIONES", "").strip()
 SHEETS_TAB_CONVERSACIONES    = os.getenv("SHEETS_TAB_CONVERSACIONES", "Conversaciones").strip()
 
 # ---------------------------------------------------------------
-# Cliente OpenAI — instanciación explícita compatible con SDK >= 1.0
-# openai.api_key = ... es patrón SDK v0 y puede fallar en SDK moderno.
-# Usamos openai.OpenAI(api_key=...) que funciona desde SDK 1.0 en adelante.
+# Cliente OpenAI — SDK >= 1.0 requerido (agrega openai>=1.0.0 a requirements.txt).
+# El fallback legacy se eliminó: openai.OpenAI() es incompatible con el módulo
+# legacy y mezclarlo produce errores silenciosos en chat.completions.create().
 # ---------------------------------------------------------------
-try:
-    _openai_client = openai.OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-    if _openai_client:
-        log.info("✅ Cliente OpenAI inicializado (SDK >= 1.0).")
-    else:
-        log.warning("⚠️ OPENAI_API_KEY no configurado. Comando sgpt: deshabilitado.")
-except AttributeError:
-    # Fallback para instalaciones muy antiguas del SDK (< 1.0) — improbable en Render actual
-    log.warning("⚠️ SDK OpenAI antiguo detectado. Intentando modo legacy.")
+_openai_client = None
+if OPENAI_API_KEY:
     try:
-        import openai as _openai_legacy
-        _openai_legacy.api_key = OPENAI_API_KEY
-        _openai_client = _openai_legacy
+        _openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        log.info("✅ Cliente OpenAI inicializado (SDK >= 1.0).")
     except Exception:
-        log.exception("❌ No se pudo inicializar OpenAI.")
-        _openai_client = None
+        log.exception("❌ No se pudo inicializar cliente OpenAI. Verifica openai>=1.0.0.")
+else:
+    log.warning("⚠️ OPENAI_API_KEY no configurado. GPT deshabilitado.")
 
 # ---------------------------------------------------------------
 # Flask app + estado de usuarios
@@ -369,10 +362,7 @@ def send_message(to: str, text: str, _message_id: str = "") -> bool:
     return success
 
 
-
 # send_whatsapp_message eliminado — era alias redundante de send_message.
-
-
 
 
 # ---------------------------------------------------------------
@@ -450,14 +440,46 @@ def notify_advisor(message: str, _message_id: str = "") -> bool:
 # ---------------------------------------------------------------
 # UTILIDADES
 # ---------------------------------------------------------------
+# Tokens positivos y negativos evaluados por palabra completa.
+# Las frases de 2+ palabras se verifican como substring del texto normalizado.
+# Se evitan falsos positivos por substring parcial
+# (ej. "si" dentro de "simple", "not" dentro de "notificar").
+_RESP_POSITIVE_WORDS   = {"si", "sip", "claro", "ok", "vale", "afirmativo",
+                           "yes", "correcto", "exacto", "andale", "dale"}
+_RESP_POSITIVE_PHRASES = {"por supuesto", "desde luego", "claro que si",
+                           "claro que sí", "con gusto"}
+# Palabras sueltas que hacen la respuesta negativa con certeza.
+_RESP_STRONG_NEG_WORDS = {"no", "nel", "nop", "negativo", "tampoco",
+                           "nunca", "jamas"}
+
+
 def interpret_response(text: str) -> str:
-    t = (text or "").strip().lower()
-    positive = ["sí", "si", "sip", "claro", "ok", "vale", "afirmativo", "yes", "correcto"]
-    negative = ["no", "nop", "negativo", "para nada", "not", "nel"]
-    if any(k in t for k in positive):
-        return "positive"
-    if any(k in t for k in negative):
+    """
+    Interpreta si el texto es una respuesta positiva, negativa o neutral.
+
+    Reglas (en orden de prioridad):
+    1. Negativa fuerte por palabra completa → "negative" (incluye "ok no", "sí pero no").
+    2. Positiva por palabra completa o frase → "positive".
+    3. Neutral en cualquier otro caso.
+    """
+    if not text:
+        return "neutral"
+
+    norm = normalize_text(text)
+    tokens = set(norm.split())
+
+    # Negativa fuerte: cualquier token negativo gana sobre positivos
+    if tokens & _RESP_STRONG_NEG_WORDS:
         return "negative"
+
+    # Positiva: token positivo suelto
+    if tokens & _RESP_POSITIVE_WORDS:
+        return "positive"
+
+    # Positiva: frase multi-palabra contenida en el texto normalizado
+    if any(phrase in norm for phrase in _RESP_POSITIVE_PHRASES):
+        return "positive"
+
     return "neutral"
 
 
@@ -489,7 +511,7 @@ def send_main_menu(phone: str):
 
 
 # ---------------------------------------------------------------
-# GPT (opcional por comando "sgpt: ...")
+# GPT — helpers
 # ---------------------------------------------------------------
 def ask_gpt(prompt: str, model: str = "gpt-4o-mini", temperature: float = 0.3) -> str:
     """
@@ -511,8 +533,524 @@ def ask_gpt(prompt: str, model: str = "gpt-4o-mini", temperature: float = 0.3) -
         return "Lo siento, ocurrió un error al consultar GPT."
 
 
+def ask_gpt_hybrid(user_prompt: str, system_prompt: str = "",
+                   model: str = "gpt-4o-mini", temperature: float = 0.4) -> str:
+    """
+    Llamada a OpenAI con system_prompt separado para la capa híbrida.
+    Acepta un system_prompt explícito; si no se pasa, usa el de Vicky Bot.
+    max_tokens reducido a 250 para respuestas breves y comerciales.
+    """
+    if not _openai_client:
+        return "Lo siento, el servicio de consulta no está disponible en este momento."
+
+    if not system_prompt:
+        system_prompt = _HYBRID_SYSTEM_PROMPT
+
+    try:
+        resp = _openai_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+            temperature=temperature,
+            max_tokens=250,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        log.exception(f"Error OpenAI hybrid: {e}")
+        return ("En este momento no puedo procesar tu consulta. "
+                "¿Te puedo orientar sobre alguno de nuestros servicios: "
+                "préstamos IMSS, seguros o financiamiento empresarial?")
+
+
 def is_gpt_command(msg: str) -> bool:
     return (msg or "").strip().lower().startswith("sgpt:")
+
+
+# ---------------------------------------------------------------
+# SYSTEM PROMPT PARA CAPA HÍBRIDA
+# ---------------------------------------------------------------
+_HYBRID_SYSTEM_PROMPT = """Eres Vicky, asistente comercial de Christian López, asesor financiero de Inbursa.
+
+Tu único propósito es orientar al usuario sobre EXACTAMENTE estos 6 servicios:
+1. Préstamos IMSS Pensionados Ley 73 — montos $40K–$650K, descuento vía pensión, sin aval, plazos 12–60 meses
+2. Seguros de Auto Inbursa — cobertura amplia, RC, robo total/parcial, asistencia vial 24/7
+3. Seguros de Vida y Salud — vida, gastos médicos mayores, hospitalización, atención 24/7
+4. Tarjetas Médicas VRIM — consultas ilimitadas, especialistas, laboratorios, descuentos en medicamentos
+5. Financiamiento Empresarial — $100K–$100M, PYMES y empresas consolidadas, tasas preferenciales
+6. Financiamiento Práctico Empresarial — aprobación desde 24 horas, desde $100K, sin garantía, para empresas y personas físicas con actividad empresarial
+
+REGLAS ABSOLUTAS (incumplirlas es un error grave):
+- Responde SIEMPRE en español mexicano, tono profesional pero cercano y cálido.
+- Máximo 80–120 palabras. Si no cabe en eso, recorta; no escribas más.
+- NO inventes políticas, tasas, plazos, requisitos ni condiciones que no estén descritos arriba.
+- NO prometas aprobación ni resultados garantizados.
+- NO respondas temas ajenos a los 6 servicios. Si la consulta no corresponde a ninguno, responde en 1–2 líneas explicando que solo puedes orientar sobre esos servicios e invita a elegir uno.
+- NO repitas el menú completo. Menciona opciones solo si es imprescindible para orientar.
+- SIEMPRE termina con UNA sola pregunta útil o una guía concreta al siguiente paso.
+- Si la intención no está clara, haz UNA sola pregunta de aclaración concisa.
+- Tu objetivo es la conversión: llevar al usuario a elegir un servicio específico.
+"""
+
+
+# ---------------------------------------------------------------
+# CAPA HÍBRIDA — funciones auxiliares
+# ---------------------------------------------------------------
+
+def normalize_text(text: str) -> str:
+    """
+    Normaliza texto para comparaciones semánticas:
+    minúsculas, sin tildes (unicodedata NFD), sin signos de puntuación,
+    espacios simples.
+    """
+    if not text:
+        return ""
+    import unicodedata
+    # NFD descompone caracteres acentuados en base + diacrítico
+    t = unicodedata.normalize("NFD", text.lower().strip())
+    # Eliminar diacríticos (Mn = Mark, Nonspacing)
+    t = "".join(c for c in t if unicodedata.category(c) != "Mn")
+    # Reemplazar ñ explícitamente (NFD no la descompone)
+    t = t.replace("ñ", "n")
+    # Eliminar puntuación, dejar alfanuméricos y espacios
+    t = re.sub(r"[^\w\s]", " ", t)
+    # Colapsar espacios múltiples
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+# Mapa de opciones exactas del menú — fuente única de verdad.
+# TODAS las keys están pre-normalizadas (sin tildes, minúsculas) para que
+# detect_exact_option solo necesite normalizar el input del usuario.
+_MENU_OPTIONS: dict = {
+    # --- Opción 1: Préstamo IMSS Pensionados ---
+    # Solo frases que identifican inequívocamente el producto.
+    # "prestamo" solo → ambiguo (puede ser empresarial) → va a semántica/GPT.
+    "1": "prestamo_imss",
+    "imss": "prestamo_imss",
+    "prestamo imss": "prestamo_imss",
+    "prestamos imss": "prestamo_imss",
+    "prestamo pensionado": "prestamo_imss",
+    "prestamo pensionados": "prestamo_imss",
+    "credito imss": "prestamo_imss",
+    "credito pensionado": "prestamo_imss",
+    "credito pensionados": "prestamo_imss",
+    "prestamo imss pensionados": "prestamo_imss",
+    "prestamos imss pensionados": "prestamo_imss",
+    "ley 73": "prestamo_imss",
+    "pension": "prestamo_imss",
+    "pensionado": "prestamo_imss",
+    "pensionados": "prestamo_imss",
+    # --- Opción 2: Seguros de Auto ---
+    # "auto" / "vehiculo" / "carro" solos → ambiguos → van a semántica/GPT.
+    "2": "seguro_auto",
+    "seguro auto": "seguro_auto",
+    "seguro carro": "seguro_auto",
+    "seguro vehiculo": "seguro_auto",
+    "seguros de auto": "seguro_auto",
+    "seguro de auto": "seguro_auto",
+    "seguro para auto": "seguro_auto",
+    "seguro para carro": "seguro_auto",
+    "seguro para vehiculo": "seguro_auto",
+    # --- Opción 3: Seguros de Vida y Salud ---
+    # "vida" sola → demasiado ambigua → va a semántica/GPT.
+    "3": "seguro_vida",
+    "seguro vida": "seguro_vida",
+    "seguros de vida": "seguro_vida",
+    "seguro de vida": "seguro_vida",
+    "seguro de vida y salud": "seguro_vida",
+    "seguros de vida y salud": "seguro_vida",
+    "seguro salud": "seguro_vida",
+    "seguro de salud": "seguro_vida",
+    "seguro medico": "seguro_vida",
+    "gastos medicos": "seguro_vida",
+    "gastos medicos mayores": "seguro_vida",
+    # --- Opción 4: Tarjetas Médicas VRIM ---
+    "4": "vrim",
+    "vrim": "vrim",
+    "tarjeta medica": "vrim",
+    "tarjetas medicas": "vrim",
+    "membresia medica": "vrim",
+    "consultas medicas": "vrim",
+    # --- Opción 5: Financiamiento Empresarial ---
+    # "empresa" / "negocio" solos → ambiguos → van a semántica/GPT.
+    "5": "empresarial",
+    "financiamiento empresarial": "empresarial",
+    "credito empresarial": "empresarial",
+    "pyme": "empresarial",
+    # --- Opción 6: Financiamiento Práctico Empresarial ---
+    "6": "financiamiento_practico",
+    "financiamiento practico": "financiamiento_practico",
+    "financiamiento practico empresarial": "financiamiento_practico",
+    "credito practico": "financiamiento_practico",
+    "credito simple": "financiamiento_practico",
+    "credito rapido": "financiamiento_practico",
+    "prestamo rapido": "financiamiento_practico",
+}
+
+# Frases que deben mostrar el menú principal sin pasar por la capa híbrida.
+# Se normalizan en runtime con normalize_text().
+_MENU_TRIGGER_PHRASES: set = {
+    # Saludos y arranques de conversación → menú inmediato
+    "menu", "memu", "inicio", "start",
+    "hola", "buenas", "buenos dias", "buenas tardes", "buenas noches",
+    # Solicitudes explícitas de catálogo / opciones
+    "servicios", "opciones", "catalogo", "productos",
+    "que manejas", "que ofrecen", "que ofreces", "que tienen", "que tienes",
+    "que servicios tienen", "que servicios ofrecen", "que servicios manejan",
+    "quiero informacion", "quiero info", "quiero ver opciones",
+    "en que me puedes ayudar", "para que sirves",
+    # NOTA: "como funciona", "info", "informacion", "ayuda" se movieron al
+    # híbrido/GPT porque pueden ser consultas sobre un servicio específico.
+}
+
+# Palabras clave para detección semántica.
+# Estructura: { servicio: { "strong": [...frases 2+palabras...], "weak": [...palabras sueltas...] } }
+# Puntaje: frase fuerte = 2pts | palabra débil = 1pt | umbral mínimo = 2pts para activar.
+# Si hay empate entre servicios → None (va a GPT).
+_SEMANTIC_KEYWORDS: dict = {
+    "prestamo_imss": {
+        "strong": [
+            "prestamo pensionado", "prestamo para pensionado", "prestamo imss",
+            "credito imss", "prestamo jubilado", "credito pensionado",
+            "necesito dinero pensionado", "calificar prestamo",
+            "descuento pension", "cobro imss", "ley 73",
+            "soy pensionado", "estoy jubilado", "estoy pensionado",
+            "quiero prestamo pensionado", "quiero credito pensionado",
+        ],
+        "weak": ["pensionado", "jubilado", "jubilada", "pension", "pensionada"],
+    },
+    "seguro_auto": {
+        "strong": [
+            "asegurar carro", "seguro carro", "seguro auto", "seguro vehiculo",
+            "seguro automovil", "cotizar seguro auto", "cobertura vehiculo",
+            "cobertura carro", "seguro para mi auto", "seguro para mi carro",
+            "asegurar vehiculo", "poliza auto", "seguro de mi carro",
+            "quiero seguro auto", "necesito seguro auto", "seguro de auto",
+        ],
+        "weak": [],  # "auto" y "carro" solos son demasiado ambiguos
+    },
+    "seguro_vida": {
+        "strong": [
+            "seguro de vida", "seguro vida", "gastos medicos", "seguro medico",
+            "seguro salud", "proteger familia", "cobertura medica",
+            "seguro enfermedad", "seguro de salud", "seguro familiar",
+            "vida y salud", "cobertura familiar",
+            "quiero seguro vida", "necesito seguro vida",
+            "gastos medicos mayores",
+        ],
+        "weak": [],  # "vida" sola es muy ambigua
+    },
+    "vrim": {
+        "strong": [
+            "tarjeta medica", "tarjetas medicas", "membresia medica",
+            "consultas medicas", "consultas con descuento", "descuentos medicamentos",
+            "especialistas descuento", "laboratorios descuento",
+            "plan medico", "que incluye vrim", "acceso medico",
+            "consultas ilimitadas",
+        ],
+        "weak": ["vrim"],
+    },
+    "empresarial": {
+        # Intencionalmente más genérico — gana cuando hay señal empresarial SIN urgencia/rapidez
+        "strong": [
+            "credito empresa", "credito empresarial", "prestamo empresa",
+            "prestamo empresarial", "financiamiento empresa",
+            "capital para negocio", "credito para negocio", "prestamo negocio",
+            "financiar empresa", "capital de trabajo", "inversion empresa",
+            "financiar mi negocio", "credito pyme", "mi empresa necesita",
+            "necesito credito empresa", "necesito financiamiento empresa",
+        ],
+        "weak": [],  # "negocio", "empresa" solos son débiles; ver nota abajo
+    },
+    "financiamiento_practico": {
+        # Requiere señal EXPLÍCITA de rapidez/liquidez/urgencia para diferenciarse del 5
+        "strong": [
+            "financiamiento rapido", "credito rapido", "aprobacion rapida",
+            "aprobacion en 24", "24 horas", "liquidez rapida", "liquidez negocio",
+            "facturo necesito credito", "facturacion credito",
+            "credito sin garantia", "sin garantia empresa",
+            "necesito liquidez", "prestamo rapido negocio",
+            "financiamiento en 24", "credito en 24 horas", "quiero liquidez",
+        ],
+        "weak": [],
+    },
+}
+
+
+def detect_exact_option(text: str) -> str | None:
+    """
+    Busca coincidencia exacta en el mapa de opciones del menú.
+    Normaliza el input del usuario antes de buscar.
+    Las keys de _MENU_OPTIONS ya están normalizadas (sin tildes, minúsculas).
+    """
+    normalized = normalize_text(text)
+    if normalized in _MENU_OPTIONS:
+        return _MENU_OPTIONS[normalized]
+    return None
+
+
+def detect_semantic_intent(text: str) -> str | None:
+    """
+    Detecta intención semántica usando palabras clave ponderadas por servicio.
+
+    Sistema de puntaje:
+    - Frase fuerte (2+ palabras): 2.0 pts
+    - Palabra débil (1 palabra):  1.0 pt
+    - Umbral mínimo para activar: 2.0 pts
+
+    Matching de keywords:
+    - Substring exacto O todas las palabras del keyword aparecen como palabras
+      individuales en el mensaje (maneja frases con palabras intermedias).
+
+    Desambiguación empresarial (opción 5) vs financiamiento_practico (opción 6):
+    - Regla comercial explícita (tiene prioridad sobre el score):
+        si hay señal de rapidez/liquidez/urgencia/24h → opción 6
+        si no hay esa señal pero sí empresa/negocio/capital → opción 5
+    - NO se resuelve por empate: siempre devuelve uno de los dos.
+
+    Para empates entre otros servicios distintos → None (va a GPT).
+    """
+    normalized = normalize_text(text)
+    msg_words = set(normalized.split())
+    scores: dict = {}
+
+    def kw_matches(kw_norm: str) -> bool:
+        # Coincidencia exacta como substring
+        if kw_norm in normalized:
+            return True
+        # Coincidencia por conjunto de palabras (maneja palabras intermedias)
+        kw_words = set(kw_norm.split())
+        if len(kw_words) >= 2 and kw_words.issubset(msg_words):
+            return True
+        return False
+
+    for service, kw_groups in _SEMANTIC_KEYWORDS.items():
+        score = 0.0
+        for kw in kw_groups.get("strong", []):
+            if kw_matches(normalize_text(kw)):
+                score += 2.0
+        for kw in kw_groups.get("weak", []):
+            if kw_matches(normalize_text(kw)):
+                score += 1.0
+        if score >= 2.0:
+            scores[service] = score
+
+    if not scores:
+        return None
+
+    # ── Pre-regla comercial 5 vs 6 ───────────────────────────────────────────
+    # Se aplica ANTES del ranking para cubrir casos donde solo uno de los dos
+    # servicios alcanzó umbral pero el mensaje tiene señal decisiva de urgencia.
+    # Señales de urgencia → opción 6 (Financiamiento Práctico)
+    # Contexto empresarial sin urgencia → opción 5 (Financiamiento Empresarial)
+    _URGENCY_SIGNALS = {
+        "rapido", "rapida", "urgente", "urgencia", "liquidez",
+        "24 horas", "24h", "inmediato", "inmediata", "pronto",
+        "hoy mismo", "en 24", "sin garantia",
+    }
+    _BUSINESS_SIGNALS = {
+        "empresa", "negocio", "pyme", "capital", "trabajo",
+        "empresarial", "factura", "facturo",
+    }
+    normalized_for_56 = normalize_text(text)
+    has_urgency  = any(s in normalized_for_56 for s in _URGENCY_SIGNALS)
+    has_business = any(s in normalized_for_56 for s in _BUSINESS_SIGNALS)
+
+    if has_business:
+        # Si hay señal de negocio con urgencia → siempre opción 6
+        if has_urgency:
+            return "financiamiento_practico"
+        # Si hay señal de negocio sin urgencia y el score de empresarial alcanzó umbral
+        if scores.get("empresarial", 0) >= 2.0:
+            return "empresarial"
+        # Negocio + no urgencia pero solo financiamiento_practico en scores → igual opción 5
+        if scores.get("financiamiento_practico", 0) >= 2.0 and "empresarial" not in scores:
+            return "empresarial"
+
+    # ── Ranking general ──────────────────────────────────────────────────────
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    best_service, best_score = ranked[0]
+
+    if len(ranked) > 1:
+        second_service, second_score = ranked[1]
+
+        # Si los top 2 son 5 y 6, la pre-regla ya debería haberlo resuelto arriba.
+        # Como seguridad: si llega aquí sin resolución previa, aplica urgencia.
+        if set([best_service, second_service]) == {"empresarial", "financiamiento_practico"}:
+            if has_urgency:
+                return "financiamiento_practico"
+            return "empresarial"
+
+        # Empate real entre otros servicios distintos → None (va a GPT)
+        if best_score == second_score:
+            return None
+
+    return best_service
+
+
+# Registro de último modo de resolución por usuario (anti-repetición).
+# Valores posibles: "exact" | "semantic" | "gpt" | "clarification" | "menu" | "greeting" | "advisor"
+_last_route: dict = {}
+
+
+def _reset_user_session(phone: str) -> None:
+    """
+    Limpia todo el estado conversacional del usuario.
+    Centraliza el reseteo para evitar olvidar algún dict en el futuro.
+    """
+    user_state.pop(phone, None)
+    user_data.pop(phone, None)
+    _last_service.pop(phone, None)
+    _last_route.pop(phone, None)
+
+
+def _route_to_service(phone: str, service: str, msg_id: str) -> None:
+    """
+    Enruta al flujo de servicio correcto dado su nombre.
+    Centraliza la lógica de activación para exact + semantic.
+    """
+    if service == "prestamo_imss":
+        _last_service[phone] = "imss"
+        user_state[phone] = "imss_beneficios"
+        user_data.setdefault(phone, {})
+        funnel_prestamo_imss(phone, "1")
+
+    elif service == "empresarial":
+        _last_service[phone] = "empresarial"
+        user_state[phone] = "emp_beneficios"
+        user_data.setdefault(phone, {})
+        funnel_credito_empresarial(phone, "5")
+
+    elif service == "financiamiento_practico":
+        _last_service[phone] = "financiamiento_practico"
+        user_state[phone] = "fp_intro"
+        user_data.setdefault(phone, {})
+        funnel_financiamiento_practico(phone, "6")
+
+    elif service == "seguro_auto":
+        _last_service[phone] = "seguro_auto"
+        send_message(
+            phone,
+            "🚗 *Seguros de Auto Inbursa*\n"
+            "✅ Cobertura amplia\n✅ Asistencia vial 24/7\n✅ RC, robo total/parcial\n\n"
+            "📞 Un asesor te contactará para cotizar.",
+            msg_id,
+        )
+        notify_advisor(f"🚗 Interesado en Seguro Auto · WhatsApp: {phone}", msg_id)
+
+    elif service == "seguro_vida":
+        _last_service[phone] = "seguro_vida"
+        send_message(
+            phone,
+            "🏥 *Seguros de Vida y Salud Inbursa*\n"
+            "✅ Vida\n✅ Gastos médicos\n✅ Hospitalización\n✅ Atención 24/7\n\n"
+            "📞 Un asesor te contactará para explicar coberturas.",
+            msg_id,
+        )
+        notify_advisor(f"🏥 Interesado en Vida/Salud · WhatsApp: {phone}", msg_id)
+
+    elif service == "vrim":
+        _last_service[phone] = "vrim"
+        send_message(
+            phone,
+            "💳 *Tarjetas Médicas VRIM*\n"
+            "✅ Consultas ilimitadas\n✅ Especialistas y laboratorios\n✅ Descuentos en medicamentos\n\n"
+            "📞 Un asesor te contactará para explicar beneficios.",
+            msg_id,
+        )
+        notify_advisor(f"💳 Interesado en VRIM · WhatsApp: {phone}", msg_id)
+
+
+def handle_hybrid_message(phone: str, text: str, msg_id: str) -> None:
+    """
+    Capa híbrida de interpretación natural.
+    Se llama solo cuando no hubo coincidencia exacta con el menú.
+
+    Orden de decisión:
+    1. Semántica clara (score >= 2.0) → enrutar al servicio.
+    2. Hint financiero real → GPT (con anti-repetición: si ya fue GPT → aclaración).
+    3. Anti-repetición de menú/aclaración → aclaración breve.
+    4. Último recurso → menú completo (una sola vez).
+
+    _last_route válidos: "exact" | "semantic" | "gpt" | "clarification" | "menu" | "greeting" | "advisor"
+    """
+    last_route = _last_route.get(phone, "")
+
+    # --- Paso 1: intención semántica clara ---
+    intent = detect_semantic_intent(text)
+    if intent:
+        log.info(f"📍 {phone}: route=semantic → {intent}")
+        _last_route[phone] = "semantic"
+        _route_to_service(phone, intent, msg_id)
+        return
+
+    # --- Paso 2: activar GPT solo si hay hint financiero REAL ---
+    # Regla: GPT se activa si el mensaje contiene un término financiero específico
+    # O si es una pregunta consultiva explícita sobre servicios/calificación/costo.
+    # NO se activa solo por ser una pregunta genérica de 3+ tokens.
+    normalized = normalize_text(text)
+    tokens = set(normalized.split())
+
+    # Términos que indican consulta real sobre los servicios del bot
+    _FINANCIAL_HINTS = {
+        "seguro", "prestamo", "credito", "financiamiento", "inbursa",
+        "dinero", "beneficio", "tarjeta", "medico", "medica",
+        "pension", "jubilado", "pensionado",
+        "cotizar", "precio", "costo", "aplico", "califico",
+        "requisito", "documentos", "aplica",
+    }
+    # Frases consultivas de servicio (requieren estar completas en el texto)
+    _CONSULTIVE_PHRASES = {
+        "como funciona", "cuanto cuesta", "que necesito", "que cubre",
+        "si califico", "que documentos", "que requisitos", "cuanto es",
+        "como aplico", "en que consiste", "que incluye", "que es el",
+        "que es la", "explicame", "informame", "como accedo",
+    }
+
+    has_financial_hint  = bool(tokens & _FINANCIAL_HINTS)
+    has_consultive      = any(p in normalized for p in _CONSULTIVE_PHRASES)
+
+    # NO activar GPT por empresa/negocio solos porque esos ya los maneja semántica
+    # y si llegan aquí es porque no hubo coincidencia suficiente.
+    should_use_gpt = has_financial_hint or has_consultive
+
+    if should_use_gpt:
+        # Anti-repetición: GPT ya respondió → aclaración en lugar de GPT de nuevo
+        if last_route == "gpt":
+            log.info(f"📍 {phone}: route=clarification (tras GPT)")
+            _last_route[phone] = "clarification"
+            send_message(
+                phone,
+                "¿Tu consulta es sobre *pensión*, *seguros* o *financiamiento para empresa*? "
+                "Con eso te oriento directo al servicio correcto. 😊",
+                msg_id,
+            )
+            return
+
+        log.info(f"📍 {phone}: route=gpt")
+        _last_route[phone] = "gpt"
+        gpt_reply = ask_gpt_hybrid(text)
+        send_message(phone, gpt_reply, msg_id)
+        return
+
+    # --- Paso 3: anti-repetición de menú / aclaración ---
+    if last_route in ("menu", "clarification"):
+        log.info(f"📍 {phone}: route=clarification (anti-repetición de menú)")
+        _last_route[phone] = "clarification"
+        send_message(
+            phone,
+            "¿En qué puedo ayudarte hoy? 😊\n"
+            "¿Buscas apoyo para *pensión*, *seguros* o *financiamiento empresarial*?",
+            msg_id,
+        )
+        return
+
+    # --- Paso 4: menú completo como último recurso ---
+    log.info(f"📍 {phone}: route=menu")
+    _last_route[phone] = "menu"
+    send_main_menu(phone)
 
 
 # ---------------------------------------------------------------
@@ -546,9 +1084,7 @@ def funnel_prestamo_imss(user_id: str, user_message: str):
         resp = interpret_response(user_message)
         if resp == "negative":
             send_main_menu(user_id)
-            user_state.pop(user_id, None)
-            user_data.pop(user_id, None)
-            _last_service.pop(user_id, None)
+            _reset_user_session(user_id)
             return jsonify({"status": "ok"})
         if resp == "positive":
             send_message(user_id, "¿Cuánto recibes aproximadamente al mes por concepto de pensión?")
@@ -588,15 +1124,11 @@ def funnel_prestamo_imss(user_id: str, user_message: str):
             notify_advisor(formatted)
             send_message(user_id, "¡Listo! Un asesor te contactará con opciones alternativas.")
             send_main_menu(user_id)
-            user_state.pop(user_id, None)
-            user_data.pop(user_id, None)
-            _last_service.pop(user_id, None)
+            _reset_user_session(user_id)
             return jsonify({"status": "ok"})
         send_message(user_id, "Perfecto, si deseas podemos continuar con otros servicios.")
         send_main_menu(user_id)
-        user_state.pop(user_id, None)
-        user_data.pop(user_id, None)
-        _last_service.pop(user_id, None)
+        _reset_user_session(user_id)
         return jsonify({"status": "ok"})
 
     if state == "imss_preg_monto_solicitado":
@@ -654,9 +1186,7 @@ def funnel_prestamo_imss(user_id: str, user_message: str):
         )
         notify_advisor(formatted)
         send_main_menu(user_id)
-        user_state.pop(user_id, None)
-        user_data.pop(user_id, None)
-        _last_service.pop(user_id, None)
+        _reset_user_session(user_id)
         return jsonify({"status": "ok"})
 
     send_main_menu(user_id)
@@ -692,9 +1222,7 @@ def funnel_credito_empresarial(user_id: str, user_message: str):
             return jsonify({"status": "ok"})
         if resp == "negative":
             send_main_menu(user_id)
-            user_state.pop(user_id, None)
-            user_data.pop(user_id, None)
-            _last_service.pop(user_id, None)
+            _reset_user_session(user_id)
             return jsonify({"status": "ok"})
         send_message(user_id, "Responde *sí* o *no* para continuar.")
         return jsonify({"status": "ok"})
@@ -750,9 +1278,7 @@ def funnel_credito_empresarial(user_id: str, user_message: str):
         )
         notify_advisor(formatted)
         send_main_menu(user_id)
-        user_state.pop(user_id, None)
-        user_data.pop(user_id, None)
-        _last_service.pop(user_id, None)
+        _reset_user_session(user_id)
         return jsonify({"status": "ok"})
 
     send_main_menu(user_id)
@@ -788,9 +1314,7 @@ def funnel_financiamiento_practico(user_id: str, user_message: str):
             )
             notify_advisor(f"📩 Prospecto NO interesado en Financiamiento Práctico\nNúmero: {user_id}")
             send_main_menu(user_id)
-            user_state.pop(user_id, None)
-            user_data.pop(user_id, None)
-            _last_service.pop(user_id, None)
+            _reset_user_session(user_id)
             return jsonify({"status": "ok"})
         if resp == "positive":
             send_message(
@@ -862,9 +1386,7 @@ def funnel_financiamiento_practico(user_id: str, user_message: str):
             "se pondrá en contacto contigo en breve para continuar con tu solicitud."
         )
         send_main_menu(user_id)
-        user_state.pop(user_id, None)
-        user_data.pop(user_id, None)
-        _last_service.pop(user_id, None)
+        _reset_user_session(user_id)
         return jsonify({"status": "ok"})
 
     send_main_menu(user_id)
@@ -897,6 +1419,15 @@ def _handle_message(message: dict) -> None:
     Procesa un mensaje individual del webhook.
     Separado para permitir iterar sobre múltiples mensajes por payload [A-2].
     Registra el mensaje entrante en Sheets antes de procesarlo.
+
+    Orden de decisión:
+    1. Validar tipo de mensaje.
+    2. Registrar en Sheets.
+    3. Comando sgpt: → responder con GPT libre.
+    4. Embudo activo → continuar embudo.
+    5. Saludo / menú explícito → mostrar menú.
+    6. Coincidencia exacta con mapa de opciones → enrutar.
+    7. Capa híbrida → detect_semantic_intent → GPT → aclaración → menú.
     """
     try:
         phone_number = message.get("from")
@@ -918,7 +1449,6 @@ def _handle_message(message: dict) -> None:
                 _processed_ids.add(msg_id)
 
         # Propagar msg_id al hilo para que send_message/notify_advisor lo hereden
-        # automáticamente desde los embudos sin refactorizar cada llamada.
         _tl.msg_id = msg_id
 
         mtype = message.get("type")
@@ -941,6 +1471,9 @@ def _handle_message(message: dict) -> None:
         user_message = (message.get("text") or {}).get("body", "").strip()
         user_message = user_message[:500]   # [B-3] límite de longitud
 
+        if not user_message:
+            return
+
         log.info(f"📱 {phone_number}: {user_message}")
 
         # Registrar mensaje ENTRANTE en Sheets
@@ -956,7 +1489,7 @@ def _handle_message(message: dict) -> None:
         except Exception:
             log.exception("❌ Error registrando mensaje entrante en Sheets")
 
-        # Comando GPT
+        # --- 3. Comando GPT directo ---
         if is_gpt_command(user_message):
             prompt = user_message.split(":", 1)[1].strip() if ":" in user_message else ""
             if not prompt:
@@ -966,7 +1499,7 @@ def _handle_message(message: dict) -> None:
             send_message(phone_number, gpt_reply, msg_id)
             return
 
-        # Continuar embudo activo
+        # --- 4. Continuar embudo activo ---
         state = user_state.get(phone_number, "")
         if state.startswith("imss_"):
             funnel_prestamo_imss(phone_number, user_message)
@@ -978,91 +1511,91 @@ def _handle_message(message: dict) -> None:
             funnel_financiamiento_practico(phone_number, user_message)
             return
 
-        # Mapa de opciones del menú
-        menu_options = {
-            "1": "prestamo_imss", "imss": "prestamo_imss", "préstamo": "prestamo_imss",
-            "prestamo": "prestamo_imss", "ley 73": "prestamo_imss",
-            "pensión": "prestamo_imss", "pension": "prestamo_imss",
-            "2": "seguro_auto", "auto": "seguro_auto", "seguros de auto": "seguro_auto",
-            "3": "seguro_vida", "seguro vida": "seguro_vida", "seguros de vida": "seguro_vida",
-            "seguro salud": "seguro_vida", "vida": "seguro_vida",
-            "4": "vrim", "tarjetas médicas": "vrim", "tarjetas medicas": "vrim", "vrim": "vrim",
-            "5": "empresarial", "financiamiento empresarial": "empresarial",
-            "empresa": "empresarial", "negocio": "empresarial", "pyme": "empresarial",
-            "crédito empresarial": "empresarial", "credito empresarial": "empresarial",
-            "6": "financiamiento_practico", "financiamiento practico": "financiamiento_practico",
-            "financiamiento práctico": "financiamiento_practico",
-            "crédito simple": "financiamiento_practico", "credito simple": "financiamiento_practico",
+        # --- 5. Saludos y solicitudes explícitas de menú ---
+        # Exact match contra el set de trigger phrases (ya son frases completas seguras).
+        # Contención solo para frases largas y claras, NO palabras cortas como
+        # "info", "ayuda", "servicios", "hola" sueltas que dispararían menú en
+        # cualquier mensaje que las contenga.
+        _msg_norm = normalize_text(user_message)
+        _MENU_CONTAINMENT = {
+            "que manejas", "que ofrecen", "que ofreces",
+            "que servicios tienen", "que servicios ofrecen",
+            "quiero ver opciones", "ver el menu", "ver el menú",
+            "ver los servicios", "mostrar opciones",
         }
-
-        option = menu_options.get(user_message.lower())
-
-        if option == "prestamo_imss":
-            _last_service[phone_number] = "imss"
-            user_state[phone_number] = "imss_beneficios"
-            user_data.setdefault(phone_number, {})
-            funnel_prestamo_imss(phone_number, user_message)
-            return
-
-        if option == "empresarial":
-            _last_service[phone_number] = "empresarial"
-            user_state[phone_number] = "emp_beneficios"
-            user_data.setdefault(phone_number, {})
-            funnel_credito_empresarial(phone_number, user_message)
-            return
-
-        if option == "financiamiento_practico":
-            _last_service[phone_number] = "financiamiento_practico"
-            user_state[phone_number] = "fp_intro"
-            user_data.setdefault(phone_number, {})
-            funnel_financiamiento_practico(phone_number, user_message)
-            return
-
-        if user_message.lower() in ["menu", "menú", "hola", "buenas", "servicios", "opciones"]:
-            user_state.pop(phone_number, None)
-            user_data.pop(phone_number, None)
-            _last_service.pop(phone_number, None)
+        _is_menu_trigger = (
+            _msg_norm in _MENU_TRIGGER_PHRASES
+            or any(phrase in _msg_norm for phrase in _MENU_CONTAINMENT)
+        )
+        if _is_menu_trigger:
+            _reset_user_session(phone_number)
+            _last_route[phone_number] = "greeting"
+            log.info(f"📍 {phone_number}: route=greeting")
             send_main_menu(phone_number)
             return
 
-        if option == "seguro_auto":
-            _last_service[phone_number] = "seguro_auto"
+        # --- 5b. Solicitud explícita de hablar con asesor ---
+        # Solo frases inequívocas de contacto humano directo.
+        # EXCLUIDAS: "quiero hablar con" (puede ser "quiero hablar con alguien sobre pensión"),
+        #            "como me comunico" (puede ser sobre un trámite, no sobre un asesor),
+        #            "con quien hablo" (puede ser consulta de proceso).
+        _ADVISOR_TRIGGERS = {
+            "hablar con un asesor", "hablar con alguien",
+            "contactar asesor", "contactar con asesor",
+            "que me contacten", "que me llamen", "me pueden llamar",
+            "llamame", "quiero que me llamen",
+            "hablar con un ejecutivo", "comunicame con alguien",
+        }
+        if any(t in _msg_norm for t in _ADVISOR_TRIGGERS):
+            log.info(f"📍 {phone_number}: route=advisor")
+            _last_route[phone_number] = "advisor"
             send_message(
                 phone_number,
-                "🚗 *Seguros de Auto Inbursa*\n"
-                "✅ Cobertura amplia\n✅ Asistencia vial 24/7\n✅ RC, robo total/parcial\n\n"
-                "📞 Un asesor te contactará para cotizar.",
+                "¡Claro! 📞 Voy a avisarle a nuestro asesor *Christian López* para que "
+                "se comunique contigo a la brevedad.\n\n"
+                "¿Hay algo específico en lo que te pueda orientar mientras tanto?",
                 msg_id,
             )
-            notify_advisor(f"🚗 Interesado en Seguro Auto · WhatsApp: {phone_number}", msg_id)
-            return
-
-        if option == "seguro_vida":
-            _last_service[phone_number] = "seguro_vida"
-            send_message(
-                phone_number,
-                "🏥 *Seguros de Vida y Salud Inbursa*\n"
-                "✅ Vida\n✅ Gastos médicos\n✅ Hospitalización\n✅ Atención 24/7\n\n"
-                "📞 Un asesor te contactará para explicar coberturas.",
+            notify_advisor(
+                f"📣 SOLICITUD DE CONTACTO DIRECTO\n"
+                f"Cliente pide hablar con asesor.\n"
+                f"WhatsApp: {phone_number}\n"
+                f"Mensaje: {user_message}",
                 msg_id,
             )
-            notify_advisor(f"🏥 Interesado en Vida/Salud · WhatsApp: {phone_number}", msg_id)
             return
 
-        if option == "vrim":
-            _last_service[phone_number] = "vrim"
-            send_message(
-                phone_number,
-                "💳 *Tarjetas Médicas VRIM*\n"
-                "✅ Consultas ilimitadas\n✅ Especialistas y laboratorios\n✅ Descuentos en medicamentos\n\n"
-                "📞 Un asesor te contactará para explicar beneficios.",
-                msg_id,
-            )
-            notify_advisor(f"💳 Interesado en VRIM · WhatsApp: {phone_number}", msg_id)
+        # --- 6. Intención numérica incrustada en texto ---
+        # Solo activar con contexto inequívoco de selección de menú.
+        # EXCLUIDOS "el" y "la" porque son demasiado genéricos:
+        #   "el 3 de marzo", "la 2 de la tarde", "el 5%" → falsos positivos.
+        _NUM_CONTEXT = re.search(
+            r'\b(?:opcion|opcion|numero|numero|servicio|'
+            r'quiero el|quiero la|me interesa el|me interesa la|'
+            r'me interesa|elige|elijo|selecciono|dame el|dame la|'
+            r'escojo el|escojo la|quiero el numero|quiero la opcion)\s*([1-6])\b'
+            r'|\b([1-6])\s*(?:por favor|porfavor|gracias|pls)\b',
+            normalize_text(user_message),
+        )
+        if _NUM_CONTEXT:
+            _digit = _NUM_CONTEXT.group(1) or _NUM_CONTEXT.group(2)
+            _embedded_option = detect_exact_option(_digit)
+            if _embedded_option:
+                log.info(f"📍 {phone_number}: route=exact (número incrustado) → {_embedded_option}")
+                _last_route[phone_number] = "exact"
+                _route_to_service(phone_number, _embedded_option, msg_id)
+                return
+
+        # --- 7. Coincidencia exacta → centralizado en _route_to_service ---
+        exact_option = detect_exact_option(user_message)
+        if exact_option:
+            log.info(f"📍 {phone_number}: route=exact → {exact_option}")
+            _last_route[phone_number] = "exact"
+            _route_to_service(phone_number, exact_option, msg_id)
             return
 
-        # Fallback
-        send_main_menu(phone_number)
+        # --- 8. Capa híbrida (semántica → GPT → aclaración → menú) ---
+        handle_hybrid_message(phone_number, user_message, msg_id)
 
     except Exception:
         log.exception(f"❌ Error procesando mensaje de {message.get('from', '?')}")
