@@ -24,7 +24,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # Zona horaria operativa — Ciudad de México (UTC-6 invierno / UTC-5 verano)
-# Usamos pytz si está disponible; si no, fallback a UTC-6 fijo.
 try:
     import pytz as _pytz
     _TZ_MX = _pytz.timezone("America/Mexico_City")
@@ -36,7 +35,7 @@ except ImportError:
         return datetime.now(_TZ_MX).strftime("%Y-%m-%d %H:%M:%S")
 
 # ---------------------------------------------------------------
-# Librerías Google — importación condicional (modo degradado si no están instaladas)
+# Librerías Google — importación condicional
 # ---------------------------------------------------------------
 try:
     from google.oauth2.service_account import Credentials
@@ -53,12 +52,20 @@ except ImportError:
 # ---------------------------------------------------------------
 load_dotenv()
 
-META_TOKEN        = os.getenv("META_TOKEN")
-WABA_PHONE_ID     = os.getenv("WABA_PHONE_ID")
-VERIFY_TOKEN      = os.getenv("VERIFY_TOKEN")
-ADVISOR_NUMBER    = os.getenv("ADVISOR_NUMBER", "5216682478005")
-OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
-META_APP_SECRET   = os.getenv("META_APP_SECRET", "").strip()
+META_TOKEN             = os.getenv("META_TOKEN")
+WABA_PHONE_ID          = os.getenv("WABA_PHONE_ID")
+VERIFY_TOKEN           = os.getenv("VERIFY_TOKEN")
+ADVISOR_NUMBER         = os.getenv("ADVISOR_NUMBER", "5216682478005")
+OPENAI_API_KEY         = os.getenv("OPENAI_API_KEY")
+META_APP_SECRET        = os.getenv("META_APP_SECRET", "").strip()
+
+# Template aprobado para notificar al asesor fuera de la ventana de 24h.
+# Configura ADVISOR_TEMPLATE_NAME con el nombre exacto de tu template aprobado en Meta.
+# El template debe tener UN parámetro {{1}} en el cuerpo con el texto de la notificación.
+# Ejemplo: nombre del template = "notificacion_asesor" con cuerpo: {{1}}
+# Si no está configurado, solo se intenta texto libre (puede fallar fuera de ventana 24h).
+ADVISOR_TEMPLATE_NAME  = os.getenv("ADVISOR_TEMPLATE_NAME", "").strip()
+ADVISOR_TEMPLATE_LANG  = os.getenv("ADVISOR_TEMPLATE_LANG", "es_MX").strip()
 
 # Google Sheets — bitácora de conversaciones
 GOOGLE_CREDENTIALS_JSON      = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
@@ -66,9 +73,7 @@ SHEETS_ID_CONVERSACIONES     = os.getenv("SHEETS_ID_CONVERSACIONES", "").strip()
 SHEETS_TAB_CONVERSACIONES    = os.getenv("SHEETS_TAB_CONVERSACIONES", "Conversaciones").strip()
 
 # ---------------------------------------------------------------
-# Cliente OpenAI — SDK >= 1.0 requerido (agrega openai>=1.0.0 a requirements.txt).
-# El fallback legacy se eliminó: openai.OpenAI() es incompatible con el módulo
-# legacy y mezclarlo produce errores silenciosos en chat.completions.create().
+# Cliente OpenAI — SDK >= 1.0 requerido (agrega openai>=1.0.0 a requirements.txt)
 # ---------------------------------------------------------------
 _openai_client = None
 if OPENAI_API_KEY:
@@ -97,12 +102,11 @@ _idempotency_lock        = threading.Lock()
 # ---------------------------------------------------------------
 # GOOGLE SHEETS — Inicialización y helpers
 # ---------------------------------------------------------------
-_sheets_service  = None   # cliente global reutilizable
-_sheets_ready    = False  # True si la conexión fue exitosa al arrancar
+_sheets_service  = None
+_sheets_ready    = False
 
 _SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# Cabeceras esperadas en la hoja (en este orden exacto)
 _SHEET_HEADERS = [
     "Phone", "Nombre", "Mensaje", "Fecha", "Tipo",
     "Origen", "Servicio", "EstadoEmbudo",
@@ -114,7 +118,6 @@ def _sheets_init() -> bool:
     """
     Inicializa el cliente de Google Sheets API desde la variable de entorno
     GOOGLE_CREDENTIALS_JSON. Retorna True si fue exitoso.
-    Llama una sola vez al arrancar; el cliente se reutiliza.
     """
     global _sheets_service, _sheets_ready
 
@@ -133,7 +136,7 @@ def _sheets_init() -> bool:
         _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
         _sheets_ready = True
         log.info("✅ Google Sheets API inicializado correctamente.")
-        _sheets_ensure_headers()   # garantiza que la fila 1 tenga los encabezados correctos
+        _sheets_ensure_headers()
         return True
     except json.JSONDecodeError:
         log.exception("❌ GOOGLE_CREDENTIALS_JSON no es JSON válido.")
@@ -145,8 +148,7 @@ def _sheets_init() -> bool:
 def _sheets_ensure_headers() -> None:
     """
     Verifica que la fila 1 del tab contenga los encabezados correctos.
-    Si está vacía, los escribe. Si tiene contenido distinto, solo registra advertencia
-    (no sobreescribe para proteger datos existentes).
+    Si está vacía, los escribe.
     """
     if not _sheets_ready or not _sheets_service:
         return
@@ -159,7 +161,6 @@ def _sheets_ensure_headers() -> None:
         existing = result.get("values", [[]])[0] if result.get("values") else []
 
         if not existing:
-            # Fila 1 vacía — escribir encabezados
             _sheets_service.spreadsheets().values().update(
                 spreadsheetId=SHEETS_ID_CONVERSACIONES,
                 range=rng,
@@ -176,7 +177,6 @@ def _sheets_ensure_headers() -> None:
             log.info("✅ Encabezados en Sheets verificados correctamente.")
     except Exception:
         log.exception("❌ Error verificando/escribiendo encabezados en Sheets.")
-
 
 
 def _safe_str(value, max_len: int = 500) -> str:
@@ -197,26 +197,19 @@ def _normalize_phone(phone) -> str:
 
 
 # Thread-local para propagar msg_id activo a send_message/notify_advisor
-# desde los embudos sin necesidad de cambiar cada firma.
 _tl = threading.local()
 
 
 def _active_msg_id() -> str:
-    """Retorna el message_id activo en el hilo actual (vacío si no hay ninguno)."""
+    """Retorna el message_id activo en el hilo actual."""
     return getattr(_tl, "msg_id", "")
-
 
 
 _last_service: dict = {}
 
 
 def _detect_service(phone: str) -> str:
-    """
-    Infiere el servicio del usuario a partir de su estado en el embudo.
-    Si no hay embudo activo, usa el último servicio registrado.
-    Cubre todos los servicios: imss, empresarial, financiamiento_practico,
-    seguro_auto, seguro_vida, vrim.
-    """
+    """Infiere el servicio del usuario a partir de su estado en el embudo."""
     state = user_state.get(phone, "")
     if state.startswith("imss_"):
         return "imss"
@@ -224,7 +217,6 @@ def _detect_service(phone: str) -> str:
         return "empresarial"
     if state.startswith("fp_"):
         return "financiamiento_practico"
-    # Sin estado de embudo activo: usar último servicio registrado
     return _last_service.get(phone, "desconocido")
 
 
@@ -232,19 +224,16 @@ def _sheets_append_row(
     phone: str,
     nombre: str,
     mensaje: str,
-    tipo: str,          # "entrante" | "saliente"
-    origen: str,        # "cliente" | "bot" | "asesor"
+    tipo: str,
+    origen: str,
     servicio: str = "",
-    resultado: str = "",   # "ok" | "error" | ""
+    resultado: str = "",
     detalle_error: str = "",
     message_id: str = "",
 ) -> None:
     """
     Appends una fila de bitácora en la hoja de Google Sheets.
-    Si Sheets no está disponible o falla, solo registra en log — el bot no se detiene.
-
-    Columnas (en orden): Phone, Nombre, Mensaje, Fecha, Tipo, Origen,
-                         Servicio, EstadoEmbudo, ResultadoEnvio, DetalleError, MessageID
+    Si Sheets no está disponible o falla, solo registra en log.
     """
     if not _sheets_ready or not _sheets_service:
         return
@@ -292,14 +281,11 @@ def _get_nombre(phone: str) -> str:
 
 # ---------------------------------------------------------------
 # ENVÍO DE MENSAJES WHATSAPP
-# Modificado para registrar en Sheets cada intento (éxito o error)
 # ---------------------------------------------------------------
 def send_message(to: str, text: str, _message_id: str = "") -> bool:
     """
     Envía un mensaje de texto por WhatsApp Cloud API.
     Registra el intento en Google Sheets (saliente / bot).
-    _message_id: id del mensaje entrante que disparó este envío (opcional).
-                 Si no se pasa, se usa el msg_id activo del hilo actual.
     """
     if not _message_id:
         _message_id = _active_msg_id()
@@ -344,17 +330,16 @@ def send_message(to: str, text: str, _message_id: str = "") -> bool:
         detalle_err = str(e)[:300]
 
     finally:
-        # Registrar en Sheets — no detiene el bot si falla
         try:
             _sheets_append_row(
-                phone       = str(to),
-                nombre      = _get_nombre(str(to)),
-                mensaje     = text,
-                tipo        = "saliente",
-                origen      = "bot",
-                resultado   = resultado,
+                phone         = str(to),
+                nombre        = _get_nombre(str(to)),
+                mensaje       = text,
+                tipo          = "saliente",
+                origen        = "bot",
+                resultado     = resultado,
                 detalle_error = detalle_err,
-                message_id  = _message_id,
+                message_id    = _message_id,
             )
         except Exception:
             log.exception("❌ Error registrando send_message en Sheets")
@@ -362,16 +347,78 @@ def send_message(to: str, text: str, _message_id: str = "") -> bool:
     return success
 
 
-# send_whatsapp_message eliminado — era alias redundante de send_message.
-
-
 # ---------------------------------------------------------------
 # NOTIFICAR AL ASESOR
-# Modificado para registrar en Sheets con Origen = "asesor"
+# Estrategia robusta de dos niveles:
+#   Nivel 1 — mensaje de texto libre (funciona dentro de la ventana 24h).
+#   Nivel 2 — template aprobada (para fuera de ventana 24h).
+#             Requiere ADVISOR_TEMPLATE_NAME configurado.
 # ---------------------------------------------------------------
+def _send_advisor_template(message: str) -> tuple:
+    """
+    Envía notificación al asesor usando template aprobada de Meta.
+    Necesaria cuando el asesor no ha escrito en las últimas 24h.
+
+    El template debe tener UN parámetro {{1}} en el cuerpo con el texto de la notificación.
+    Configura ADVISOR_TEMPLATE_NAME y ADVISOR_TEMPLATE_LANG en las variables de entorno.
+
+    Retorna (success: bool, resultado: str, detalle_error: str).
+    """
+    if not ADVISOR_TEMPLATE_NAME:
+        return (
+            False, "error",
+            "ADVISOR_TEMPLATE_NAME no configurado — define esta variable con el nombre "
+            "de tu template aprobado en Meta Business Manager para notificaciones fuera de ventana 24h."
+        )
+    if not META_TOKEN or not WABA_PHONE_ID:
+        return (False, "error", "META_TOKEN o WABA_PHONE_ID no configurados")
+
+    url = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {META_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    # Los parámetros de template tienen límite de 1024 caracteres
+    msg_truncated = message[:1024]
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": str(ADVISOR_NUMBER),
+        "type": "template",
+        "template": {
+            "name": ADVISOR_TEMPLATE_NAME,
+            "language": {"code": ADVISOR_TEMPLATE_LANG or "es_MX"},
+            "components": [
+                {
+                    "type": "body",
+                    "parameters": [
+                        {"type": "text", "text": msg_truncated}
+                    ]
+                }
+            ]
+        }
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        if resp.status_code in (200, 201):
+            log.info("✅ Notificación enviada al asesor vía template aprobada")
+            return (True, "ok", "")
+        else:
+            err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            log.error(f"❌ Template al asesor falló: {err}")
+            return (False, "error", err)
+    except Exception as e:
+        return (False, "error", str(e)[:300])
+
+
 def notify_advisor(message: str, _message_id: str = "") -> bool:
     """
     Envía una notificación al asesor.
+
+    Estrategia:
+    1. Intenta mensaje de texto libre (funciona dentro de ventana 24h).
+    2. Si falla, reintenta con template aprobada (ADVISOR_TEMPLATE_NAME).
+    3. Si template no está configurada, registra instrucciones claras en log.
+
     Registra en Sheets con Origen=asesor y Tipo=saliente.
     """
     if not _message_id:
@@ -406,13 +453,29 @@ def notify_advisor(message: str, _message_id: str = "") -> bool:
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
 
         if resp.status_code in (200, 201):
-            log.info("✅ Notificación enviada al asesor")
+            log.info("✅ Notificación enviada al asesor (texto libre)")
             resultado = "ok"
             success   = True
         else:
-            log.error(f"❌ Falló notificación al asesor {resp.status_code}: {resp.text}")
-            resultado   = "error"
-            detalle_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            texto_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            log.warning(
+                f"⚠️ Texto libre al asesor falló ({texto_err}). "
+                "Probable causa: ventana 24h expirada. Reintentando con template..."
+            )
+            ok_t, res_t, err_t = _send_advisor_template(message)
+            if ok_t:
+                resultado = "ok"
+                success   = True
+            else:
+                resultado   = "error"
+                detalle_err = f"texto: {texto_err} | template: {err_t}"
+                if not ADVISOR_TEMPLATE_NAME:
+                    log.warning(
+                        "⚠️ Para garantizar la notificación al asesor fuera de la ventana de 24h:\n"
+                        "   1. Crea un template aprobado en Meta Business Manager con un parámetro {{1}}.\n"
+                        "   2. Agrega ADVISOR_TEMPLATE_NAME=nombre_del_template a tu .env.\n"
+                        "   3. Opcionalmente: ADVISOR_TEMPLATE_LANG=es_MX (o el idioma del template)."
+                    )
 
     except Exception as e:
         log.exception(f"💥 Excepción en notify_advisor: {e}")
@@ -440,15 +503,10 @@ def notify_advisor(message: str, _message_id: str = "") -> bool:
 # ---------------------------------------------------------------
 # UTILIDADES
 # ---------------------------------------------------------------
-# Tokens positivos y negativos evaluados por palabra completa.
-# Las frases de 2+ palabras se verifican como substring del texto normalizado.
-# Se evitan falsos positivos por substring parcial
-# (ej. "si" dentro de "simple", "not" dentro de "notificar").
 _RESP_POSITIVE_WORDS   = {"si", "sip", "claro", "ok", "vale", "afirmativo",
                            "yes", "correcto", "exacto", "andale", "dale"}
 _RESP_POSITIVE_PHRASES = {"por supuesto", "desde luego", "claro que si",
                            "claro que sí", "con gusto"}
-# Palabras sueltas que hacen la respuesta negativa con certeza.
 _RESP_STRONG_NEG_WORDS = {"no", "nel", "nop", "negativo", "tampoco",
                            "nunca", "jamas"}
 
@@ -456,11 +514,7 @@ _RESP_STRONG_NEG_WORDS = {"no", "nel", "nop", "negativo", "tampoco",
 def interpret_response(text: str) -> str:
     """
     Interpreta si el texto es una respuesta positiva, negativa o neutral.
-
-    Reglas (en orden de prioridad):
-    1. Negativa fuerte por palabra completa → "negative" (incluye "ok no", "sí pero no").
-    2. Positiva por palabra completa o frase → "positive".
-    3. Neutral en cualquier otro caso.
+    Prioridad: negativa fuerte > positiva > neutral.
     """
     if not text:
         return "neutral"
@@ -468,15 +522,10 @@ def interpret_response(text: str) -> str:
     norm = normalize_text(text)
     tokens = set(norm.split())
 
-    # Negativa fuerte: cualquier token negativo gana sobre positivos
     if tokens & _RESP_STRONG_NEG_WORDS:
         return "negative"
-
-    # Positiva: token positivo suelto
     if tokens & _RESP_POSITIVE_WORDS:
         return "positive"
-
-    # Positiva: frase multi-palabra contenida en el texto normalizado
     if any(phrase in norm for phrase in _RESP_POSITIVE_PHRASES):
         return "positive"
 
@@ -484,6 +533,7 @@ def interpret_response(text: str) -> str:
 
 
 def extract_number(text: str):
+    """Extrae el primer número del texto. Retorna float o None."""
     if not text:
         return None
     clean = text.replace(",", "").replace("$", "").replace(" ", "")
@@ -497,15 +547,24 @@ def extract_number(text: str):
 
 
 def send_main_menu(phone: str):
+    """Menú principal — claro, jerarquizado y comercial."""
     menu = (
-        "🏦 *INBURSA - SERVICIOS DISPONIBLES*\n\n"
-        "1️⃣ Préstamos IMSS Pensionados (Ley 73)\n"
-        "2️⃣ Seguros de Auto\n"
-        "3️⃣ Seguros de Vida y Salud\n"
-        "4️⃣ Tarjetas Médicas VRIM\n"
-        "5️⃣ Financiamiento Empresarial\n"
-        "6️⃣ Financiamiento Práctico Empresarial (desde 24 hrs)\n\n"
-        "Escribe el número o el nombre del servicio que te interesa."
+        "🏦 *Servicios Financieros Inbursa*\n"
+        "─────────────────────────────\n"
+        "1️⃣  *Préstamo IMSS Pensionados* _(Ley 73)_\n"
+        "     💰 $40K–$650K · Sin aval · Vía pensión\n\n"
+        "2️⃣  *Seguro de Auto*\n"
+        "     🚗 Cobertura amplia · Asistencia 24/7\n\n"
+        "3️⃣  *Seguro de Vida y Salud*\n"
+        "     🏥 Vida · GMM · Hospitalización\n\n"
+        "4️⃣  *Tarjeta Médica VRIM*\n"
+        "     💳 Consultas ilimitadas · Labs · Medicamentos\n\n"
+        "5️⃣  *Financiamiento Empresarial*\n"
+        "     🏢 $100K–$100M · PYMES y empresas\n\n"
+        "6️⃣  *Financiamiento Práctico Empresarial*\n"
+        "     ⚡ Aprobación desde 24 hrs · Sin garantía\n"
+        "─────────────────────────────\n"
+        "Escribe el *número* o el nombre del servicio que te interesa. 😊"
     )
     send_message(phone, menu)
 
@@ -515,8 +574,8 @@ def send_main_menu(phone: str):
 # ---------------------------------------------------------------
 def ask_gpt(prompt: str, model: str = "gpt-4o-mini", temperature: float = 0.3) -> str:
     """
-    Llama a OpenAI usando el cliente instanciado explícitamente (_openai_client).
-    Funciona con SDK >= 1.0. Temperature 0.3 — preciso para contexto financiero.
+    Llama a OpenAI usando el cliente instanciado explícitamente.
+    SDK >= 1.0. Temperature 0.3 — preciso para contexto financiero.
     """
     if not _openai_client:
         return "Lo siento, el servicio de consulta GPT no está configurado."
@@ -537,8 +596,7 @@ def ask_gpt_hybrid(user_prompt: str, system_prompt: str = "",
                    model: str = "gpt-4o-mini", temperature: float = 0.4) -> str:
     """
     Llamada a OpenAI con system_prompt separado para la capa híbrida.
-    Acepta un system_prompt explícito; si no se pasa, usa el de Vicky Bot.
-    max_tokens reducido a 250 para respuestas breves y comerciales.
+    max_tokens=250 para respuestas breves y comerciales.
     """
     if not _openai_client:
         return "Lo siento, el servicio de consulta no está disponible en este momento."
@@ -601,32 +659,115 @@ REGLAS ABSOLUTAS (incumplirlas es un error grave):
 def normalize_text(text: str) -> str:
     """
     Normaliza texto para comparaciones semánticas:
-    minúsculas, sin tildes (unicodedata NFD), sin signos de puntuación,
-    espacios simples.
+    minúsculas, sin tildes (unicodedata NFD), sin signos de puntuación, espacios simples.
     """
     if not text:
         return ""
     import unicodedata
-    # NFD descompone caracteres acentuados en base + diacrítico
     t = unicodedata.normalize("NFD", text.lower().strip())
-    # Eliminar diacríticos (Mn = Mark, Nonspacing)
     t = "".join(c for c in t if unicodedata.category(c) != "Mn")
-    # Reemplazar ñ explícitamente (NFD no la descompone)
     t = t.replace("ñ", "n")
-    # Eliminar puntuación, dejar alfanuméricos y espacios
     t = re.sub(r"[^\w\s]", " ", t)
-    # Colapsar espacios múltiples
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
 
-# Mapa de opciones exactas del menú — fuente única de verdad.
-# TODAS las keys están pre-normalizadas (sin tildes, minúsculas) para que
-# detect_exact_option solo necesite normalizar el input del usuario.
+# ---------------------------------------------------------------
+# DETECCIÓN DE LEADS DE CAMPAÑA IMSS
+# Prioridad máxima — evaluada ANTES que cualquier trigger de menú.
+# Intercepta leads de anuncios FB/IG click-to-WhatsApp y los enruta
+# directamente al embudo IMSS sin mostrar el menú general.
+# ---------------------------------------------------------------
+
+# Frases exactas (tras normalización) que señalan lead de campaña IMSS.
+# Incluye aperturas en inglés (señal de anuncio click-to-WA desde FB/IG),
+# solicitudes genéricas de información y términos de préstamo/pensión.
+_IMSS_CAMPAIGN_TRIGGERS_EXACT: set = {
+    # Aperturas en inglés — señal fuerte de anuncio click-to-WhatsApp
+    "hello", "hi", "hey", "yo",
+    # Solicitudes de información sin especificar servicio distinto
+    "info", "informacion", "informes",
+    "mas informacion", "mas info", "mas informes",
+    "quiero informacion", "quiero info", "quiero informes",
+    "quiero saber", "quiero saber mas",
+    "quiero mas informacion", "quiero mas info",
+    "me pueden informar", "me puedes informar",
+    "me interesa", "me interesa saber",
+    # Intención de préstamo genérica o IMSS
+    "prestamo", "prestamos",
+    "quiero prestamo", "quiero un prestamo", "quiero el prestamo",
+    "quiero credito", "quiero un credito", "quiero el credito",
+    "me interesa el prestamo", "me interesa el credito",
+    "necesito un prestamo", "necesito prestamo",
+    "necesito dinero", "necesito credito",
+    # Calificación
+    "califico", "si califico", "como califico",
+    "quiero saber si califico", "puedo calificar",
+    "quiero calificar", "quiero aplicar", "como aplico",
+    # Términos IMSS / pensión directos
+    "jubilado", "jubilada", "pensionado", "pensionada",
+}
+
+# Frases que, contenidas en el mensaje, indican lead de campaña IMSS.
+_IMSS_CAMPAIGN_CONTAINMENT: set = {
+    "can i get more info", "more info on this", "more info about",
+    "get more info", "more information", "send me info", "give me info",
+    "quiero saber si califico",
+    "me interesa el prestamo", "me interesa el credito",
+    "quiero informacion sobre el prestamo",
+    "quiero saber del prestamo",
+    "quiero saber sobre el prestamo",
+    "informacion sobre el prestamo",
+    "quiero saber si puedo",
+    "como puedo aplicar",
+}
+
+
+def _is_imss_campaign_lead(message: dict, norm_text: str) -> bool:
+    """
+    Detecta si el mensaje corresponde a un lead de campaña IMSS.
+
+    Orden de prioridad:
+    1. Metadata de referral de Meta (anuncio click-to-WhatsApp) → señal definitiva.
+    2. Coincidencia exacta con trigger phrases normalizadas.
+    3. Coincidencia por contenido (substring).
+
+    Retorna True si el lead debe ir al flujo IMSS directamente, sin pasar por el menú.
+    """
+    # 1. Referral de Meta — señal más confiable (clickeo en anuncio)
+    referral = message.get("referral") or {}
+    if referral:
+        source_type = (referral.get("source_type") or "").lower()
+        if source_type == "ad":
+            log.info("📌 Referral de anuncio detectado (source_type=ad) → campaña IMSS")
+            return True
+        # Referral sin tipo "ad" — verificar contenido
+        headline = normalize_text(referral.get("headline") or "")
+        body_ref = normalize_text(referral.get("body") or "")
+        imss_kw = {"imss", "pension", "pensionado", "prestamo", "jubilado", "ley 73"}
+        if any(kw in headline or kw in body_ref for kw in imss_kw):
+            log.info("📌 Referral con keywords IMSS detectado → campaña IMSS")
+            return True
+
+    # 2. Coincidencia exacta con trigger phrases
+    if norm_text in _IMSS_CAMPAIGN_TRIGGERS_EXACT:
+        log.info(f"📌 Trigger exacto campaña IMSS: '{norm_text}'")
+        return True
+
+    # 3. Coincidencia por contenido (substring)
+    if any(phrase in norm_text for phrase in _IMSS_CAMPAIGN_CONTAINMENT):
+        log.info(f"📌 Trigger contenido campaña IMSS en: '{norm_text[:60]}'")
+        return True
+
+    return False
+
+
+# ---------------------------------------------------------------
+# MAPA DE OPCIONES EXACTAS DEL MENÚ
+# Fuente única de verdad. Keys pre-normalizadas (sin tildes, minúsculas).
+# ---------------------------------------------------------------
 _MENU_OPTIONS: dict = {
     # --- Opción 1: Préstamo IMSS Pensionados ---
-    # Solo frases que identifican inequívocamente el producto.
-    # "prestamo" solo → ambiguo (puede ser empresarial) → va a semántica/GPT.
     "1": "prestamo_imss",
     "imss": "prestamo_imss",
     "prestamo imss": "prestamo_imss",
@@ -643,7 +784,6 @@ _MENU_OPTIONS: dict = {
     "pensionado": "prestamo_imss",
     "pensionados": "prestamo_imss",
     # --- Opción 2: Seguros de Auto ---
-    # "auto" / "vehiculo" / "carro" solos → ambiguos → van a semántica/GPT.
     "2": "seguro_auto",
     "seguro auto": "seguro_auto",
     "seguro carro": "seguro_auto",
@@ -654,7 +794,6 @@ _MENU_OPTIONS: dict = {
     "seguro para carro": "seguro_auto",
     "seguro para vehiculo": "seguro_auto",
     # --- Opción 3: Seguros de Vida y Salud ---
-    # "vida" sola → demasiado ambigua → va a semántica/GPT.
     "3": "seguro_vida",
     "seguro vida": "seguro_vida",
     "seguros de vida": "seguro_vida",
@@ -674,7 +813,6 @@ _MENU_OPTIONS: dict = {
     "membresia medica": "vrim",
     "consultas medicas": "vrim",
     # --- Opción 5: Financiamiento Empresarial ---
-    # "empresa" / "negocio" solos → ambiguos → van a semántica/GPT.
     "5": "empresarial",
     "financiamiento empresarial": "empresarial",
     "credito empresarial": "empresarial",
@@ -689,26 +827,26 @@ _MENU_OPTIONS: dict = {
     "prestamo rapido": "financiamiento_practico",
 }
 
-# Frases que deben mostrar el menú principal sin pasar por la capa híbrida.
-# Se normalizan en runtime con normalize_text().
+# Frases que activan el menú principal explícitamente.
+# IMPORTANTE: "quiero informacion" y "quiero info" se ELIMINARON de esta lista.
+# Ambas frases son indicadores de lead de campaña y se capturan en el paso 4.5
+# (_is_imss_campaign_lead) antes de que lleguen aquí.
+# El menú solo aparece cuando la intención es navegar el catálogo, no cuando
+# el lead busca información sobre un producto.
 _MENU_TRIGGER_PHRASES: set = {
-    # Saludos y arranques de conversación → menú inmediato
+    # Palabras clave de menú / navegación explícita
     "menu", "memu", "inicio", "start",
+    # Saludos en español (no se tratan como leads de campaña)
     "hola", "buenas", "buenos dias", "buenas tardes", "buenas noches",
-    # Solicitudes explícitas de catálogo / opciones
+    # Solicitudes explícitas de catálogo / servicios
     "servicios", "opciones", "catalogo", "productos",
     "que manejas", "que ofrecen", "que ofreces", "que tienen", "que tienes",
     "que servicios tienen", "que servicios ofrecen", "que servicios manejan",
-    "quiero informacion", "quiero info", "quiero ver opciones",
+    "quiero ver opciones",
     "en que me puedes ayudar", "para que sirves",
-    # NOTA: "como funciona", "info", "informacion", "ayuda" se movieron al
-    # híbrido/GPT porque pueden ser consultas sobre un servicio específico.
 }
 
-# Palabras clave para detección semántica.
-# Estructura: { servicio: { "strong": [...frases 2+palabras...], "weak": [...palabras sueltas...] } }
-# Puntaje: frase fuerte = 2pts | palabra débil = 1pt | umbral mínimo = 2pts para activar.
-# Si hay empate entre servicios → None (va a GPT).
+# Palabras clave para detección semántica (puntaje ponderado).
 _SEMANTIC_KEYWORDS: dict = {
     "prestamo_imss": {
         "strong": [
@@ -729,7 +867,7 @@ _SEMANTIC_KEYWORDS: dict = {
             "asegurar vehiculo", "poliza auto", "seguro de mi carro",
             "quiero seguro auto", "necesito seguro auto", "seguro de auto",
         ],
-        "weak": [],  # "auto" y "carro" solos son demasiado ambiguos
+        "weak": [],
     },
     "seguro_vida": {
         "strong": [
@@ -740,7 +878,7 @@ _SEMANTIC_KEYWORDS: dict = {
             "quiero seguro vida", "necesito seguro vida",
             "gastos medicos mayores",
         ],
-        "weak": [],  # "vida" sola es muy ambigua
+        "weak": [],
     },
     "vrim": {
         "strong": [
@@ -753,7 +891,6 @@ _SEMANTIC_KEYWORDS: dict = {
         "weak": ["vrim"],
     },
     "empresarial": {
-        # Intencionalmente más genérico — gana cuando hay señal empresarial SIN urgencia/rapidez
         "strong": [
             "credito empresa", "credito empresarial", "prestamo empresa",
             "prestamo empresarial", "financiamiento empresa",
@@ -762,10 +899,9 @@ _SEMANTIC_KEYWORDS: dict = {
             "financiar mi negocio", "credito pyme", "mi empresa necesita",
             "necesito credito empresa", "necesito financiamiento empresa",
         ],
-        "weak": [],  # "negocio", "empresa" solos son débiles; ver nota abajo
+        "weak": [],
     },
     "financiamiento_practico": {
-        # Requiere señal EXPLÍCITA de rapidez/liquidez/urgencia para diferenciarse del 5
         "strong": [
             "financiamiento rapido", "credito rapido", "aprobacion rapida",
             "aprobacion en 24", "24 horas", "liquidez rapida", "liquidez negocio",
@@ -780,11 +916,7 @@ _SEMANTIC_KEYWORDS: dict = {
 
 
 def detect_exact_option(text: str) -> str | None:
-    """
-    Busca coincidencia exacta en el mapa de opciones del menú.
-    Normaliza el input del usuario antes de buscar.
-    Las keys de _MENU_OPTIONS ya están normalizadas (sin tildes, minúsculas).
-    """
+    """Busca coincidencia exacta en el mapa de opciones del menú."""
     normalized = normalize_text(text)
     if normalized in _MENU_OPTIONS:
         return _MENU_OPTIONS[normalized]
@@ -800,27 +932,19 @@ def detect_semantic_intent(text: str) -> str | None:
     - Palabra débil (1 palabra):  1.0 pt
     - Umbral mínimo para activar: 2.0 pts
 
-    Matching de keywords:
-    - Substring exacto O todas las palabras del keyword aparecen como palabras
-      individuales en el mensaje (maneja frases con palabras intermedias).
+    Desambiguación 5 vs 6:
+    - Señal de urgencia/liquidez/24h → opción 6 (Financiamiento Práctico)
+    - Contexto empresarial sin urgencia → opción 5 (Financiamiento Empresarial)
 
-    Desambiguación empresarial (opción 5) vs financiamiento_practico (opción 6):
-    - Regla comercial explícita (tiene prioridad sobre el score):
-        si hay señal de rapidez/liquidez/urgencia/24h → opción 6
-        si no hay esa señal pero sí empresa/negocio/capital → opción 5
-    - NO se resuelve por empate: siempre devuelve uno de los dos.
-
-    Para empates entre otros servicios distintos → None (va a GPT).
+    Empates entre otros servicios → None (va a GPT).
     """
     normalized = normalize_text(text)
     msg_words = set(normalized.split())
     scores: dict = {}
 
     def kw_matches(kw_norm: str) -> bool:
-        # Coincidencia exacta como substring
         if kw_norm in normalized:
             return True
-        # Coincidencia por conjunto de palabras (maneja palabras intermedias)
         kw_words = set(kw_norm.split())
         if len(kw_words) >= 2 and kw_words.issubset(msg_words):
             return True
@@ -840,11 +964,6 @@ def detect_semantic_intent(text: str) -> str | None:
     if not scores:
         return None
 
-    # ── Pre-regla comercial 5 vs 6 ───────────────────────────────────────────
-    # Se aplica ANTES del ranking para cubrir casos donde solo uno de los dos
-    # servicios alcanzó umbral pero el mensaje tiene señal decisiva de urgencia.
-    # Señales de urgencia → opción 6 (Financiamiento Práctico)
-    # Contexto empresarial sin urgencia → opción 5 (Financiamiento Empresarial)
     _URGENCY_SIGNALS = {
         "rapido", "rapida", "urgente", "urgencia", "liquidez",
         "24 horas", "24h", "inmediato", "inmediata", "pronto",
@@ -859,31 +978,24 @@ def detect_semantic_intent(text: str) -> str | None:
     has_business = any(s in normalized_for_56 for s in _BUSINESS_SIGNALS)
 
     if has_business:
-        # Si hay señal de negocio con urgencia → siempre opción 6
         if has_urgency:
             return "financiamiento_practico"
-        # Si hay señal de negocio sin urgencia y el score de empresarial alcanzó umbral
         if scores.get("empresarial", 0) >= 2.0:
             return "empresarial"
-        # Negocio + no urgencia pero solo financiamiento_practico en scores → igual opción 5
         if scores.get("financiamiento_practico", 0) >= 2.0 and "empresarial" not in scores:
             return "empresarial"
 
-    # ── Ranking general ──────────────────────────────────────────────────────
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     best_service, best_score = ranked[0]
 
     if len(ranked) > 1:
         second_service, second_score = ranked[1]
 
-        # Si los top 2 son 5 y 6, la pre-regla ya debería haberlo resuelto arriba.
-        # Como seguridad: si llega aquí sin resolución previa, aplica urgencia.
         if set([best_service, second_service]) == {"empresarial", "financiamiento_practico"}:
             if has_urgency:
                 return "financiamiento_practico"
             return "empresarial"
 
-        # Empate real entre otros servicios distintos → None (va a GPT)
         if best_score == second_score:
             return None
 
@@ -891,15 +1003,11 @@ def detect_semantic_intent(text: str) -> str | None:
 
 
 # Registro de último modo de resolución por usuario (anti-repetición).
-# Valores posibles: "exact" | "semantic" | "gpt" | "clarification" | "menu" | "greeting" | "advisor"
 _last_route: dict = {}
 
 
 def _reset_user_session(phone: str) -> None:
-    """
-    Limpia todo el estado conversacional del usuario.
-    Centraliza el reseteo para evitar olvidar algún dict en el futuro.
-    """
+    """Limpia todo el estado conversacional del usuario."""
     user_state.pop(phone, None)
     user_data.pop(phone, None)
     _last_service.pop(phone, None)
@@ -907,10 +1015,7 @@ def _reset_user_session(phone: str) -> None:
 
 
 def _route_to_service(phone: str, service: str, msg_id: str) -> None:
-    """
-    Enruta al flujo de servicio correcto dado su nombre.
-    Centraliza la lógica de activación para exact + semantic.
-    """
+    """Enruta al flujo de servicio correcto dado su nombre."""
     if service == "prestamo_imss":
         _last_service[phone] = "imss"
         user_state[phone] = "imss_beneficios"
@@ -933,34 +1038,49 @@ def _route_to_service(phone: str, service: str, msg_id: str) -> None:
         _last_service[phone] = "seguro_auto"
         send_message(
             phone,
-            "🚗 *Seguros de Auto Inbursa*\n"
-            "✅ Cobertura amplia\n✅ Asistencia vial 24/7\n✅ RC, robo total/parcial\n\n"
-            "📞 Un asesor te contactará para cotizar.",
+            "🚗 *Seguro de Auto Inbursa*\n\n"
+            "✅ Cobertura amplia\n"
+            "✅ Robo total y parcial\n"
+            "✅ Responsabilidad civil\n"
+            "✅ Asistencia vial 24/7\n\n"
+            "📞 Un asesor te contactará para cotizar tu vehículo.",
             msg_id,
         )
-        notify_advisor(f"🚗 Interesado en Seguro Auto · WhatsApp: {phone}", msg_id)
+        notify_advisor(
+            f"🚗 INTERESADO EN SEGURO AUTO\nWhatsApp: {phone}", msg_id
+        )
 
     elif service == "seguro_vida":
         _last_service[phone] = "seguro_vida"
         send_message(
             phone,
-            "🏥 *Seguros de Vida y Salud Inbursa*\n"
-            "✅ Vida\n✅ Gastos médicos\n✅ Hospitalización\n✅ Atención 24/7\n\n"
-            "📞 Un asesor te contactará para explicar coberturas.",
+            "🏥 *Seguro de Vida y Salud Inbursa*\n\n"
+            "✅ Seguro de vida\n"
+            "✅ Gastos médicos mayores\n"
+            "✅ Hospitalización\n"
+            "✅ Atención 24/7\n\n"
+            "📞 Un asesor te contactará para explicarte coberturas y costos.",
             msg_id,
         )
-        notify_advisor(f"🏥 Interesado en Vida/Salud · WhatsApp: {phone}", msg_id)
+        notify_advisor(
+            f"🏥 INTERESADO EN VIDA/SALUD\nWhatsApp: {phone}", msg_id
+        )
 
     elif service == "vrim":
         _last_service[phone] = "vrim"
         send_message(
             phone,
-            "💳 *Tarjetas Médicas VRIM*\n"
-            "✅ Consultas ilimitadas\n✅ Especialistas y laboratorios\n✅ Descuentos en medicamentos\n\n"
-            "📞 Un asesor te contactará para explicar beneficios.",
+            "💳 *Tarjeta Médica VRIM*\n\n"
+            "✅ Consultas ilimitadas con médico general\n"
+            "✅ Acceso a especialistas\n"
+            "✅ Laboratorios y estudios\n"
+            "✅ Descuentos en medicamentos\n\n"
+            "📞 Un asesor te contactará para explicarte los planes disponibles.",
             msg_id,
         )
-        notify_advisor(f"💳 Interesado en VRIM · WhatsApp: {phone}", msg_id)
+        notify_advisor(
+            f"💳 INTERESADO EN VRIM\nWhatsApp: {phone}", msg_id
+        )
 
 
 def handle_hybrid_message(phone: str, text: str, msg_id: str) -> None:
@@ -970,11 +1090,9 @@ def handle_hybrid_message(phone: str, text: str, msg_id: str) -> None:
 
     Orden de decisión:
     1. Semántica clara (score >= 2.0) → enrutar al servicio.
-    2. Hint financiero real → GPT (con anti-repetición: si ya fue GPT → aclaración).
+    2. Hint financiero real → GPT (anti-repetición: si ya fue GPT → aclaración).
     3. Anti-repetición de menú/aclaración → aclaración breve.
     4. Último recurso → menú completo (una sola vez).
-
-    _last_route válidos: "exact" | "semantic" | "gpt" | "clarification" | "menu" | "greeting" | "advisor"
     """
     last_route = _last_route.get(phone, "")
 
@@ -987,13 +1105,9 @@ def handle_hybrid_message(phone: str, text: str, msg_id: str) -> None:
         return
 
     # --- Paso 2: activar GPT solo si hay hint financiero REAL ---
-    # Regla: GPT se activa si el mensaje contiene un término financiero específico
-    # O si es una pregunta consultiva explícita sobre servicios/calificación/costo.
-    # NO se activa solo por ser una pregunta genérica de 3+ tokens.
     normalized = normalize_text(text)
     tokens = set(normalized.split())
 
-    # Términos que indican consulta real sobre los servicios del bot
     _FINANCIAL_HINTS = {
         "seguro", "prestamo", "credito", "financiamiento", "inbursa",
         "dinero", "beneficio", "tarjeta", "medico", "medica",
@@ -1001,7 +1115,6 @@ def handle_hybrid_message(phone: str, text: str, msg_id: str) -> None:
         "cotizar", "precio", "costo", "aplico", "califico",
         "requisito", "documentos", "aplica",
     }
-    # Frases consultivas de servicio (requieren estar completas en el texto)
     _CONSULTIVE_PHRASES = {
         "como funciona", "cuanto cuesta", "que necesito", "que cubre",
         "si califico", "que documentos", "que requisitos", "cuanto es",
@@ -1009,15 +1122,12 @@ def handle_hybrid_message(phone: str, text: str, msg_id: str) -> None:
         "que es la", "explicame", "informame", "como accedo",
     }
 
-    has_financial_hint  = bool(tokens & _FINANCIAL_HINTS)
-    has_consultive      = any(p in normalized for p in _CONSULTIVE_PHRASES)
+    has_financial_hint = bool(tokens & _FINANCIAL_HINTS)
+    has_consultive     = any(p in normalized for p in _CONSULTIVE_PHRASES)
 
-    # NO activar GPT por empresa/negocio solos porque esos ya los maneja semántica
-    # y si llegan aquí es porque no hubo coincidencia suficiente.
     should_use_gpt = has_financial_hint or has_consultive
 
     if should_use_gpt:
-        # Anti-repetición: GPT ya respondió → aclaración en lugar de GPT de nuevo
         if last_route == "gpt":
             log.info(f"📍 {phone}: route=clarification (tras GPT)")
             _last_route[phone] = "clarification"
@@ -1060,55 +1170,122 @@ def funnel_prestamo_imss(user_id: str, user_message: str):
     state = user_state.get(user_id, "imss_beneficios")
     datos = user_data.get(user_id, {})
 
+    # ── Apertura para leads de campaña ────────────────────────────────────────
+    # Activado cuando el sistema detecta un lead de anuncio FB/IG.
+    # Directo y comercial: muestra beneficios clave y hace UNA sola pregunta.
+    if state == "imss_campaign_open":
+        send_message(
+            user_id,
+            "💰 *Préstamo para Pensionados IMSS (Ley 73)*\n\n"
+            "✅ Montos desde *$40,000 hasta $650,000*\n"
+            "✅ Sin aval ni garantía\n"
+            "✅ Descuento directo vía tu pensión\n"
+            "✅ Depósito a tu cuenta en días\n"
+            "✅ Atención personalizada\n\n"
+            "*¿Ya eres pensionado o jubilado del IMSS bajo la Ley 73?*"
+        )
+        user_state[user_id] = "imss_preg_pensionado"
+        return jsonify({"status": "ok", "funnel": "imss_campaign"})
+
+    # ── Apertura estándar (desde menú o selección directa) ───────────────────
     if state == "imss_beneficios":
         send_message(
             user_id,
-            "💰 *Préstamo para Pensionados IMSS (Ley 73)*\n"
-            "- Montos desde $40,000 hasta $650,000\n"
-            "- Descuento vía pensión\n"
-            "- Plazos de 12 a 60 meses\n"
-            "- Depósito directo a tu cuenta\n"
-            "- Sin aval ni garantía\n\n"
-            "🏦 *Beneficios adicionales si recibes tu pensión en Inbursa*\n"
-            "- Tasas preferenciales\n"
-            "- Acceso a seguro de vida sin costo\n"
-            "- Anticipo de nómina disponible\n"
-            "- Atención personalizada 24/7\n\n"
-            "(Los beneficios de nómina son *adicionales* y *no obligatorios*)."
+            "💰 *Préstamo para Pensionados IMSS (Ley 73)*\n\n"
+            "✅ Montos desde *$40,000 hasta $650,000*\n"
+            "✅ Sin aval ni garantía\n"
+            "✅ Descuento vía pensión — sin trámites complicados\n"
+            "✅ Plazos de 12 a 60 meses\n"
+            "✅ Depósito directo a tu cuenta\n\n"
+            "🏦 *Si ya recibes tu pensión en Inbursa*, aplican beneficios adicionales:\n"
+            "tasas preferenciales, seguro de vida y anticipo de nómina.\n"
+            "_(No es obligatorio — son ventajas adicionales)_\n\n"
+            "*¿Ya eres pensionado o jubilado del IMSS bajo la Ley 73?*"
         )
-        send_message(user_id, "¿Eres pensionado o jubilado del IMSS bajo la Ley 73?")
         user_state[user_id] = "imss_preg_pensionado"
         return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
+    # ── Respuesta a la pregunta de calificación ───────────────────────────────
     if state == "imss_preg_pensionado":
         resp = interpret_response(user_message)
         if resp == "negative":
-            send_main_menu(user_id)
-            _reset_user_session(user_id)
+            # No califica — respuesta cálida, no cortar la conversación
+            send_message(
+                user_id,
+                "Gracias por confirmarlo 🙏\n\n"
+                "Este financiamiento está diseñado exclusivamente para pensionados y "
+                "jubilados del IMSS bajo la *Ley 73*.\n\n"
+                "Sin embargo, contamos con otras opciones que podrían adaptarse a tu "
+                "situación. ¿Te gustaría que un asesor te oriente sobre alternativas?"
+            )
+            user_state[user_id] = "imss_no_califica_asesor"
             return jsonify({"status": "ok"})
         if resp == "positive":
-            send_message(user_id, "¿Cuánto recibes aproximadamente al mes por concepto de pensión?")
+            send_message(
+                user_id,
+                "¡Perfecto! 👏 Eso es justo lo que necesitamos.\n\n"
+                "*¿Cuánto recibes aproximadamente al mes por concepto de pensión?*\n"
+                "_(Puedes escribir el monto, ej. 7500)_"
+            )
             user_state[user_id] = "imss_preg_monto_pension"
             return jsonify({"status": "ok"})
-        send_message(user_id, "Por favor responde *sí* o *no* para continuar.")
+        send_message(user_id, "Por favor responde *sí* o *no* para continuar. 😊")
         return jsonify({"status": "ok"})
 
+    # ── Manejo de no calificados ──────────────────────────────────────────────
+    if state == "imss_no_califica_asesor":
+        resp = interpret_response(user_message)
+        if resp == "positive":
+            notify_advisor(
+                f"📣 PROSPECTO NO CALIFICA – IMSS LEY 73\n"
+                f"WhatsApp: {user_id}\n"
+                f"No es pensionado IMSS Ley 73.\n"
+                f"Origen: {datos.get('origen', 'directo')}\n"
+                f"Solicitó orientación sobre otras alternativas."
+            )
+            send_message(
+                user_id,
+                "¡Perfecto! 👍 Le avisaré a nuestro asesor *Christian López* para que "
+                "te contacte y explore las mejores opciones para ti.\n\n"
+                "Te atendemos a la brevedad. 😊"
+            )
+        else:
+            send_message(
+                user_id,
+                "Entendido 😊 Aquí estaré si necesitas más información.\n\n"
+                "Si en algún momento deseas explorar nuestros otros servicios, con gusto te oriento."
+            )
+            send_main_menu(user_id)
+        _reset_user_session(user_id)
+        return jsonify({"status": "ok"})
+
+    # ── Monto de pensión ──────────────────────────────────────────────────────
     if state == "imss_preg_monto_pension":
         monto = extract_number(user_message)
         if monto is None:
-            send_message(user_id, "Indica el monto mensual que recibes por pensión (ej. 6500).")
+            send_message(
+                user_id,
+                "Indica el monto mensual que recibes por pensión _(ej. 6500)_."
+            )
             return jsonify({"status": "ok"})
         datos["pension_mensual"] = monto
         user_data[user_id] = datos
         if monto < 5000:
             send_message(
                 user_id,
-                "Por ahora los créditos aplican a pensiones a partir de $5,000.\n"
-                "Puedo notificar a nuestro asesor para ofrecerte otra opción. ¿Deseas que lo haga?"
+                "Gracias por la información 🙏\n\n"
+                "Por ahora los créditos aplican a pensiones a partir de *$5,000 mensuales*.\n\n"
+                "Sin embargo, puedo notificar a nuestro asesor para que te ofrezca opciones "
+                "adaptadas a tu caso. ¿Deseas que lo haga?"
             )
             user_state[user_id] = "imss_ofrecer_asesor"
             return jsonify({"status": "ok"})
-        send_message(user_id, "Perfecto 👏 ¿Qué monto de préstamo te gustaría solicitar (mínimo $40,000)?")
+        send_message(
+            user_id,
+            "Excelente 💪 Con esa pensión puedes calificar.\n\n"
+            "*¿Qué monto de préstamo te gustaría solicitar?*\n"
+            "_(Mínimo $40,000 — Máximo $650,000)_"
+        )
         user_state[user_id] = "imss_preg_monto_solicitado"
         return jsonify({"status": "ok"})
 
@@ -1118,71 +1295,110 @@ def funnel_prestamo_imss(user_id: str, user_message: str):
             formatted = (
                 "🔔 NUEVO PROSPECTO – PRÉSTAMO IMSS\n"
                 f"WhatsApp: {user_id}\n"
-                f"Pensión mensual: ${datos.get('pension_mensual','ND')}\n"
-                "Estatus: Pensión baja, requiere opciones alternativas"
+                f"Pensión mensual: ${datos.get('pension_mensual', 'ND')}\n"
+                f"Origen: {datos.get('origen', 'directo')}\n"
+                "Estatus: Pensión baja — requiere opciones alternativas"
             )
             notify_advisor(formatted)
-            send_message(user_id, "¡Listo! Un asesor te contactará con opciones alternativas.")
+            send_message(
+                user_id,
+                "¡Listo! ✅ Un asesor te contactará para ofrecerte las mejores "
+                "alternativas disponibles para tu situación."
+            )
+        else:
+            send_message(
+                user_id,
+                "Entendido 😊 Si en algún momento deseas más información, aquí estaré.\n\n"
+                "¿Hay algo más en lo que pueda ayudarte?"
+            )
             send_main_menu(user_id)
-            _reset_user_session(user_id)
-            return jsonify({"status": "ok"})
-        send_message(user_id, "Perfecto, si deseas podemos continuar con otros servicios.")
-        send_main_menu(user_id)
         _reset_user_session(user_id)
         return jsonify({"status": "ok"})
 
+    # ── Monto solicitado ──────────────────────────────────────────────────────
     if state == "imss_preg_monto_solicitado":
         monto_sol = extract_number(user_message)
         if monto_sol is None or monto_sol < 40000:
-            send_message(user_id, "Indica el monto que deseas solicitar (mínimo $40,000), ej. 65000.")
+            send_message(
+                user_id,
+                "Indica el monto que deseas solicitar _(mínimo $40,000)_, ej. *65,000*."
+            )
             return jsonify({"status": "ok"})
         datos["monto_solicitado"] = monto_sol
         user_data[user_id] = datos
-        send_message(user_id, "¿Cuál es tu *nombre completo*?")
+        send_message(
+            user_id,
+            f"Perfecto, anotado: *${monto_sol:,.0f}* ✅\n\n"
+            "*¿Cuál es tu nombre completo?*"
+        )
         user_state[user_id] = "imss_preg_nombre"
         return jsonify({"status": "ok"})
 
+    # ── Nombre ────────────────────────────────────────────────────────────────
     if state == "imss_preg_nombre":
         datos["nombre"] = user_message.title()
         user_data[user_id] = datos
-        send_message(user_id, "¿Cuál es tu *teléfono de contacto*?")
+        send_message(
+            user_id,
+            f"Mucho gusto, *{datos['nombre']}* 😊\n\n"
+            "*¿Cuál es tu número de teléfono de contacto?*\n"
+            "_(Si es el mismo de este WhatsApp, escribe: mismo)_"
+        )
         user_state[user_id] = "imss_preg_telefono"
         return jsonify({"status": "ok"})
 
+    # ── Teléfono ──────────────────────────────────────────────────────────────
     if state == "imss_preg_telefono":
-        datos["telefono_contacto"] = user_message.strip()
+        telf = user_message.strip().lower()
+        datos["telefono_contacto"] = (
+            user_id if telf in ("mismo", "este", "el mismo") else telf
+        )
         user_data[user_id] = datos
-        send_message(user_id, "¿En qué *ciudad* vives?")
+        send_message(user_id, "*¿En qué ciudad vives?*")
         user_state[user_id] = "imss_preg_ciudad"
         return jsonify({"status": "ok"})
 
+    # ── Ciudad ────────────────────────────────────────────────────────────────
     if state == "imss_preg_ciudad":
         datos["ciudad"] = user_message.title()
         user_data[user_id] = datos
-        send_message(user_id, "¿Ya recibes tu pensión en *Inbursa*? (Sí/No)")
+        send_message(
+            user_id,
+            "*¿Ya recibes tu pensión en Inbursa?* (Sí / No)\n\n"
+            "_(Si es en otro banco, no hay problema — igual puedes aplicar)_"
+        )
         user_state[user_id] = "imss_preg_nomina_inbursa"
         return jsonify({"status": "ok"})
 
+    # ── Nómina Inbursa + cierre + notificación al asesor ─────────────────────
     if state == "imss_preg_nomina_inbursa":
         resp = interpret_response(user_message)
-        datos["nomina_inbursa"] = "Sí" if resp == "positive" else "No" if resp == "negative" else "ND"
+        datos["nomina_inbursa"] = (
+            "Sí" if resp == "positive" else "No" if resp == "negative" else "ND"
+        )
         if resp not in ("positive", "negative"):
             send_message(user_id, "Por favor responde *sí* o *no* para continuar.")
             return jsonify({"status": "ok"})
 
         send_message(
             user_id,
-            "✅ ¡Listo! Tu crédito ha sido *preautorizado*.\n"
-            "Un asesor financiero (Christian López) se pondrá en contacto contigo."
+            "✅ *¡Todo listo!*\n\n"
+            "Con los datos que me compartiste, tu solicitud quedó registrada.\n"
+            "Nuestro asesor *Christian López* se pondrá en contacto contigo a la brevedad "
+            "para darte todos los detalles y continuar el proceso. 🙌"
         )
         formatted = (
-            "🔔 NUEVO PROSPECTO – PRÉSTAMO IMSS\n"
-            f"Nombre: {datos.get('nombre','ND')}\n"
+            "🔔 NUEVO PROSPECTO – PRÉSTAMO IMSS LEY 73\n"
+            "─────────────────────────────\n"
+            f"Nombre: {datos.get('nombre', 'ND')}\n"
             f"WhatsApp: {user_id}\n"
-            f"Teléfono: {datos.get('telefono_contacto','ND')}\n"
-            f"Ciudad: {datos.get('ciudad','ND')}\n"
-            f"Monto solicitado: ${datos.get('monto_solicitado',0):,.0f}\n"
-            f"Nómina Inbursa: {datos.get('nomina_inbursa','ND')}"
+            f"Teléfono: {datos.get('telefono_contacto', 'ND')}\n"
+            f"Ciudad: {datos.get('ciudad', 'ND')}\n"
+            f"Pensión mensual: ${datos.get('pension_mensual', 0):,.0f}\n"
+            f"Monto solicitado: ${datos.get('monto_solicitado', 0):,.0f}\n"
+            f"Pensión en Inbursa: {datos.get('nomina_inbursa', 'ND')}\n"
+            f"Origen: {datos.get('origen', 'directo')}\n"
+            "─────────────────────────────"
         )
         notify_advisor(formatted)
         send_main_menu(user_id)
@@ -1269,11 +1485,11 @@ def funnel_credito_empresarial(user_id: str, user_message: str):
         )
         formatted = (
             "🔔 NUEVO PROSPECTO – CRÉDITO EMPRESARIAL\n"
-            f"Nombre: {datos.get('nombre','ND')}\n"
-            f"Teléfono: {datos.get('telefono','ND')}\n"
-            f"Ciudad: {datos.get('ciudad','ND')}\n"
-            f"Monto solicitado: ${datos.get('monto_solicitado',0):,.0f}\n"
-            f"Actividad: {datos.get('actividad_empresa','ND')}\n"
+            f"Nombre: {datos.get('nombre', 'ND')}\n"
+            f"Teléfono: {datos.get('telefono', 'ND')}\n"
+            f"Ciudad: {datos.get('ciudad', 'ND')}\n"
+            f"Monto solicitado: ${datos.get('monto_solicitado', 0):,.0f}\n"
+            f"Actividad: {datos.get('actividad_empresa', 'ND')}\n"
             f"WhatsApp: {user_id}"
         )
         notify_advisor(formatted)
@@ -1312,7 +1528,9 @@ def funnel_financiamiento_practico(user_id: str, user_message: str):
                 "Perfecto 👍. Un ejecutivo te contactará para conocer tus necesidades y "
                 "ofrecerte otras opciones."
             )
-            notify_advisor(f"📩 Prospecto NO interesado en Financiamiento Práctico\nNúmero: {user_id}")
+            notify_advisor(
+                f"📩 Prospecto NO interesado en Financiamiento Práctico\nNúmero: {user_id}"
+            )
             send_main_menu(user_id)
             _reset_user_session(user_id)
             return jsonify({"status": "ok"})
@@ -1327,8 +1545,6 @@ def funnel_financiamiento_practico(user_id: str, user_message: str):
         send_message(user_id, "Responde *sí* o *no* para continuar.")
         return jsonify({"status": "ok"})
 
-    # Preguntas secuenciales — el valor del estado actual es la respuesta anterior;
-    # el dict `preguntas` mapea estado_actual → texto de la SIGUIENTE pregunta.
     preguntas = {
         "fp_q1_giro":        "2️⃣ ¿Qué *antigüedad fiscal* tiene la empresa?",
         "fp_q2_antiguedad":  "3️⃣ ¿Es *persona física con actividad empresarial* o *persona moral*?",
@@ -1366,18 +1582,18 @@ def funnel_financiamiento_practico(user_id: str, user_message: str):
         formatted = (
             "🔔 *NUEVO PROSPECTO – FINANCIAMIENTO PRÁCTICO EMPRESARIAL*\n\n"
             f"📱 WhatsApp: {user_id}\n"
-            f"🏢 Giro: {datos.get('fp_q1_giro','ND')}\n"
-            f"📆 Antigüedad Fiscal: {datos.get('fp_q2_antiguedad','ND')}\n"
-            f"👤 Tipo de Persona: {datos.get('fp_q3_tipo','ND')}\n"
-            f"🧑‍⚖️ Edad Rep. Legal: {datos.get('fp_q4_edad','ND')}\n"
-            f"📊 Buró empresa/accionistas: {datos.get('fp_q5_buro','ND')}\n"
-            f"💵 Facturación anual: {datos.get('fp_q6_facturacion','ND')}\n"
-            f"📈 6 meses constantes: {datos.get('fp_q7_constancia','ND')}\n"
-            f"🎯 Monto requerido: {datos.get('fp_q8_monto','ND')}\n"
-            f"🧾 Opinión SAT: {datos.get('fp_q9_opinion','ND')}\n"
-            f"🏦 Tipo de financiamiento: {datos.get('fp_q10_tipo','ND')}\n"
-            f"💼 Financiamiento actual: {datos.get('fp_q11_actual','ND')}\n"
-            f"💬 Comentario: {datos.get('comentario','Ninguno')}"
+            f"🏢 Giro: {datos.get('fp_q1_giro', 'ND')}\n"
+            f"📆 Antigüedad Fiscal: {datos.get('fp_q2_antiguedad', 'ND')}\n"
+            f"👤 Tipo de Persona: {datos.get('fp_q3_tipo', 'ND')}\n"
+            f"🧑‍⚖️ Edad Rep. Legal: {datos.get('fp_q4_edad', 'ND')}\n"
+            f"📊 Buró empresa/accionistas: {datos.get('fp_q5_buro', 'ND')}\n"
+            f"💵 Facturación anual: {datos.get('fp_q6_facturacion', 'ND')}\n"
+            f"📈 6 meses constantes: {datos.get('fp_q7_constancia', 'ND')}\n"
+            f"🎯 Monto requerido: {datos.get('fp_q8_monto', 'ND')}\n"
+            f"🧾 Opinión SAT: {datos.get('fp_q9_opinion', 'ND')}\n"
+            f"🏦 Tipo de financiamiento: {datos.get('fp_q10_tipo', 'ND')}\n"
+            f"💼 Financiamiento actual: {datos.get('fp_q11_actual', 'ND')}\n"
+            f"💬 Comentario: {datos.get('comentario', 'Ninguno')}"
         )
         notify_advisor(formatted)
         send_message(
@@ -1417,17 +1633,21 @@ def _verify_meta_signature(raw_body: bytes, sig_header: str) -> bool:
 def _handle_message(message: dict) -> None:
     """
     Procesa un mensaje individual del webhook.
-    Separado para permitir iterar sobre múltiples mensajes por payload [A-2].
     Registra el mensaje entrante en Sheets antes de procesarlo.
 
     Orden de decisión:
     1. Validar tipo de mensaje.
     2. Registrar en Sheets.
-    3. Comando sgpt: → responder con GPT libre.
+    3. Comando sgpt: → GPT libre.
     4. Embudo activo → continuar embudo.
-    5. Saludo / menú explícito → mostrar menú.
-    6. Coincidencia exacta con mapa de opciones → enrutar.
-    7. Capa híbrida → detect_semantic_intent → GPT → aclaración → menú.
+    4.5. Detección de lead de campaña IMSS → flujo IMSS directo [PRIORIDAD MÁXIMA].
+         Se evalúa ANTES que los triggers de menú para capturar leads de anuncios
+         FB/IG click-to-WhatsApp con mensajes genéricos o de bajo contexto.
+    5. Saludo / solicitud explícita de menú → mostrar menú.
+    5b. Solicitud directa de asesor → notificar.
+    6. Intención numérica incrustada en texto → enrutar.
+    7. Coincidencia exacta con mapa de opciones → enrutar.
+    8. Capa híbrida → detect_semantic_intent → GPT → aclaración → menú.
     """
     try:
         phone_number = message.get("from")
@@ -1448,12 +1668,10 @@ def _handle_message(message: dict) -> None:
                 _processed_deque.append(msg_id)
                 _processed_ids.add(msg_id)
 
-        # Propagar msg_id al hilo para que send_message/notify_advisor lo hereden
         _tl.msg_id = msg_id
 
         mtype = message.get("type")
         if mtype != "text":
-            # Registrar evento multimedia entrante en Sheets antes de responder
             try:
                 _sheets_append_row(
                     phone      = phone_number,
@@ -1469,7 +1687,7 @@ def _handle_message(message: dict) -> None:
             return
 
         user_message = (message.get("text") or {}).get("body", "").strip()
-        user_message = user_message[:500]   # [B-3] límite de longitud
+        user_message = user_message[:500]
 
         if not user_message:
             return
@@ -1511,12 +1729,31 @@ def _handle_message(message: dict) -> None:
             funnel_financiamiento_practico(phone_number, user_message)
             return
 
-        # --- 5. Saludos y solicitudes explícitas de menú ---
-        # Exact match contra el set de trigger phrases (ya son frases completas seguras).
-        # Contención solo para frases largas y claras, NO palabras cortas como
-        # "info", "ayuda", "servicios", "hola" sueltas que dispararían menú en
-        # cualquier mensaje que las contenga.
+        # --- 4.5. Detección de lead de campaña IMSS — PRIORIDAD MÁXIMA ---
+        # Se ejecuta ANTES de los triggers de menú para interceptar leads de
+        # anuncios FB/IG con mensajes genéricos y enrutarlos directamente al
+        # embudo IMSS. Sin esta verificación, mensajes como "Hello!", "Info"
+        # o "Quiero información" caerían en el menú general y romperían la conversión.
         _msg_norm = normalize_text(user_message)
+        if _is_imss_campaign_lead(message, _msg_norm):
+            log.info(f"📍 {phone_number}: route=imss_campaign_lead")
+            _last_route[phone_number] = "imss_campaign"
+            _last_service[phone_number] = "imss"
+            user_data.setdefault(phone_number, {})
+            # Registrar origen para la notificación al asesor
+            referral = message.get("referral") or {}
+            origen_tag = "campaña_IMSS"
+            if referral:
+                ad_headline = referral.get("headline", "")
+                ad_id       = referral.get("source_id", "")
+                if ad_headline or ad_id:
+                    origen_tag = f"campaña_IMSS | anuncio: {ad_headline or ad_id}"
+            user_data[phone_number]["origen"] = origen_tag
+            user_state[phone_number] = "imss_campaign_open"
+            funnel_prestamo_imss(phone_number, user_message)
+            return
+
+        # --- 5. Saludos y solicitudes explícitas de menú ---
         _MENU_CONTAINMENT = {
             "que manejas", "que ofrecen", "que ofreces",
             "que servicios tienen", "que servicios ofrecen",
@@ -1535,10 +1772,6 @@ def _handle_message(message: dict) -> None:
             return
 
         # --- 5b. Solicitud explícita de hablar con asesor ---
-        # Solo frases inequívocas de contacto humano directo.
-        # EXCLUIDAS: "quiero hablar con" (puede ser "quiero hablar con alguien sobre pensión"),
-        #            "como me comunico" (puede ser sobre un trámite, no sobre un asesor),
-        #            "con quien hablo" (puede ser consulta de proceso).
         _ADVISOR_TRIGGERS = {
             "hablar con un asesor", "hablar con alguien",
             "contactar asesor", "contactar con asesor",
@@ -1566,9 +1799,6 @@ def _handle_message(message: dict) -> None:
             return
 
         # --- 6. Intención numérica incrustada en texto ---
-        # Solo activar con contexto inequívoco de selección de menú.
-        # EXCLUIDOS "el" y "la" porque son demasiado genéricos:
-        #   "el 3 de marzo", "la 2 de la tarde", "el 5%" → falsos positivos.
         _NUM_CONTEXT = re.search(
             r'\b(?:opcion|opcion|numero|numero|servicio|'
             r'quiero el|quiero la|me interesa el|me interesa la|'
@@ -1600,7 +1830,6 @@ def _handle_message(message: dict) -> None:
     except Exception:
         log.exception(f"❌ Error procesando mensaje de {message.get('from', '?')}")
     finally:
-        # Limpiar msg_id del hilo para evitar rastro si el worker se reutiliza
         _tl.msg_id = ""
 
 
@@ -1623,14 +1852,12 @@ def webhook():
         mode      = request.args.get("hub.mode")
         token     = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
-        # [C-3] Guardia explícita: VERIFY_TOKEN vacío nunca valida
         if mode == "subscribe" and VERIFY_TOKEN and token == VERIFY_TOKEN:
             return challenge, 200
         return "forbidden", 403
 
     # POST
     try:
-        # [A-3] Verificar firma HMAC-SHA256 de Meta
         raw_body   = request.get_data()
         sig_header = request.headers.get("X-Hub-Signature-256", "")
         if not _verify_meta_signature(raw_body, sig_header):
@@ -1639,7 +1866,6 @@ def webhook():
 
         data = request.get_json(force=True, silent=True) or {}
 
-        # [A-2] Iterar sobre TODOS los entries/changes/messages
         for entry in data.get("entry", []):
             for change in entry.get("changes", []):
                 value    = change.get("value") or {}
@@ -1651,7 +1877,7 @@ def webhook():
 
     except Exception:
         log.exception("❌ Error en webhook POST")
-        # [C-2] Siempre 200 para evitar reintentos infinitos de Meta
+        # Siempre 200 para evitar reintentos infinitos de Meta
         return jsonify({"status": "ok"}), 200
 
 
@@ -1667,7 +1893,6 @@ def health():
 # ---------------------------------------------------------------
 # ARRANQUE
 # ---------------------------------------------------------------
-# Inicializar Google Sheets al arrancar (antes de recibir requests)
 _sheets_init()
 
 if __name__ == "__main__":
