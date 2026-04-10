@@ -46,6 +46,7 @@ VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 ADVISOR_NUM  = os.getenv("ADVISOR_NUMBER", "5216682478005")
 OPENAI_KEY   = os.getenv("OPENAI_API_KEY")
 APP_SECRET   = os.getenv("META_APP_SECRET", "").strip()
+INTERNAL_TOKEN = os.getenv("INTERNAL_TOKEN", "").strip()
 
 # Notificación al asesor fuera de ventana 24h:
 # Crea un template aprobado en Meta Business Manager con un parámetro {{1}}.
@@ -163,6 +164,12 @@ def send_msg(to: str, text: str) -> bool:
         log.exception(f"💥 send_msg {to}")
         _log(to, _nombre(to), text, "saliente", "bot", "error", str(e)[:200], _mid())
         return False
+
+def _is_internal_request(req) -> bool:
+    if not INTERNAL_TOKEN:
+        return False
+    provided = (req.headers.get("X-Internal-Token", "") or "").strip()
+    return bool(provided) and hmac.compare_digest(provided, INTERNAL_TOKEN)
 
 def notify_advisor(msg: str) -> bool:
     """
@@ -839,6 +846,42 @@ def webhook():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "sheets": _srdy}), 200
+
+@app.route("/ext/lead", methods=["POST"])
+def ext_lead():
+    try:
+        if not INTERNAL_TOKEN:
+            log.error("❌ INTERNAL_TOKEN no configurado")
+            return jsonify({"ok": False, "error": "internal_token_not_configured"}), 500
+        if not _is_internal_request(request):
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        data = request.get_json(force=True, silent=True) or {}
+        lead_id = str(data.get("lead_id", "")).strip()
+        nombre = str(data.get("nombre", "")).strip() or "Sin nombre"
+        telefono = re.sub(r"\D", "", str(data.get("telefono", "")))[-10:]
+        interest = str(data.get("interest") or data.get("interes") or "").strip() or "sin_especificar"
+        source = str(data.get("source", "")).strip() or "desconocido"
+        if not lead_id:
+            return jsonify({"ok": False, "error": "missing_lead_id"}), 422
+        if len(telefono) != 10:
+            return jsonify({"ok": False, "error": "invalid_telefono"}), 422
+        advisor_msg = (
+            f"🔔 Lead nuevo desde cohifis.com\n"
+            f"Nombre: {nombre}\n"
+            f"Teléfono: {telefono}\n"
+            f"Interés: {interest}\n"
+            f"Fuente: {source}\n"
+            f"Lead ID: {lead_id}"
+        )
+        ok = notify_advisor(advisor_msg)
+        if not ok:
+            log.warning("⚠️ /ext/lead notify_advisor falló [lead_id=%s]", lead_id)
+            return jsonify({"ok": False, "error": "advisor_notify_failed"}), 502
+        log.info("✅ /ext/lead OK [lead_id=%s]", lead_id)
+        return jsonify({"ok": True}), 200
+    except Exception as exc:
+        log.exception("❌ Error en /ext/lead: %s", exc)
+        return jsonify({"ok": False, "error": "internal_server_error"}), 500
 
 # ── Arranque ──────────────────────────────────────────────────────────────────
 _sheets_init()
