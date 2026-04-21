@@ -539,6 +539,50 @@ def funnel_imss(phone: str, msg: str) -> None:
             f"Inbursa:  {data.get('inbursa', 'ND')}\n"
             f"Origen:   {data.get('origen', 'directo')}\n"
             "────────────────────────")
+        # Auto-trigger Hydra al completar prospecto IMSS
+        try:
+            import requests as _req
+            _hydra_url = "https://boardroom-engine.onrender.com/boardroom/tasks/commercial"
+            _hydra_token = os.getenv("BOARDROOM_API_TOKEN", "").strip()
+            _hydra_payload = {
+                "event_id": str(__import__('uuid').uuid4()),
+                "lead_id": phone,
+                "event_type": "lead_new",
+                "product_code": "prestamo_imss",
+                "product_config": {
+                    "product_code": "prestamo_imss",
+                    "product_name": "Préstamo IMSS Ley 73",
+                    "priority": "A",
+                    "requirements": ["ine", "estado_de_cuenta"],
+                    "stage_scripts": {
+                        "qualification": "Hola, te comparto los requisitos para tu Préstamo IMSS.",
+                        "default": "Seguimos con tu proceso COHIFIS."
+                    },
+                    "commission_rate": 0.08
+                },
+                "classification": {"intent": "lead_new", "confidence": 0.95},
+                "advisor_id": "don_chiwy",
+                "channel": "whatsapp",
+                "source": "bot_vicky_redes",
+                "metadata": {
+                    "nombre": data.get("nombre", ""),
+                    "pension": data.get("pension", ""),
+                    "monto": data.get("monto", ""),
+                    "inbursa": data.get("inbursa", "")
+                }
+            }
+            _resp = _req.post(
+                _hydra_url,
+                json=_hydra_payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Boardroom-Token": _hydra_token
+                },
+                timeout=8
+            )
+            print(f"hydra_trigger: status={_resp.status_code} lead={phone}", flush=True)
+        except Exception as _e:
+            print(f"hydra_trigger_failed: {_e}", flush=True)
         reset(phone)
         return
 
