@@ -6,6 +6,7 @@ import hmac
 import hashlib
 import threading
 import unicodedata
+import uuid
 from collections import deque
 from datetime import datetime, timezone, timedelta
 
@@ -47,6 +48,13 @@ ADVISOR_NUM  = os.getenv("ADVISOR_NUMBER", "5216682478005")
 OPENAI_KEY   = os.getenv("OPENAI_API_KEY")
 APP_SECRET   = os.getenv("META_APP_SECRET", "").strip()
 INTERNAL_TOKEN = os.getenv("INTERNAL_TOKEN", "").strip()
+
+HYDRA_URL   = os.getenv("HYDRA_URL", "https://boardroom-engine.onrender.com/boardroom/tasks/commercial").strip()
+HYDRA_TOKEN = os.getenv("BOARDROOM_API_TOKEN", "").strip()
+try:
+    HYDRA_TIMEOUT = int(os.getenv("HYDRA_TIMEOUT", "8").strip() or "8")
+except Exception:
+    HYDRA_TIMEOUT = 8
 
 # Notificación al asesor fuera de ventana 24h:
 # Crea un template aprobado en Meta Business Manager con un parámetro {{1}}.
@@ -316,23 +324,132 @@ _SYS = (
     "(2) Seguro Auto, (3) Seguro Vida/GMM, (4) VRIM tarjeta médica, "
     "(5) Financiamiento Empresarial $100K–$100M, (6) Financiamiento Práctico 24hrs sin garantía. "
     "Responde en español mexicano, máximo 100 palabras, tono profesional y cálido. "
-    "Termina con UNA sola pregunta. No inventes tasas ni condiciones."
+    "Resuelve dudas reales del cliente. Si la pregunta es abierta, contesta de forma útil; "
+    "no mandes al menú salvo que el cliente lo pida. "
+    "Termina con UNA sola pregunta cuando ayude a avanzar. "
+    "No inventes tasas, requisitos ni condiciones no confirmadas."
 )
 
-def ask_gpt(prompt: str) -> str:
+_SERVICE_LABELS = {
+    "imss": "Préstamo IMSS Ley 73",
+    "auto": "Seguro de Auto",
+    "vida": "Seguro de Vida y Salud",
+    "vrim": "Tarjeta Médica VRIM",
+    "emp": "Financiamiento Empresarial",
+    "fp": "Financiamiento Práctico Empresarial",
+    "general": "Consulta general"
+}
+
+def ask_gpt(prompt: str, svc: str | None = None) -> str:
     if not _oai:
         return "Lo siento, servicio no disponible en este momento."
     try:
+        ctx = _SERVICE_LABELS.get(svc or "", "Consulta general")
+        user_prompt = f"Servicio detectado: {ctx}\nConsulta del cliente: {prompt}"
         r = _oai.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "system", "content": _SYS},
-                      {"role": "user", "content": prompt}],
-            temperature=0.4, max_tokens=200)
+                      {"role": "user", "content": user_prompt}],
+            temperature=0.35, max_tokens=220)
         return r.choices[0].message.content.strip()
     except Exception:
         log.exception("GPT error")
         return "Ocurrió un error. ¿Sobre qué servicio te puedo orientar?"
 
+def _extract_hydra_reply(data):
+    if isinstance(data, str):
+        return data.strip()
+    if not isinstance(data, dict):
+        return None
+
+    direct_keys = (
+        "reply", "response", "response_text", "answer", "message",
+        "assistant_message", "text", "output", "content"
+    )
+    for key in direct_keys:
+        val = data.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+
+    nested = data.get("result")
+    if isinstance(nested, dict):
+        for key in direct_keys:
+            val = nested.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+
+    actions = data.get("actions")
+    if isinstance(actions, list):
+        for item in actions:
+            if isinstance(item, dict):
+                for key in ("message", "text", "body"):
+                    val = item.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+    return None
+
+def ask_hydra(phone: str, text: str, svc: str | None = None):
+    if not HYDRA_URL:
+        return None
+
+    product_code = {
+        "imss": "prestamo_imss",
+        "auto": "seguro_auto",
+        "vida": "vida_salud",
+        "vrim": "vrim",
+        "emp": "credito_empresarial",
+        "fp": "financiamiento_practico",
+    }.get(svc or "", "general")
+
+    payload = {
+        "event_id": str(uuid.uuid4()),
+        "lead_id": phone,
+        "event_type": "open_question",
+        "product_code": product_code,
+        "classification": {"intent": "open_question", "confidence": 0.93},
+        "advisor_id": "don_chiwy",
+        "channel": "whatsapp",
+        "source": "bot_vicky_redes",
+        "message_text": text,
+        "metadata": {
+            "nombre": _nombre(phone),
+            "service_hint": svc or "general",
+            "state": user_state.get(phone, ""),
+        }
+    }
+
+    headers = {"Content-Type": "application/json"}
+    if HYDRA_TOKEN:
+        headers["X-Boardroom-Token"] = HYDRA_TOKEN
+
+    try:
+        log.info("hydra_trigger_start lead=%s svc=%s", phone, svc or "general")
+        resp = requests.post(HYDRA_URL, json=payload, headers=headers, timeout=HYDRA_TIMEOUT)
+        log.info("hydra_trigger status=%s lead=%s", resp.status_code, phone)
+        if resp.status_code not in (200, 201, 202):
+            log.warning("hydra_trigger_bad_status lead=%s body=%s", phone, resp.text[:250])
+            return None
+        try:
+            data = resp.json()
+        except Exception:
+            log.warning("hydra_trigger_non_json lead=%s body=%s", phone, resp.text[:250])
+            return None
+        reply = _extract_hydra_reply(data)
+        if reply:
+            return reply
+        log.warning("hydra_trigger_no_reply lead=%s", phone)
+        return None
+    except Exception as e:
+        log.exception("hydra_trigger_failed lead=%s err=%s", phone, e)
+        return None
+
+def ask_hydra_or_gpt(phone: str, text: str, svc: str | None = None) -> str:
+    hydra_reply = ask_hydra(phone, text, svc)
+    if hydra_reply:
+        return hydra_reply
+    return ask_gpt(text, svc)
+
+# ── Detección de servicio ─────────────────────────────────────────────────────
 # ── Detección de servicio ─────────────────────────────────────────────────────
 _EXACT: dict = {
     "1": "imss", "imss": "imss", "prestamo imss": "imss", "credito imss": "imss",
@@ -359,11 +476,37 @@ _SEM = [
 
 def detect_svc(text: str) -> str | None:
     n = norm(text)
+    toks = set(n.split())
     if n in _EXACT:
         return _EXACT[n]
+
     for svc, kws in _SEM:
-        if any(norm(k) in n for k in kws):
-            return svc
+        for k in kws:
+            nk = norm(k)
+            if nk in n:
+                return svc
+            parts = nk.split()
+            if parts and all(p in toks for p in parts):
+                return svc
+
+    if ("imss" in toks and ({"prestamo", "prestamos", "credito", "creditos", "pension", "pensionado", "pensionada", "jubilado", "jubilada"} & toks)) or ("ley" in toks and "73" in toks):
+        return "imss"
+
+    if ({"seguro", "seguros", "cobertura", "coberturas", "poliza", "polizas"} & toks) and ({"auto", "autos", "carro", "carros", "vehiculo", "vehiculos", "placa", "placas"} & toks):
+        return "auto"
+
+    if ({"vida", "gmm", "hospitalizacion", "hospitalario"} & toks) and ({"seguro", "seguros", "salud", "medico", "medicos", "gastos"} & toks):
+        return "vida"
+
+    if "vrim" in toks or ({"tarjeta", "membresia", "consultas"} & toks and {"medica", "medicas", "medico", "medicos"} & toks):
+        return "vrim"
+
+    if ({"empresa", "empresas", "empresarial", "negocio", "negocios", "pyme", "pymes"} & toks) and ({"credito", "creditos", "financiamiento", "prestamo", "prestamos"} & toks):
+        return "emp"
+
+    if ({"practico", "rapido", "rapida", "liquidez", "24", "horas"} & toks) and ({"empresa", "empresarial", "financiamiento", "credito"} & toks):
+        return "fp"
+
     return None
 
 # ── Enrutamiento a servicio ───────────────────────────────────────────────────
@@ -541,48 +684,44 @@ def funnel_imss(phone: str, msg: str) -> None:
             "────────────────────────")
         # Auto-trigger Hydra al completar prospecto IMSS
         try:
-            import requests as _req
-            _hydra_url = "https://boardroom-engine.onrender.com/boardroom/tasks/commercial"
-            _hydra_token = os.getenv("BOARDROOM_API_TOKEN", "").strip()
-            _hydra_payload = {
-                "event_id": str(__import__('uuid').uuid4()),
-                "lead_id": phone,
-                "event_type": "lead_new",
-                "product_code": "prestamo_imss",
-                "product_config": {
+            if HYDRA_URL:
+                _hydra_payload = {
+                    "event_id": str(uuid.uuid4()),
+                    "lead_id": phone,
+                    "event_type": "lead_new",
                     "product_code": "prestamo_imss",
-                    "product_name": "Préstamo IMSS Ley 73",
-                    "priority": "A",
-                    "requirements": ["ine", "estado_de_cuenta"],
-                    "stage_scripts": {
-                        "qualification": "Hola, te comparto los requisitos para tu Préstamo IMSS.",
-                        "default": "Seguimos con tu proceso COHIFIS."
+                    "product_config": {
+                        "product_code": "prestamo_imss",
+                        "product_name": "Préstamo IMSS Ley 73",
+                        "priority": "A",
+                        "requirements": ["ine", "estado_de_cuenta"],
+                        "stage_scripts": {
+                            "qualification": "Hola, te comparto los requisitos para tu Préstamo IMSS.",
+                            "default": "Seguimos con tu proceso COHIFIS."
+                        },
+                        "commission_rate": 0.08
                     },
-                    "commission_rate": 0.08
-                },
-                "classification": {"intent": "lead_new", "confidence": 0.95},
-                "advisor_id": "don_chiwy",
-                "channel": "whatsapp",
-                "source": "bot_vicky_redes",
-                "metadata": {
-                    "nombre": data.get("nombre", ""),
-                    "pension": data.get("pension", ""),
-                    "monto": data.get("monto", ""),
-                    "inbursa": data.get("inbursa", "")
+                    "classification": {"intent": "lead_new", "confidence": 0.95},
+                    "advisor_id": "don_chiwy",
+                    "channel": "whatsapp",
+                    "source": "bot_vicky_redes",
+                    "metadata": {
+                        "nombre": data.get("nombre", ""),
+                        "pension": data.get("pension", ""),
+                        "monto": data.get("monto", ""),
+                        "inbursa": data.get("inbursa", "")
+                    }
                 }
-            }
-            _resp = _req.post(
-                _hydra_url,
-                json=_hydra_payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Boardroom-Token": _hydra_token
-                },
-                timeout=8
-            )
-            print(f"hydra_trigger: status={_resp.status_code} lead={phone}", flush=True)
+                _headers = {"Content-Type": "application/json"}
+                if HYDRA_TOKEN:
+                    _headers["X-Boardroom-Token"] = HYDRA_TOKEN
+                log.info("hydra_trigger_start lead=%s svc=imss_prospect", phone)
+                _resp = requests.post(HYDRA_URL, json=_hydra_payload, headers=_headers, timeout=HYDRA_TIMEOUT)
+                log.info("hydra_trigger status=%s lead=%s", _resp.status_code, phone)
+                if _resp.status_code not in (200, 201, 202):
+                    log.warning("hydra_trigger_bad_status lead=%s body=%s", phone, _resp.text[:250])
         except Exception as _e:
-            print(f"hydra_trigger_failed: {_e}", flush=True)
+            log.exception("hydra_trigger_failed lead=%s err=%s", phone, _e)
         reset(phone)
         return
 
@@ -747,13 +886,49 @@ _MENU_EXACT = {
     "servicios", "opciones", "catalogo", "productos",
     "que manejas", "que ofrecen", "que ofreces", "que tienes", "que tienen",
     "que servicios tienen", "que servicios ofrecen",
-    "quiero ver opciones", "en que me puedes ayudar", "para que sirves",
+    "quiero ver opciones", "ver menu", "ver el menu", "mostrar menu",
 }
 _MENU_CONTAINS = {"que servicios", "ver el menu", "mostrar opciones", "ver opciones"}
 
-_FIN_KW = {"seguro", "prestamo", "credito", "financiamiento", "inbursa",
-           "pension", "jubilado", "cotizar", "califico", "requisito", "tarjeta", "medico"}
+_FIN_KW = {
+    "seguro", "seguros", "cobertura", "coberturas", "poliza", "polizas",
+    "prestamo", "prestamos", "credito", "creditos", "financiamiento",
+    "inbursa", "pension", "pensionado", "pensionada", "jubilado", "jubilada",
+    "cotizar", "califico", "requisito", "requisitos", "tarjeta",
+    "medico", "medica", "medicos", "medicas", "gmm", "auto", "carro",
+    "vehiculo", "vrim", "empresa", "empresarial", "ley", "73"
+}
 
+_Q_WORDS = {
+    "que", "como", "cual", "cuales", "cuanto", "cuantos",
+    "donde", "cuando", "por", "porque", "requisito", "requisitos",
+    "duda", "explica", "explicas", "ayuda", "ayudar", "cotizar"
+}
+
+_Q_PHRASES = {
+    "tengo duda", "me puedes ayudar", "me puedes explicar", "quiero saber",
+    "quisiera saber", "tengo una duda", "me orientas", "me apoyas",
+    "como funciona", "cuales son", "que incluye", "que cubre",
+    "me puedes decir", "necesito informacion"
+}
+
+def _is_open_question(raw: str, n: str) -> bool:
+    toks = set(n.split())
+    if "?" in raw or "¿" in raw:
+        return True
+    if any(p in n for p in _Q_PHRASES):
+        return True
+    if "duda" in toks:
+        return True
+    if len(toks) >= 5 and toks & _Q_WORDS:
+        return True
+    return False
+
+def _is_financial_context(n: str, svc: str | None = None) -> bool:
+    toks = set(n.split())
+    return bool(svc) or bool(toks & _FIN_KW)
+
+# ── Procesamiento del mensaje ─────────────────────────────────────────────────
 # ── Procesamiento del mensaje ─────────────────────────────────────────────────
 def handle(msg_obj: dict) -> None:
     phone = msg_obj.get("from", "")
@@ -839,12 +1014,23 @@ def handle(msg_obj: dict) -> None:
         return
 
     svc = detect_svc(text)
+    is_question = _is_open_question(text, n)
+    in_finance = _is_financial_context(n, svc)
+
+    if svc and is_question:
+        send_msg(phone, ask_hydra_or_gpt(phone, text, svc))
+        return
+
     if svc:
         route(phone, svc)
         return
 
-    if set(n.split()) & _FIN_KW:
-        send_msg(phone, ask_gpt(text))
+    if is_question and in_finance:
+        send_msg(phone, ask_hydra_or_gpt(phone, text, svc))
+        return
+
+    if in_finance:
+        send_msg(phone, ask_hydra_or_gpt(phone, text, svc))
         return
 
     show_menu(phone)
