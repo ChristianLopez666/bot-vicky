@@ -7,6 +7,7 @@ import hashlib
 import threading
 import unicodedata
 import uuid
+import time
 from collections import deque
 from datetime import datetime, timezone, timedelta
 
@@ -14,6 +15,36 @@ import requests
 import openai
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+from types import SimpleNamespace
+
+try:
+    from authority_matrix import AuthorityActor, EventSeverity
+    from hydra_orchestrator import ExecutionPlan, HydraOrchestrator, PlanDisposition
+    from policy_envelope import (
+        Agent,
+        Channel as BoardroomChannel,
+        Criticality,
+        FallbackMode,
+        PolicyEnvelope,
+        Source,
+        SystemOfRecord,
+        TaskType,
+    )
+    from task import Task, TaskState
+    from fallback_manager import FallbackManager, FallbackTrigger
+    from flow_gemma_decision_layer import GemmaDecisionLayerFlow
+    from notifier import BoardroomNotifier, NotificationConfig
+    from valkey_store import (
+        AgentTraceRecord,
+        TraceStage,
+        TraceStatus,
+        ValkeyStore,
+        ValkeyStoreConfig,
+    )
+    from sheets_ledger import IncidentCode, LedgerIncident, SheetsLedger, SheetsLedgerConfig
+    _boardroom_libs = True
+except Exception:
+    _boardroom_libs = False
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO,
@@ -37,6 +68,14 @@ try:
 except ImportError:
     _glibs = False
     log.warning("⚠️ google-api-python-client no instalado. Sheets deshabilitado.")
+
+try:
+    import redis
+    _redis_libs = True
+except ImportError:
+    redis = None
+    _redis_libs = False
+    log.warning("⚠️ redis no instalado. Persistencia en memoria.")
 
 # ── Variables de entorno ──────────────────────────────────────────────────────
 load_dotenv()
@@ -66,6 +105,190 @@ GG_CREDS  = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
 SHEET_ID  = os.getenv("SHEETS_ID_CONVERSACIONES", "").strip()
 SHEET_TAB = os.getenv("SHEETS_TAB_CONVERSACIONES", "Conversaciones").strip()
 
+BOARDROOM_LEDGER_SHEET_ID = os.getenv("BOARDROOM_LEDGER_SHEET_ID", "").strip()
+BOARDROOM_VALKEY_URL = (
+    os.getenv("VALKEY_URL", "").strip()
+    or os.getenv("REDIS_URL", "").strip()
+    or os.getenv("KV_URL", "").strip()
+)
+
+if _boardroom_libs:
+    # Shim de compatibilidad:
+    # activation_criteria.py y flow_gemma_decision_layer.py consumen aliases que no
+    # están expuestos por hydra_orchestrator.py en todos los ambientes cerrados v1.
+    # Se agregan aquí sin alterar los módulos auditados.
+    if not hasattr(HydraOrchestrator, "route_policy_envelope"):
+        def _route_policy_envelope_compat(self, policy_envelope, *, trace_id=None,
+                                          conversation_id=None, request_id=None,
+                                          metadata=None):
+            task = self.create_task(
+                policy_envelope,
+                trace_id=trace_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                metadata=metadata or {},
+            )
+            execution_plan = self.build_execution_plan(task)
+            return SimpleNamespace(task=task, execution_plan=execution_plan)
+        HydraOrchestrator.route_policy_envelope = _route_policy_envelope_compat
+
+    if not hasattr(ExecutionPlan, "primary_agent"):
+        ExecutionPlan.primary_agent = property(
+            lambda self: Agent(self.selected_actor.value)
+            if self.selected_actor.value in Agent._value2member_map_
+            else None
+        )
+    if not hasattr(ExecutionPlan, "authority_events"):
+        ExecutionPlan.authority_events = property(lambda self: list(self.events))
+    if not hasattr(ExecutionPlan, "conflicts"):
+        ExecutionPlan.conflicts = property(lambda self: [])
+    if not hasattr(PlanDisposition, "ROUTED"):
+        PlanDisposition.ROUTED = PlanDisposition.EXECUTE
+
+
+STATE_TTL = 24 * 60 * 60
+
+class StateStore:
+    def __init__(self, ttl: int = STATE_TTL):
+        self.ttl = ttl
+        self._redis = None
+        self._state_mem = {}
+        self._data_mem = {}
+        redis_url = (os.getenv("KV_URL", "").strip() or os.getenv("REDIS_URL", "").strip())
+        if redis_url and _redis_libs:
+            try:
+                self._redis = redis.Redis.from_url(redis_url, decode_responses=True)
+                self._redis.ping()
+                log.info("✅ StateStore conectado a Redis/Valkey.")
+            except Exception as e:
+                self._redis = None
+                log.warning("⚠️ Redis/Valkey no disponible. Usando memoria. err=%s", e)
+        elif redis_url and not _redis_libs:
+            log.warning("⚠️ KV_URL/REDIS_URL configurado pero redis no está instalado. Usando memoria.")
+        else:
+            log.warning("⚠️ KV_URL/REDIS_URL no configurado. Estado en memoria.")
+
+    def _key(self, kind: str, phone: str) -> str:
+        ph = re.sub(r"\D", "", str(phone))
+        return f"vicky:{kind}:{ph}"
+
+    def get_state(self, phone: str, default: str = "") -> str:
+        if self._redis:
+            key = self._key("state", phone)
+            val = self._redis.get(key)
+            if val is not None:
+                self._redis.expire(key, self.ttl)
+                return val
+            return default
+        return self._state_mem.get(str(phone), default)
+
+    def set_state(self, phone: str, state: str) -> None:
+        if self._redis:
+            self._redis.setex(self._key("state", phone), self.ttl, state or "")
+            return
+        self._state_mem[str(phone)] = state or ""
+
+    def pop_state(self, phone: str, default=None):
+        if self._redis:
+            key = self._key("state", phone)
+            val = self._redis.get(key)
+            self._redis.delete(key)
+            return val if val is not None else default
+        return self._state_mem.pop(str(phone), default)
+
+    def get_data(self, phone: str, default=None):
+        default = {} if default is None else default
+        if self._redis:
+            key = self._key("data", phone)
+            raw = self._redis.get(key)
+            if raw is None:
+                return dict(default) if isinstance(default, dict) else default
+            self._redis.expire(key, self.ttl)
+            try:
+                val = json.loads(raw)
+                return val if isinstance(val, dict) else (dict(default) if isinstance(default, dict) else default)
+            except Exception:
+                return dict(default) if isinstance(default, dict) else default
+        val = self._data_mem.get(str(phone))
+        if val is None:
+            return dict(default) if isinstance(default, dict) else default
+        return val
+
+    def set_data(self, phone: str, data: dict) -> None:
+        data = data if isinstance(data, dict) else {}
+        if self._redis:
+            self._redis.setex(self._key("data", phone), self.ttl, json.dumps(data, ensure_ascii=False))
+            return
+        self._data_mem[str(phone)] = data
+
+    def pop_data(self, phone: str, default=None):
+        if self._redis:
+            key = self._key("data", phone)
+            raw = self._redis.get(key)
+            self._redis.delete(key)
+            if raw is None:
+                return default
+            try:
+                return json.loads(raw)
+            except Exception:
+                return default
+        return self._data_mem.pop(str(phone), default)
+
+class _StateMap:
+    def __init__(self, store: StateStore):
+        self.store = store
+
+    def get(self, key, default=None):
+        return self.store.get_state(key, "" if default is None else default)
+
+    def __getitem__(self, key):
+        val = self.store.get_state(key, None)
+        if val is None:
+            raise KeyError(key)
+        return val
+
+    def __setitem__(self, key, value):
+        self.store.set_state(key, value)
+
+    def pop(self, key, default=None):
+        return self.store.pop_state(key, default)
+
+    def setdefault(self, key, default=None):
+        cur = self.store.get_state(key, None)
+        if cur is None:
+            self.store.set_state(key, "" if default is None else default)
+            return "" if default is None else default
+        return cur
+
+class _DataMap:
+    def __init__(self, store: StateStore):
+        self.store = store
+
+    def get(self, key, default=None):
+        return self.store.get_data(key, {} if default is None else default)
+
+    def __getitem__(self, key):
+        val = self.store.get_data(key, None)
+        if val is None:
+            raise KeyError(key)
+        return val
+
+    def __setitem__(self, key, value):
+        self.store.set_data(key, value)
+
+    def pop(self, key, default=None):
+        return self.store.pop_data(key, default)
+
+    def setdefault(self, key, default=None):
+        cur = self.store.get_data(key, None)
+        if cur is None:
+            val = {} if default is None else default
+            self.store.set_data(key, val)
+            return val
+        return cur
+
+
+
 # ── OpenAI ────────────────────────────────────────────────────────────────────
 _oai = None
 if OPENAI_KEY:
@@ -79,8 +302,423 @@ else:
 
 # ── Flask + estado ────────────────────────────────────────────────────────────
 app = Flask(__name__)
-user_state: dict = {}
-user_data: dict = {}
+_state_store = StateStore()
+user_state = _StateMap(_state_store)
+user_data = _DataMap(_state_store)
+
+# ── Boardroom Engine v1 / Hydra local ────────────────────────────────────────
+_BOARDROOM_OWNER = "app_vicky_hydra_v2"
+_BOARDROOM_MODULE = "app_vicky_hydra_v2"
+_BOARDROOM_CONTRACT_VERSION = "boardroom.v1.agent-contract"
+
+_boardroom_hydra = None
+_boardroom_fallback = None
+_boardroom_gemma_flow = None
+_boardroom_notifier = None
+_boardroom_valkey = None
+_boardroom_ledger = None
+
+
+def _boardroom_enabled() -> bool:
+    return _boardroom_libs and _boardroom_hydra is not None
+
+
+def _init_boardroom_runtime() -> None:
+    global _boardroom_hydra, _boardroom_fallback, _boardroom_gemma_flow
+    global _boardroom_notifier, _boardroom_valkey, _boardroom_ledger
+
+    if not _boardroom_libs:
+        log.warning("⚠️ Boardroom Engine v1 no disponible; Hydra local deshabilitado.")
+        return
+
+    try:
+        _boardroom_hydra = HydraOrchestrator(default_owner=_BOARDROOM_OWNER)
+        _boardroom_fallback = FallbackManager(orchestrator=_boardroom_hydra)
+        log.info("✅ Hydra local Boardroom v1 inicializado.")
+    except Exception:
+        _boardroom_hydra = None
+        _boardroom_fallback = None
+        log.exception("❌ No se pudo inicializar Hydra local Boardroom v1.")
+        return
+
+    if BOARDROOM_VALKEY_URL:
+        try:
+            _boardroom_valkey = ValkeyStore(
+                ValkeyStoreConfig(redis_url=BOARDROOM_VALKEY_URL)
+            )
+            log.info("✅ Boardroom ValkeyStore inicializado.")
+        except Exception:
+            _boardroom_valkey = None
+            log.exception("❌ No se pudo inicializar Boardroom ValkeyStore.")
+    else:
+        log.warning("⚠️ VALKEY_URL/REDIS_URL/KV_URL no configurado para Boardroom ValkeyStore.")
+
+    if META_TOKEN and WABA_ID and ADVISOR_NUM:
+        try:
+            _boardroom_notifier = BoardroomNotifier(
+                NotificationConfig(
+                    meta_token=META_TOKEN,
+                    waba_phone_id=WABA_ID,
+                    approver_whatsapp=ADVISOR_NUM,
+                    valkey_url=BOARDROOM_VALKEY_URL or None,
+                    dry_run=False,
+                )
+            )
+            log.info("✅ BoardroomNotifier inicializado.")
+        except Exception:
+            _boardroom_notifier = None
+            log.exception("❌ No se pudo inicializar BoardroomNotifier.")
+
+    if _boardroom_valkey and BOARDROOM_LEDGER_SHEET_ID and GG_CREDS:
+        try:
+            _boardroom_ledger = SheetsLedger(
+                config=SheetsLedgerConfig(
+                    sheet_id=BOARDROOM_LEDGER_SHEET_ID,
+                    credentials_json=GG_CREDS,
+                    dry_run=False,
+                ),
+                valkey_store=_boardroom_valkey,
+            )
+            log.info("✅ Boardroom SheetsLedger inicializado.")
+        except Exception:
+            _boardroom_ledger = None
+            log.exception("❌ No se pudo inicializar Boardroom SheetsLedger.")
+
+    try:
+        _boardroom_gemma_flow = GemmaDecisionLayerFlow(
+            fallback_manager=_boardroom_fallback,
+            notifier=_boardroom_notifier,
+            auto_init_notifier=False,
+        )
+        log.info("✅ GemmaDecisionLayerFlow inicializado.")
+    except Exception:
+        _boardroom_gemma_flow = None
+        log.exception("❌ No se pudo inicializar GemmaDecisionLayerFlow.")
+
+
+def _boardroom_trace(task: Task | None, actor: AuthorityActor,
+                     stage: TraceStage, status: TraceStatus, summary: str,
+                     metadata: dict | None = None) -> None:
+    if not (_boardroom_valkey and task):
+        return
+    try:
+        _boardroom_valkey.append_agent_trace(
+            AgentTraceRecord(
+                task_id=task.task_id,
+                actor=actor,
+                stage=stage,
+                status=status,
+                summary=summary,
+                metadata=metadata or {},
+            )
+        )
+    except Exception:
+        log.exception("❌ Error persistiendo AgentTraceRecord en Valkey.")
+
+
+def _boardroom_record_task(task: Task | None, authority_events: list | None = None) -> None:
+    if task is None:
+        return
+    authority_events = authority_events or []
+
+    if _boardroom_valkey:
+        try:
+            _boardroom_valkey.write_task_ledger(task)
+            for event in authority_events:
+                _boardroom_valkey.append_authority_event(event)
+        except Exception:
+            log.exception("❌ Error persistiendo task/eventos en Boardroom ValkeyStore.")
+
+    if _boardroom_ledger:
+        try:
+            _boardroom_ledger.record_task_snapshot(task)
+            for event in authority_events:
+                _boardroom_ledger.append_authority_event(event)
+        except Exception:
+            log.exception("❌ Error persistiendo task/eventos en Boardroom SheetsLedger.")
+
+
+def _boardroom_record_incident(task: Task | None, incident_code: IncidentCode,
+                               summary: str, *, severity: EventSeverity = EventSeverity.HIGH,
+                               reason_code: str | None = None,
+                               actor: str | None = None,
+                               metadata: dict | None = None) -> None:
+    if not (_boardroom_ledger and task):
+        return
+    try:
+        _boardroom_ledger.append_incident(
+            LedgerIncident(
+                incident_code=incident_code,
+                task_id=task.task_id,
+                summary=summary,
+                severity=severity,
+                source=_BOARDROOM_MODULE,
+                current_state=task.current_state.value,
+                reason_code=reason_code,
+                actor=actor,
+                metadata=metadata or {},
+            )
+        )
+    except Exception:
+        log.exception("❌ Error registrando incidente Boardroom.")
+
+
+def _boardroom_notify(task: Task | None, *, authority_events: list | None = None,
+                      summary: str | None = None) -> None:
+    authority_events = authority_events or []
+    delivered = False
+
+    if _boardroom_notifier and task is not None:
+        try:
+            for event in authority_events:
+                result = _boardroom_notifier.notify_authority_event(
+                    task, event, source_module=_BOARDROOM_MODULE
+                )
+                if result is not None and getattr(result.status, "value", "") in {"sent", "persisted_only"}:
+                    delivered = True
+
+            result = _boardroom_notifier.notify_task_state(
+                task,
+                triggered_by=_BOARDROOM_OWNER,
+                source_module=_BOARDROOM_MODULE,
+                summary=summary,
+            )
+            if result is not None and getattr(result.status, "value", "") in {"sent", "persisted_only"}:
+                delivered = True
+        except Exception:
+            log.exception("❌ Error enviando notificación Boardroom.")
+
+    if not delivered and summary:
+        notify_advisor(f"📣 BOARDROOM\nTarea: {task.task_id if task else 'ND'}\n{summary}")
+
+
+def _boardroom_apply_failure_fallback(task: Task | None, summary: str,
+                                      *, metadata: dict | None = None) -> None:
+    if task is None or _boardroom_fallback is None:
+        return
+    try:
+        resolution = _boardroom_fallback.handle_event(
+            task,
+            AuthorityActor.HYDRA,
+            FallbackTrigger.FAILURE,
+            summary=summary,
+            metadata=metadata or {},
+        )
+        _boardroom_record_task(task, authority_events=list(resolution.record.authority_events))
+        _boardroom_notify(
+            task,
+            authority_events=list(resolution.record.authority_events),
+            summary=summary,
+        )
+        incident_code = IncidentCode.HOLD if task.current_state == TaskState.HOLD else IncidentCode.FAILED
+        _boardroom_record_incident(
+            task,
+            incident_code,
+            summary,
+            reason_code=resolution.record.code.value,
+            actor=AuthorityActor.HYDRA.value,
+            metadata=metadata or {},
+        )
+    except Exception:
+        log.exception("❌ Error aplicando fallback Boardroom.")
+
+
+def _service_to_product_code(svc: str | None) -> str:
+    return {
+        "imss": "prestamo_imss",
+        "auto": "seguro_auto",
+        "vida": "vida_salud",
+        "vrim": "vrim",
+        "emp": "credito_empresarial",
+        "fp": "financiamiento_practico",
+    }.get((svc or "").strip(), "general")
+
+
+def _conversation_intent(text: str) -> str:
+    n = norm(text)
+    if any(k in n for k in ("estatus", "seguimiento", "folio", "avance")):
+        return "policy_status"
+    if any(k in n for k in ("pago", "pagos", "mensualidad", "mensualidades")):
+        return "payment_question"
+    if any(k in n for k in ("requisito", "requisitos", "documento", "documentos", "papeles", "ine")):
+        return "document_request"
+    if any(k in n for k in ("cotiza", "cotizacion", "precio", "cuanto", "monto", "simular")):
+        return "quote_request"
+    if any(k in n for k in ("llamen", "asesor", "contacten", "ayuda humana")):
+        return "human_help"
+    return "general_question"
+
+
+def _requires_human_guardrail(text: str) -> tuple[bool, bool, bool]:
+    n = norm(text)
+    business_action_requested = any(
+        k in n for k in (
+            "autoriza", "aprobar", "activar", "cancelar", "contratar",
+            "depositar", "transferir", "pagar", "registrar", "dar de alta"
+        )
+    )
+    persistent_state_mutation_requested = any(
+        k in n for k in (
+            "cambia mi", "actualiza mi", "modifica mi", "corrige mi",
+            "edita mi", "actualizar datos", "cambiar datos"
+        )
+    )
+    business_data = any(
+        k in n for k in (
+            "curp", "rfc", "nss", "seguro social", "numero de poliza",
+            "número de póliza", "cuenta bancaria", "clabe"
+        )
+    )
+    return business_action_requested, persistent_state_mutation_requested, business_data
+
+
+def _safe_reply_for_service(text: str, svc: str | None) -> tuple[str, str]:
+    service = (svc or "").strip()
+    n = norm(text)
+    if service == "imss":
+        if any(k in n for k in ("requisito", "requisitos", "papeles", "documento")):
+            return (
+                "document_request",
+                "Con gusto te oriento con el Préstamo IMSS Ley 73. Para revisar tu perfil necesito saber si tu pensión es del IMSS bajo Ley 73 y de cuánto es aproximadamente. ¿Me compartes esos dos datos?"
+            )
+        return (
+            "quote_request" if any(k in n for k in ("monto", "prestamo", "credito", "cuanto")) else "general_question",
+            "Sí te puedo orientar con el Préstamo IMSS Ley 73. Para darte información exacta necesito confirmar si eres pensionado del IMSS Ley 73 y el monto aproximado de tu pensión. ¿Cuál es tu pensión mensual?"
+        )
+    if service == "auto":
+        return (
+            "quote_request",
+            "Con gusto te ayudo con tu seguro de auto. La cotización depende del vehículo y perfil. ¿Me compartes marca, modelo y año de tu auto?"
+        )
+    if service == "vida":
+        return (
+            "quote_request",
+            "Te ayudo con vida y gastos médicos. Para orientarte bien necesito saber qué buscas: vida, gastos médicos mayores o ambas coberturas. ¿Cuál te interesa?"
+        )
+    if service == "vrim":
+        return (
+            "general_question",
+            "VRIM es una membresía médica. Para orientarte mejor necesito saber si la quieres solo para ti o para más personas. ¿Cuántas personas serían?"
+        )
+    if service == "emp":
+        return (
+            "quote_request",
+            "Te apoyo con financiamiento empresarial. Para darte una guía correcta necesito saber a qué se dedica tu empresa y qué monto buscas. ¿Cuál es el giro y cuánto necesitas?"
+        )
+    if service == "fp":
+        return (
+            "quote_request",
+            "Te ayudo con financiamiento práctico. Para orientarte con precisión necesito saber el monto y el tiempo en que lo requieres. ¿Cuánto necesitas y para cuándo?"
+        )
+    return (
+        _conversation_intent(text),
+        "Con gusto te oriento sobre préstamo IMSS, seguro de auto, vida/GMM, VRIM, financiamiento empresarial o financiamiento práctico. ¿Cuál de estos servicios te interesa?"
+    )
+
+
+def _build_conversation_policy(phone: str, text: str, svc: str | None = None) -> PolicyEnvelope:
+    return PolicyEnvelope(
+        task_id=str(uuid.uuid4()),
+        source=Source.CLIENT,
+        channel=BoardroomChannel.WHATSAPP,
+        task_type=TaskType.CONVERSATION,
+        intent=_conversation_intent(text),
+        criticality=Criticality.LOW,
+        confidence=0.92,
+        requires_google_state=False,
+        requires_audit=False,
+        requires_human_approval=False,
+        fast_path=False,
+        allowed_agents=[Agent.GEMMA],
+        system_of_record=SystemOfRecord.INTERNAL,
+        fallback_mode=FallbackMode.SAFE_REPLY,
+        audit_required_for_release=False,
+        notify_on_waiting_audit=False,
+    )
+
+
+def _build_lead_policy(phone: str, product_code: str, confidence: float = 0.95) -> PolicyEnvelope:
+    # Supuesto operativo:
+    # Boardroom v1 no define task_type comercial. Para no alterar módulos cerrados,
+    # lead_new se modela como conversación escalada a autoridad humana, conservando
+    # el contrato semántico real en metadata: hydra_event_type=lead_new.
+    return PolicyEnvelope(
+        task_id=str(uuid.uuid4()),
+        source=Source.CLIENT,
+        channel=BoardroomChannel.WHATSAPP,
+        task_type=TaskType.CONVERSATION,
+        intent="schedule_followup",
+        criticality=Criticality.MEDIUM,
+        confidence=round(float(confidence), 4),
+        requires_google_state=False,
+        requires_audit=False,
+        requires_human_approval=True,
+        fast_path=False,
+        allowed_agents=[Agent.GEMMA],
+        system_of_record=SystemOfRecord.INTERNAL,
+        fallback_mode=FallbackMode.MANUAL_REVIEW,
+        audit_required_for_release=False,
+        notify_on_waiting_audit=False,
+    )
+
+
+def _build_gemma_output_payload(task: Task, text: str, svc: str | None = None) -> dict:
+    service_hint = (svc or "").strip()
+    intent, response_text = _safe_reply_for_service(text, service_hint)
+    business_action_requested, persistent_state_mutation_requested, business_data = _requires_human_guardrail(text)
+    decision = "conversation_request_clarification" if service_hint == "" else "conversation_safe_reply"
+    result_data = {
+        "intent": intent,
+        "catalog_intent": intent,
+        "catalog_match": True,
+        "out_of_catalog": False,
+        "business_action_requested": business_action_requested,
+        "persistent_state_mutation_requested": persistent_state_mutation_requested,
+        "business_data": business_data,
+        "sensitive_action": business_action_requested or persistent_state_mutation_requested,
+        "service_hint": service_hint or "general",
+    }
+    if decision == "conversation_request_clarification":
+        result_data["clarification"] = response_text
+    else:
+        result_data["reply"] = response_text
+
+    return {
+        "task_id": task.task_id,
+        "agent": Agent.GEMMA.value,
+        "contract_version": _BOARDROOM_CONTRACT_VERSION,
+        "decision": decision,
+        "confidence": 0.92,
+        "status": "completed",
+        "result_data": result_data,
+    }
+
+
+def _build_standard_hydra_response(task: Task, plan, *, reply_text: str | None,
+                                   mode: str, summary: str,
+                                   metadata: dict | None = None) -> dict:
+    return {
+        "task_id": task.task_id,
+        "status": "ok",
+        "response": {
+            "reply_text": reply_text,
+            "mode": mode,
+            "summary": summary,
+        },
+        "task": task.to_dict(),
+        "execution_plan": plan.to_dict() if plan is not None else None,
+        "metadata": metadata or {},
+    }
+
+
+def _conversation_hold_reply() -> str:
+    return (
+        "Gracias por tu mensaje. Para darte una respuesta exacta lo canalicé con el asesor. "
+        "¿Me compartes tu nombre completo para seguimiento?"
+    )
+
+
+_init_boardroom_runtime()
 
 # ── Idempotencia ──────────────────────────────────────────────────────────────
 _seen_ids: set = set()
@@ -357,99 +995,211 @@ def ask_gpt(prompt: str, svc: str | None = None) -> str:
         return "Ocurrió un error. ¿Sobre qué servicio te puedo orientar?"
 
 def _extract_hydra_reply(data):
-    if isinstance(data, str):
-        return data.strip()
     if not isinstance(data, dict):
         return None
-
-    direct_keys = (
-        "reply", "response", "response_text", "answer", "message",
-        "assistant_message", "text", "output", "content"
-    )
-    for key in direct_keys:
-        val = data.get(key)
+    response = data.get("response")
+    if not isinstance(response, dict):
+        return None
+    for key in ("reply_text", "safe_reply", "clarification"):
+        val = response.get(key)
         if isinstance(val, str) and val.strip():
             return val.strip()
-
-    nested = data.get("result")
-    if isinstance(nested, dict):
-        for key in direct_keys:
-            val = nested.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-
-    actions = data.get("actions")
-    if isinstance(actions, list):
-        for item in actions:
-            if isinstance(item, dict):
-                for key in ("message", "text", "body"):
-                    val = item.get(key)
-                    if isinstance(val, str) and val.strip():
-                        return val.strip()
     return None
 
-def ask_hydra(phone: str, text: str, svc: str | None = None):
-    if not HYDRA_URL:
-        return None
 
-    product_code = {
-        "imss": "prestamo_imss",
-        "auto": "seguro_auto",
-        "vida": "vida_salud",
-        "vrim": "vrim",
-        "emp": "credito_empresarial",
-        "fp": "financiamiento_practico",
-    }.get(svc or "", "general")
-
-    payload = {
-        "event_id": str(uuid.uuid4()),
-        "lead_id": phone,
-        "event_type": "open_question",
-        "product_code": product_code,
-        "classification": {"intent": "open_question", "confidence": 0.93},
-        "advisor_id": "don_chiwy",
-        "channel": "whatsapp",
-        "source": "bot_vicky_redes",
-        "message_text": text,
-        "metadata": {
-            "nombre": _nombre(phone),
-            "service_hint": svc or "general",
-            "state": user_state.get(phone, ""),
-        }
-    }
-
-    headers = {"Content-Type": "application/json"}
-    if HYDRA_TOKEN:
-        headers["X-Boardroom-Token"] = HYDRA_TOKEN
-
-    try:
-        log.info("hydra_trigger_start lead=%s svc=%s", phone, svc or "general")
-        resp = requests.post(HYDRA_URL, json=payload, headers=headers, timeout=HYDRA_TIMEOUT)
-        log.info("hydra_trigger status=%s lead=%s", resp.status_code, phone)
-        if resp.status_code not in (200, 201, 202):
-            log.warning("hydra_trigger_bad_status lead=%s body=%s", phone, resp.text[:250])
-            return None
+def _hydra_post_with_retry(url: str, payload: dict, headers: dict, timeout: int, lead: str):
+    for attempt in range(3):
         try:
-            data = resp.json()
-        except Exception:
-            log.warning("hydra_trigger_non_json lead=%s body=%s", phone, resp.text[:250])
-            return None
-        reply = _extract_hydra_reply(data)
-        if reply:
-            return reply
-        log.warning("hydra_trigger_no_reply lead=%s", phone)
+            resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+            log.info("hydra_trigger status=%s lead=%s attempt=%s", resp.status_code, lead, attempt + 1)
+            if resp.status_code in (200, 201, 202):
+                return resp
+            log.warning("hydra_trigger_bad_status lead=%s attempt=%s body=%s", lead, attempt + 1, resp.text[:250])
+        except Exception as e:
+            if attempt == 2:
+                log.exception("hydra_trigger_failed lead=%s err=%s", lead, e)
+            else:
+                log.warning("hydra_trigger_retry lead=%s attempt=%s err=%s", lead, attempt + 1, e)
+        if attempt < 2:
+            time.sleep(1)
+    return None
+
+def _trigger_hydra_lead(phone: str, product_code: str, metadata: dict | None = None,
+                        product_name: str | None = None, product_config: dict | None = None,
+                        confidence: float = 0.95, source: str = "bot_vicky_redes",
+                        svc_log: str | None = None):
+    if not _boardroom_enabled():
+        log.error("❌ Hydra local Boardroom v1 no está disponible para lead_new.")
         return None
-    except Exception as e:
-        log.exception("hydra_trigger_failed lead=%s err=%s", phone, e)
+
+    metadata = dict(metadata or {})
+    metadata.update({
+        "hydra_event_type": "lead_new",
+        "product_code": product_code,
+        "product_name": product_name or product_code,
+        "product_config": product_config or {},
+        "channel": "whatsapp",
+        "source": source,
+        "service_log": svc_log or product_code,
+        "phone": phone,
+    })
+
+    task = None
+    try:
+        policy = _build_lead_policy(phone, product_code, confidence=confidence)
+        task, plan = _boardroom_hydra.orchestrate_policy(
+            policy,
+            trace_id=str(uuid.uuid4()),
+            conversation_id=re.sub(r"\D", "", str(phone)),
+            request_id=_mid() or str(uuid.uuid4()),
+            metadata=metadata,
+            apply_plan=True,
+        )
+        _boardroom_trace(
+            task,
+            AuthorityActor.HYDRA,
+            TraceStage.ROUTING,
+            TraceStatus.SUCCEEDED,
+            f"Lead '{product_code}' registrado en Hydra local.",
+            metadata={"svc_log": svc_log or product_code, "hydra_event_type": "lead_new"},
+        )
+        _boardroom_record_task(task, authority_events=list(plan.events))
+        _boardroom_notify(
+            task,
+            authority_events=list(plan.events),
+            summary=f"Lead '{product_code}' escalado para seguimiento comercial.",
+        )
+        return _build_standard_hydra_response(
+            task,
+            plan,
+            reply_text=None,
+            mode="manual_review",
+            summary="Lead registrado y escalado a revisión humana.",
+            metadata={"hydra_event_type": "lead_new"},
+        )
+    except Exception as exc:
+        log.exception("❌ Error registrando lead_new en Hydra local: %s", exc)
+        if task is not None:
+            _boardroom_trace(
+                task,
+                AuthorityActor.HYDRA,
+                TraceStage.ROUTING,
+                TraceStatus.FAILED,
+                "Fallo registrando lead_new en Hydra local.",
+                metadata={"error": str(exc)[:300], "hydra_event_type": "lead_new"},
+            )
+            _boardroom_apply_failure_fallback(
+                task,
+                "Falló el registro del lead en Hydra local.",
+                metadata={"error": str(exc)[:300], "hydra_event_type": "lead_new"},
+            )
         return None
+
+
+def ask_hydra(phone: str, text: str, svc: str | None = None):
+    if not _boardroom_enabled():
+        return None
+
+    task = None
+    try:
+        policy = _build_conversation_policy(phone, text, svc)
+        task, plan = _boardroom_hydra.orchestrate_policy(
+            policy,
+            trace_id=str(uuid.uuid4()),
+            conversation_id=re.sub(r"\D", "", str(phone)),
+            request_id=_mid() or str(uuid.uuid4()),
+            metadata={
+                "hydra_event_type": "conversation_message",
+                "message_text": text,
+                "service_hint": svc or "general",
+                "nombre": _nombre(phone),
+                "state": user_state.get(phone, ""),
+                "phone": phone,
+                "product_code": _service_to_product_code(svc),
+            },
+            apply_plan=True,
+        )
+        _boardroom_trace(
+            task,
+            AuthorityActor.HYDRA,
+            TraceStage.ROUTING,
+            TraceStatus.SUCCEEDED,
+            "Conversación enrutada por Hydra local.",
+            metadata={"service_hint": svc or "general", "hydra_event_type": "conversation_message"},
+        )
+        _boardroom_record_task(task, authority_events=list(plan.events))
+
+        if _boardroom_gemma_flow is None:
+            raise RuntimeError("GemmaDecisionLayerFlow no está disponible.")
+
+        gemma_payload = _build_gemma_output_payload(task, text, svc)
+        flow_result = _boardroom_gemma_flow.receive_gemma_capture(task, gemma_payload)
+        authority_events = list(flow_result.authority_events)
+        if flow_result.fallback_resolution is not None:
+            authority_events.extend(list(flow_result.fallback_resolution.record.authority_events))
+
+        _boardroom_record_task(task, authority_events=authority_events)
+
+        if task.current_state == TaskState.DONE and task.metadata.get("safe_reply_text"):
+            payload = _build_standard_hydra_response(
+                task,
+                plan,
+                reply_text=str(task.metadata.get("safe_reply_text")).strip(),
+                mode="safe_reply",
+                summary="Conversation_message resuelta por flow_gemma_decision_layer.",
+                metadata={"hydra_event_type": "conversation_message"},
+            )
+            return _extract_hydra_reply(payload)
+
+        if task.current_state in {TaskState.ESCALATED, TaskState.HOLD, TaskState.WAITING_AUDIT, TaskState.FAILED}:
+            summary = (
+                "La conversación requiere intervención del asesor."
+                if task.current_state == TaskState.ESCALATED
+                else "La conversación quedó en revisión por Hydra."
+            )
+            _boardroom_notify(task, authority_events=authority_events, summary=summary)
+            payload = _build_standard_hydra_response(
+                task,
+                plan,
+                reply_text=_conversation_hold_reply(),
+                mode=task.current_state.value.lower(),
+                summary=summary,
+                metadata={"hydra_event_type": "conversation_message"},
+            )
+            return _extract_hydra_reply(payload)
+
+        return None
+    except Exception as exc:
+        log.exception("❌ Error en conversación Hydra local: %s", exc)
+        if task is not None:
+            _boardroom_trace(
+                task,
+                AuthorityActor.HYDRA,
+                TraceStage.ROUTING,
+                TraceStatus.FAILED,
+                "Fallo procesando conversation_message en Hydra local.",
+                metadata={"error": str(exc)[:300], "service_hint": svc or "general"},
+            )
+            _boardroom_apply_failure_fallback(
+                task,
+                "Falló el procesamiento conversacional en Hydra local.",
+                metadata={"error": str(exc)[:300], "hydra_event_type": "conversation_message"},
+            )
+        return None
+
 
 def ask_hydra_or_gpt(phone: str, text: str, svc: str | None = None) -> str:
     hydra_reply = ask_hydra(phone, text, svc)
     if hydra_reply:
         return hydra_reply
-    return ask_gpt(text, svc)
+    notify_advisor(
+        f"📣 BOARDROOM HOLD – CONVERSACIÓN\n"
+        f"WhatsApp: {phone}\n"
+        f"Servicio: {svc or 'general'}\n"
+        f"Mensaje: {text[:400]}"
+    )
+    return _conversation_hold_reply()
 
-# ── Detección de servicio ─────────────────────────────────────────────────────
 # ── Detección de servicio ─────────────────────────────────────────────────────
 _EXACT: dict = {
     "1": "imss", "imss": "imss", "prestamo imss": "imss", "credito imss": "imss",
@@ -524,23 +1274,17 @@ def route(phone: str, svc: str) -> None:
         user_data.setdefault(phone, {})
         funnel_fp(phone, "")
     elif svc == "auto":
-        send_msg(phone, "🚗 *Seguro de Auto Inbursa*\n\n"
-                        "✅ Cobertura amplia  ✅ Robo total/parcial\n"
-                        "✅ Responsabilidad civil  ✅ Asistencia vial 24/7\n\n"
-                        "📞 Un asesor te contactará para cotizar.")
-        notify_advisor(f"🚗 SEGURO AUTO\nWhatsApp: {phone}")
+        user_state[phone] = "auto_open"
+        user_data.setdefault(phone, {})
+        funnel_auto(phone, "")
     elif svc == "vida":
-        send_msg(phone, "🏥 *Seguro de Vida y Salud Inbursa*\n\n"
-                        "✅ Seguro de vida  ✅ Gastos Médicos Mayores\n"
-                        "✅ Hospitalización  ✅ Atención 24/7\n\n"
-                        "📞 Un asesor te contactará.")
-        notify_advisor(f"🏥 VIDA/SALUD\nWhatsApp: {phone}")
+        user_state[phone] = "vida_open"
+        user_data.setdefault(phone, {})
+        funnel_vida(phone, "")
     elif svc == "vrim":
-        send_msg(phone, "💳 *Tarjeta Médica VRIM*\n\n"
-                        "✅ Consultas ilimitadas  ✅ Especialistas\n"
-                        "✅ Laboratorios  ✅ Descuentos en medicamentos\n\n"
-                        "📞 Un asesor te contactará.")
-        notify_advisor(f"💳 VRIM\nWhatsApp: {phone}")
+        user_state[phone] = "vrim_open"
+        user_data.setdefault(phone, {})
+        funnel_vrim(phone, "")
 
 # ── Flujo IMSS ────────────────────────────────────────────────────────────────
 def funnel_imss(phone: str, msg: str) -> None:
@@ -682,46 +1426,218 @@ def funnel_imss(phone: str, msg: str) -> None:
             f"Inbursa:  {data.get('inbursa', 'ND')}\n"
             f"Origen:   {data.get('origen', 'directo')}\n"
             "────────────────────────")
-        # Auto-trigger Hydra al completar prospecto IMSS
-        try:
-            if HYDRA_URL:
-                _hydra_payload = {
-                    "event_id": str(uuid.uuid4()),
-                    "lead_id": phone,
-                    "event_type": "lead_new",
-                    "product_code": "prestamo_imss",
-                    "product_config": {
-                        "product_code": "prestamo_imss",
-                        "product_name": "Préstamo IMSS Ley 73",
-                        "priority": "A",
-                        "requirements": ["ine", "estado_de_cuenta"],
-                        "stage_scripts": {
-                            "qualification": "Hola, te comparto los requisitos para tu Préstamo IMSS.",
-                            "default": "Seguimos con tu proceso COHIFIS."
-                        },
-                        "commission_rate": 0.08
-                    },
-                    "classification": {"intent": "lead_new", "confidence": 0.95},
-                    "advisor_id": "don_chiwy",
-                    "channel": "whatsapp",
-                    "source": "bot_vicky_redes",
-                    "metadata": {
-                        "nombre": data.get("nombre", ""),
-                        "pension": data.get("pension", ""),
-                        "monto": data.get("monto", ""),
-                        "inbursa": data.get("inbursa", "")
-                    }
-                }
-                _headers = {"Content-Type": "application/json"}
-                if HYDRA_TOKEN:
-                    _headers["X-Boardroom-Token"] = HYDRA_TOKEN
-                log.info("hydra_trigger_start lead=%s svc=imss_prospect", phone)
-                _resp = requests.post(HYDRA_URL, json=_hydra_payload, headers=_headers, timeout=HYDRA_TIMEOUT)
-                log.info("hydra_trigger status=%s lead=%s", _resp.status_code, phone)
-                if _resp.status_code not in (200, 201, 202):
-                    log.warning("hydra_trigger_bad_status lead=%s body=%s", phone, _resp.text[:250])
-        except Exception as _e:
-            log.exception("hydra_trigger_failed lead=%s err=%s", phone, _e)
+        _trigger_hydra_lead(
+            phone,
+            "prestamo_imss",
+            metadata={
+                "nombre": data.get("nombre", ""),
+                "pension": data.get("pension", ""),
+                "monto": data.get("monto", ""),
+                "inbursa": data.get("inbursa", "")
+            },
+            product_config={
+                "product_code": "prestamo_imss",
+                "product_name": "Préstamo IMSS Ley 73",
+                "priority": "A",
+                "requirements": ["ine", "estado_de_cuenta"],
+                "stage_scripts": {
+                    "qualification": "Hola, te comparto los requisitos para tu Préstamo IMSS.",
+                    "default": "Seguimos con tu proceso COHIFIS."
+                },
+                "commission_rate": 0.08
+            },
+            confidence=0.95,
+            source="bot_vicky_redes",
+            svc_log="imss_prospect"
+        )
+        reset(phone)
+        return
+
+
+# ── Flujo Seguro Auto ─────────────────────────────────────────────────────────
+def funnel_auto(phone: str, msg: str) -> None:
+    state = user_state.get(phone, "auto_open")
+    data = user_data.get(phone, {})
+
+    if state == "auto_open":
+        send_msg(phone,
+            "🚗 *Seguro de Auto Inbursa*\n\n"
+            "Te ayudo a solicitar tu cotización.\n"
+            "*¿Tienes seguro actualmente?* _(Sí/No)_")
+        user_state[phone] = "auto_q_tipo"
+        return
+
+    if state == "auto_q_tipo":
+        r = yes_no(msg)
+        data["tiene_seguro_actual"] = r if r in ("si", "no") else msg.strip()
+        user_data[phone] = data
+        send_msg(phone, "*¿Marca y modelo de tu vehículo?*")
+        user_state[phone] = "auto_q_modelo"
+        return
+
+    if state == "auto_q_modelo":
+        data["marca_modelo"] = msg.title()
+        user_data[phone] = data
+        send_msg(phone, "*¿Año del vehículo?*")
+        user_state[phone] = "auto_q_ano"
+        return
+
+    if state == "auto_q_ano":
+        data["ano"] = msg.strip()
+        user_data[phone] = data
+        send_msg(phone, "*¿Tu nombre completo?*")
+        user_state[phone] = "auto_q_nombre"
+        return
+
+    if state == "auto_q_nombre":
+        data["nombre"] = msg.title()
+        user_data[phone] = data
+        send_msg(phone, "*¿Tu número de contacto?*\n_(Escribe \"mismo\" si es este WhatsApp)_")
+        user_state[phone] = "auto_q_tel"
+        return
+
+    if state == "auto_q_tel":
+        data["tel"] = phone if msg.strip().lower() in ("mismo", "este", "el mismo") else msg.strip()
+        user_data[phone] = data
+        send_msg(phone, "✅ Listo. El asesor *Christian López* te contactará para tu cotización de auto.")
+        notify_advisor(
+            f"🚗 PROSPECTO – SEGURO AUTO\n"
+            f"Nombre: {data.get('nombre', 'ND')}\n"
+            f"WhatsApp: {phone}\n"
+            f"Teléfono: {data.get('tel', 'ND')}\n"
+            f"Seguro actual: {data.get('tiene_seguro_actual', 'ND')}\n"
+            f"Vehículo: {data.get('marca_modelo', 'ND')}\n"
+            f"Año: {data.get('ano', 'ND')}"
+        )
+        _trigger_hydra_lead(
+            phone,
+            "seguro_auto",
+            metadata={
+                "nombre": data.get("nombre", ""),
+                "tel": data.get("tel", ""),
+                "tiene_seguro_actual": data.get("tiene_seguro_actual", ""),
+                "marca_modelo": data.get("marca_modelo", ""),
+                "ano": data.get("ano", "")
+            },
+            product_name="Seguro de Auto Inbursa",
+            source="bot_vicky_redes",
+            svc_log="auto_prospect"
+        )
+        reset(phone)
+        return
+
+# ── Flujo Vida y Salud ────────────────────────────────────────────────────────
+def funnel_vida(phone: str, msg: str) -> None:
+    state = user_state.get(phone, "vida_open")
+    data = user_data.get(phone, {})
+
+    if state == "vida_open":
+        send_msg(phone,
+            "🏥 *Seguro de Vida y Salud Inbursa*\n\n"
+            "Con gusto te ayudo a perfilar tu solicitud.\n"
+            "*¿Qué tipo de cobertura te interesa?* _(Vida / GMM / Ambas)_")
+        user_state[phone] = "vida_q_tipo"
+        return
+
+    if state == "vida_q_tipo":
+        data["tipo_cobertura"] = msg.strip()
+        user_data[phone] = data
+        send_msg(phone, "*¿Tu edad aproximada?*")
+        user_state[phone] = "vida_q_edad"
+        return
+
+    if state == "vida_q_edad":
+        data["edad"] = msg.strip()
+        user_data[phone] = data
+        send_msg(phone, "*¿Tu nombre completo?*")
+        user_state[phone] = "vida_q_nombre"
+        return
+
+    if state == "vida_q_nombre":
+        data["nombre"] = msg.title()
+        user_data[phone] = data
+        send_msg(phone, "*¿Tu número de contacto?*\n_(Escribe \"mismo\" si es este WhatsApp)_")
+        user_state[phone] = "vida_q_tel"
+        return
+
+    if state == "vida_q_tel":
+        data["tel"] = phone if msg.strip().lower() in ("mismo", "este", "el mismo") else msg.strip()
+        user_data[phone] = data
+        send_msg(phone, "✅ Listo. El asesor *Christian López* te contactará para revisar tu cobertura.")
+        notify_advisor(
+            f"🏥 PROSPECTO – VIDA Y SALUD\n"
+            f"Nombre: {data.get('nombre', 'ND')}\n"
+            f"WhatsApp: {phone}\n"
+            f"Teléfono: {data.get('tel', 'ND')}\n"
+            f"Cobertura: {data.get('tipo_cobertura', 'ND')}\n"
+            f"Edad: {data.get('edad', 'ND')}"
+        )
+        _trigger_hydra_lead(
+            phone,
+            "vida_salud",
+            metadata={
+                "nombre": data.get("nombre", ""),
+                "tel": data.get("tel", ""),
+                "tipo_cobertura": data.get("tipo_cobertura", ""),
+                "edad": data.get("edad", "")
+            },
+            product_name="Seguro de Vida y Salud Inbursa",
+            source="bot_vicky_redes",
+            svc_log="vida_prospect"
+        )
+        reset(phone)
+        return
+
+# ── Flujo VRIM ────────────────────────────────────────────────────────────────
+def funnel_vrim(phone: str, msg: str) -> None:
+    state = user_state.get(phone, "vrim_open")
+    data = user_data.get(phone, {})
+
+    if state == "vrim_open":
+        send_msg(phone,
+            "💳 *Tarjeta Médica VRIM*\n\n"
+            "Te ayudo a registrar tu interés.\n"
+            "*¿Para cuántas personas sería la membresía?*")
+        user_state[phone] = "vrim_q_personas"
+        return
+
+    if state == "vrim_q_personas":
+        data["personas"] = msg.strip()
+        user_data[phone] = data
+        send_msg(phone, "*¿Tu nombre completo?*")
+        user_state[phone] = "vrim_q_nombre"
+        return
+
+    if state == "vrim_q_nombre":
+        data["nombre"] = msg.title()
+        user_data[phone] = data
+        send_msg(phone, "*¿Tu número de contacto?*\n_(Escribe \"mismo\" si es este WhatsApp)_")
+        user_state[phone] = "vrim_q_tel"
+        return
+
+    if state == "vrim_q_tel":
+        data["tel"] = phone if msg.strip().lower() in ("mismo", "este", "el mismo") else msg.strip()
+        user_data[phone] = data
+        send_msg(phone, "✅ Listo. El asesor *Christian López* te contactará para tu membresía VRIM.")
+        notify_advisor(
+            f"💳 PROSPECTO – VRIM\n"
+            f"Nombre: {data.get('nombre', 'ND')}\n"
+            f"WhatsApp: {phone}\n"
+            f"Teléfono: {data.get('tel', 'ND')}\n"
+            f"Personas: {data.get('personas', 'ND')}"
+        )
+        _trigger_hydra_lead(
+            phone,
+            "vrim",
+            metadata={
+                "nombre": data.get("nombre", ""),
+                "tel": data.get("tel", ""),
+                "personas": data.get("personas", "")
+            },
+            product_name="Tarjeta Médica VRIM",
+            source="bot_vicky_redes",
+            svc_log="vrim_prospect"
+        )
         reset(phone)
         return
 
@@ -929,7 +1845,6 @@ def _is_financial_context(n: str, svc: str | None = None) -> bool:
     return bool(svc) or bool(toks & _FIN_KW)
 
 # ── Procesamiento del mensaje ─────────────────────────────────────────────────
-# ── Procesamiento del mensaje ─────────────────────────────────────────────────
 def handle(msg_obj: dict) -> None:
     phone = msg_obj.get("from", "")
     if not phone:
@@ -969,6 +1884,15 @@ def handle(msg_obj: dict) -> None:
     state = user_state.get(phone, "")
     if state.startswith("imss_"):
         funnel_imss(phone, text)
+        return
+    if state.startswith("auto_"):
+        funnel_auto(phone, text)
+        return
+    if state.startswith("vida_"):
+        funnel_vida(phone, text)
+        return
+    if state.startswith("vrim_"):
+        funnel_vrim(phone, text)
         return
     if state.startswith("emp_"):
         funnel_emp(phone, text)
@@ -1036,9 +1960,15 @@ def handle(msg_obj: dict) -> None:
     show_menu(phone)
 
 # ── Verificación de firma Meta (HMAC-SHA256) ──────────────────────────────────
+_WARNED_NO_APP_SECRET = False
+
 def _verify_sig(raw: bytes, hdr: str) -> bool:
+    global _WARNED_NO_APP_SECRET
     if not APP_SECRET:
-        return True
+        if not _WARNED_NO_APP_SECRET:
+            log.error("❌ META_APP_SECRET no configurado. Webhook bloqueado hasta que se configure la firma de Meta.")
+            _WARNED_NO_APP_SECRET = True
+        return False
     if not hdr.startswith("sha256="):
         return False
     exp = "sha256=" + hmac.new(APP_SECRET.encode(), raw, hashlib.sha256).hexdigest()
@@ -1085,16 +2015,19 @@ def ext_lead():
             return jsonify({"ok": False, "error": "internal_token_not_configured"}), 500
         if not _is_internal_request(request):
             return jsonify({"ok": False, "error": "unauthorized"}), 401
+
         data = request.get_json(force=True, silent=True) or {}
         lead_id = str(data.get("lead_id", "")).strip()
         nombre = str(data.get("nombre", "")).strip() or "Sin nombre"
         telefono = re.sub(r"\D", "", str(data.get("telefono", "")))[-10:]
         interest = str(data.get("interest") or data.get("interes") or "").strip() or "sin_especificar"
         source = str(data.get("source", "")).strip() or "desconocido"
+
         if not lead_id:
             return jsonify({"ok": False, "error": "missing_lead_id"}), 422
         if len(telefono) != 10:
             return jsonify({"ok": False, "error": "invalid_telefono"}), 422
+
         advisor_msg = (
             f"🔔 Lead nuevo desde cohifis.com\n"
             f"Nombre: {nombre}\n"
@@ -1107,8 +2040,39 @@ def ext_lead():
         if not ok:
             log.warning("⚠️ /ext/lead notify_advisor falló [lead_id=%s]", lead_id)
             return jsonify({"ok": False, "error": "advisor_notify_failed"}), 502
-        log.info("✅ /ext/lead OK [lead_id=%s]", lead_id)
-        return jsonify({"ok": True}), 200
+
+        svc = detect_svc(interest) or ""
+        hydra_result = _trigger_hydra_lead(
+            telefono,
+            _service_to_product_code(svc),
+            metadata={
+                "lead_id": lead_id,
+                "nombre": nombre,
+                "telefono": telefono,
+                "interest": interest,
+                "source": source,
+                "hydra_event_type": "lead_new",
+                "service_hint": svc or "general",
+            },
+            product_name=interest,
+            source=source,
+            svc_log="ext_lead",
+        )
+        if hydra_result is None:
+            log.error("❌ /ext/lead no pudo registrar la tarea en Hydra local [lead_id=%s]", lead_id)
+            return jsonify({"ok": False, "error": "hydra_task_registration_failed"}), 502
+
+        task_id = str(hydra_result.get("task_id") or "").strip()
+        execution_plan = hydra_result.get("execution_plan") or {}
+        disposition = execution_plan.get("disposition") if isinstance(execution_plan, dict) else None
+
+        log.info("✅ /ext/lead OK [lead_id=%s task_id=%s]", lead_id, task_id or "nd")
+        return jsonify({
+            "ok": True,
+            "task_id": task_id,
+            "disposition": disposition,
+            "hydra_event_type": "lead_new",
+        }), 200
     except Exception as exc:
         log.exception("❌ Error en /ext/lead: %s", exc)
         return jsonify({"ok": False, "error": "internal_server_error"}), 500
