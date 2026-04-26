@@ -15,36 +15,7 @@ import requests
 import openai
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-from types import SimpleNamespace
 
-try:
-    from authority_matrix import AuthorityActor, EventSeverity
-    from hydra_orchestrator import ExecutionPlan, HydraOrchestrator, PlanDisposition
-    from policy_envelope import (
-        Agent,
-        Channel as BoardroomChannel,
-        Criticality,
-        FallbackMode,
-        PolicyEnvelope,
-        Source,
-        SystemOfRecord,
-        TaskType,
-    )
-    from task import Task, TaskState
-    from fallback_manager import FallbackManager, FallbackTrigger
-    from flow_gemma_decision_layer import GemmaDecisionLayerFlow
-    from notifier import BoardroomNotifier, NotificationConfig
-    from valkey_store import (
-        AgentTraceRecord,
-        TraceStage,
-        TraceStatus,
-        ValkeyStore,
-        ValkeyStoreConfig,
-    )
-    from sheets_ledger import IncidentCode, LedgerIncident, SheetsLedger, SheetsLedgerConfig
-    _boardroom_libs = True
-except Exception:
-    _boardroom_libs = False
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO,
@@ -88,12 +59,6 @@ OPENAI_KEY   = os.getenv("OPENAI_API_KEY")
 APP_SECRET   = os.getenv("META_APP_SECRET", "").strip()
 INTERNAL_TOKEN = os.getenv("INTERNAL_TOKEN", "").strip()
 
-HYDRA_URL   = os.getenv("HYDRA_URL", "https://boardroom-engine.onrender.com/boardroom/tasks/commercial").strip()
-HYDRA_TOKEN = os.getenv("BOARDROOM_API_TOKEN", "").strip()
-try:
-    HYDRA_TIMEOUT = int(os.getenv("HYDRA_TIMEOUT", "8").strip() or "8")
-except Exception:
-    HYDRA_TIMEOUT = 8
 
 # Notificación al asesor fuera de ventana 24h:
 # Crea un template aprobado en Meta Business Manager con un parámetro {{1}}.
@@ -104,46 +69,6 @@ ADV_TPL_LANG = os.getenv("ADVISOR_TEMPLATE_LANG", "es_MX").strip()
 GG_CREDS  = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
 SHEET_ID  = os.getenv("SHEETS_ID_CONVERSACIONES", "").strip()
 SHEET_TAB = os.getenv("SHEETS_TAB_CONVERSACIONES", "Conversaciones").strip()
-
-BOARDROOM_LEDGER_SHEET_ID = os.getenv("BOARDROOM_LEDGER_SHEET_ID", "").strip()
-BOARDROOM_VALKEY_URL = (
-    os.getenv("VALKEY_URL", "").strip()
-    or os.getenv("REDIS_URL", "").strip()
-    or os.getenv("KV_URL", "").strip()
-)
-
-if _boardroom_libs:
-    # Shim de compatibilidad:
-    # activation_criteria.py y flow_gemma_decision_layer.py consumen aliases que no
-    # están expuestos por hydra_orchestrator.py en todos los ambientes cerrados v1.
-    # Se agregan aquí sin alterar los módulos auditados.
-    if not hasattr(HydraOrchestrator, "route_policy_envelope"):
-        def _route_policy_envelope_compat(self, policy_envelope, *, trace_id=None,
-                                          conversation_id=None, request_id=None,
-                                          metadata=None):
-            task = self.create_task(
-                policy_envelope,
-                trace_id=trace_id,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                metadata=metadata or {},
-            )
-            execution_plan = self.build_execution_plan(task)
-            return SimpleNamespace(task=task, execution_plan=execution_plan)
-        HydraOrchestrator.route_policy_envelope = _route_policy_envelope_compat
-
-    if not hasattr(ExecutionPlan, "primary_agent"):
-        ExecutionPlan.primary_agent = property(
-            lambda self: Agent(self.selected_actor.value)
-            if self.selected_actor.value in Agent._value2member_map_
-            else None
-        )
-    if not hasattr(ExecutionPlan, "authority_events"):
-        ExecutionPlan.authority_events = property(lambda self: list(self.events))
-    if not hasattr(ExecutionPlan, "conflicts"):
-        ExecutionPlan.conflicts = property(lambda self: [])
-    if not hasattr(PlanDisposition, "ROUTED"):
-        PlanDisposition.ROUTED = PlanDisposition.EXECUTE
 
 
 STATE_TTL = 24 * 60 * 60
@@ -306,221 +231,6 @@ _state_store = StateStore()
 user_state = _StateMap(_state_store)
 user_data = _DataMap(_state_store)
 
-# ── Boardroom Engine v1 / Hydra local ────────────────────────────────────────
-_BOARDROOM_OWNER = "app_vicky_hydra_v2"
-_BOARDROOM_MODULE = "app_vicky_hydra_v2"
-_BOARDROOM_CONTRACT_VERSION = "boardroom.v1.agent-contract"
-
-_boardroom_hydra = None
-_boardroom_fallback = None
-_boardroom_gemma_flow = None
-_boardroom_notifier = None
-_boardroom_valkey = None
-_boardroom_ledger = None
-
-
-def _boardroom_enabled() -> bool:
-    return _boardroom_libs and _boardroom_hydra is not None
-
-
-def _init_boardroom_runtime() -> None:
-    global _boardroom_hydra, _boardroom_fallback, _boardroom_gemma_flow
-    global _boardroom_notifier, _boardroom_valkey, _boardroom_ledger
-
-    if not _boardroom_libs:
-        log.warning("⚠️ Boardroom Engine v1 no disponible; Hydra local deshabilitado.")
-        return
-
-    try:
-        _boardroom_hydra = HydraOrchestrator(default_owner=_BOARDROOM_OWNER)
-        _boardroom_fallback = FallbackManager(orchestrator=_boardroom_hydra)
-        log.info("✅ Hydra local Boardroom v1 inicializado.")
-    except Exception:
-        _boardroom_hydra = None
-        _boardroom_fallback = None
-        log.exception("❌ No se pudo inicializar Hydra local Boardroom v1.")
-        return
-
-    if BOARDROOM_VALKEY_URL:
-        try:
-            _boardroom_valkey = ValkeyStore(
-                ValkeyStoreConfig(redis_url=BOARDROOM_VALKEY_URL)
-            )
-            log.info("✅ Boardroom ValkeyStore inicializado.")
-        except Exception:
-            _boardroom_valkey = None
-            log.exception("❌ No se pudo inicializar Boardroom ValkeyStore.")
-    else:
-        log.warning("⚠️ VALKEY_URL/REDIS_URL/KV_URL no configurado para Boardroom ValkeyStore.")
-
-    if META_TOKEN and WABA_ID and ADVISOR_NUM:
-        try:
-            _boardroom_notifier = BoardroomNotifier(
-                NotificationConfig(
-                    meta_token=META_TOKEN,
-                    waba_phone_id=WABA_ID,
-                    approver_whatsapp=ADVISOR_NUM,
-                    valkey_url=BOARDROOM_VALKEY_URL or None,
-                    dry_run=False,
-                )
-            )
-            log.info("✅ BoardroomNotifier inicializado.")
-        except Exception:
-            _boardroom_notifier = None
-            log.exception("❌ No se pudo inicializar BoardroomNotifier.")
-
-    if _boardroom_valkey and BOARDROOM_LEDGER_SHEET_ID and GG_CREDS:
-        try:
-            _boardroom_ledger = SheetsLedger(
-                config=SheetsLedgerConfig(
-                    sheet_id=BOARDROOM_LEDGER_SHEET_ID,
-                    credentials_json=GG_CREDS,
-                    dry_run=False,
-                ),
-                valkey_store=_boardroom_valkey,
-            )
-            log.info("✅ Boardroom SheetsLedger inicializado.")
-        except Exception:
-            _boardroom_ledger = None
-            log.exception("❌ No se pudo inicializar Boardroom SheetsLedger.")
-
-    try:
-        _boardroom_gemma_flow = GemmaDecisionLayerFlow(
-            fallback_manager=_boardroom_fallback,
-            notifier=_boardroom_notifier,
-            auto_init_notifier=False,
-        )
-        log.info("✅ GemmaDecisionLayerFlow inicializado.")
-    except Exception:
-        _boardroom_gemma_flow = None
-        log.exception("❌ No se pudo inicializar GemmaDecisionLayerFlow.")
-
-
-def _boardroom_trace(task: Task | None, actor: AuthorityActor,
-                     stage: TraceStage, status: TraceStatus, summary: str,
-                     metadata: dict | None = None) -> None:
-    if not (_boardroom_valkey and task):
-        return
-    try:
-        _boardroom_valkey.append_agent_trace(
-            AgentTraceRecord(
-                task_id=task.task_id,
-                actor=actor,
-                stage=stage,
-                status=status,
-                summary=summary,
-                metadata=metadata or {},
-            )
-        )
-    except Exception:
-        log.exception("❌ Error persistiendo AgentTraceRecord en Valkey.")
-
-
-def _boardroom_record_task(task: Task | None, authority_events: list | None = None) -> None:
-    if task is None:
-        return
-    authority_events = authority_events or []
-
-    if _boardroom_valkey:
-        try:
-            _boardroom_valkey.write_task_ledger(task)
-            for event in authority_events:
-                _boardroom_valkey.append_authority_event(event)
-        except Exception:
-            log.exception("❌ Error persistiendo task/eventos en Boardroom ValkeyStore.")
-
-    if _boardroom_ledger:
-        try:
-            _boardroom_ledger.record_task_snapshot(task)
-            for event in authority_events:
-                _boardroom_ledger.append_authority_event(event)
-        except Exception:
-            log.exception("❌ Error persistiendo task/eventos en Boardroom SheetsLedger.")
-
-
-def _boardroom_record_incident(task: Task | None, incident_code: IncidentCode,
-                               summary: str, *, severity: EventSeverity = EventSeverity.HIGH,
-                               reason_code: str | None = None,
-                               actor: str | None = None,
-                               metadata: dict | None = None) -> None:
-    if not (_boardroom_ledger and task):
-        return
-    try:
-        _boardroom_ledger.append_incident(
-            LedgerIncident(
-                incident_code=incident_code,
-                task_id=task.task_id,
-                summary=summary,
-                severity=severity,
-                source=_BOARDROOM_MODULE,
-                current_state=task.current_state.value,
-                reason_code=reason_code,
-                actor=actor,
-                metadata=metadata or {},
-            )
-        )
-    except Exception:
-        log.exception("❌ Error registrando incidente Boardroom.")
-
-
-def _boardroom_notify(task: Task | None, *, authority_events: list | None = None,
-                      summary: str | None = None) -> None:
-    authority_events = authority_events or []
-    delivered = False
-
-    if _boardroom_notifier and task is not None:
-        try:
-            for event in authority_events:
-                result = _boardroom_notifier.notify_authority_event(
-                    task, event, source_module=_BOARDROOM_MODULE
-                )
-                if result is not None and getattr(result.status, "value", "") in {"sent", "persisted_only"}:
-                    delivered = True
-
-            result = _boardroom_notifier.notify_task_state(
-                task,
-                triggered_by=_BOARDROOM_OWNER,
-                source_module=_BOARDROOM_MODULE,
-                summary=summary,
-            )
-            if result is not None and getattr(result.status, "value", "") in {"sent", "persisted_only"}:
-                delivered = True
-        except Exception:
-            log.exception("❌ Error enviando notificación Boardroom.")
-
-    if not delivered and summary:
-        notify_advisor(f"📣 BOARDROOM\nTarea: {task.task_id if task else 'ND'}\n{summary}")
-
-
-def _boardroom_apply_failure_fallback(task: Task | None, summary: str,
-                                      *, metadata: dict | None = None) -> None:
-    if task is None or _boardroom_fallback is None:
-        return
-    try:
-        resolution = _boardroom_fallback.handle_event(
-            task,
-            AuthorityActor.HYDRA,
-            FallbackTrigger.FAILURE,
-            summary=summary,
-            metadata=metadata or {},
-        )
-        _boardroom_record_task(task, authority_events=list(resolution.record.authority_events))
-        _boardroom_notify(
-            task,
-            authority_events=list(resolution.record.authority_events),
-            summary=summary,
-        )
-        incident_code = IncidentCode.HOLD if task.current_state == TaskState.HOLD else IncidentCode.FAILED
-        _boardroom_record_incident(
-            task,
-            incident_code,
-            summary,
-            reason_code=resolution.record.code.value,
-            actor=AuthorityActor.HYDRA.value,
-            metadata=metadata or {},
-        )
-    except Exception:
-        log.exception("❌ Error aplicando fallback Boardroom.")
 
 
 def _service_to_product_code(svc: str | None) -> str:
@@ -616,109 +326,6 @@ def _safe_reply_for_service(text: str, svc: str | None) -> tuple[str, str]:
     )
 
 
-def _build_conversation_policy(phone: str, text: str, svc: str | None = None) -> PolicyEnvelope:
-    return PolicyEnvelope(
-        task_id=str(uuid.uuid4()),
-        source=Source.CLIENT,
-        channel=BoardroomChannel.WHATSAPP,
-        task_type=TaskType.CONVERSATION,
-        intent=_conversation_intent(text),
-        criticality=Criticality.LOW,
-        confidence=0.92,
-        requires_google_state=False,
-        requires_audit=False,
-        requires_human_approval=False,
-        fast_path=False,
-        allowed_agents=[Agent.GEMMA],
-        system_of_record=SystemOfRecord.INTERNAL,
-        fallback_mode=FallbackMode.SAFE_REPLY,
-        audit_required_for_release=False,
-        notify_on_waiting_audit=False,
-    )
-
-
-def _build_lead_policy(phone: str, product_code: str, confidence: float = 0.95) -> PolicyEnvelope:
-    # Supuesto operativo:
-    # Boardroom v1 no define task_type comercial. Para no alterar módulos cerrados,
-    # lead_new se modela como conversación escalada a autoridad humana, conservando
-    # el contrato semántico real en metadata: hydra_event_type=lead_new.
-    return PolicyEnvelope(
-        task_id=str(uuid.uuid4()),
-        source=Source.CLIENT,
-        channel=BoardroomChannel.WHATSAPP,
-        task_type=TaskType.CONVERSATION,
-        intent="schedule_followup",
-        criticality=Criticality.MEDIUM,
-        confidence=round(float(confidence), 4),
-        requires_google_state=False,
-        requires_audit=False,
-        requires_human_approval=True,
-        fast_path=False,
-        allowed_agents=[Agent.GEMMA],
-        system_of_record=SystemOfRecord.INTERNAL,
-        fallback_mode=FallbackMode.MANUAL_REVIEW,
-        audit_required_for_release=False,
-        notify_on_waiting_audit=False,
-    )
-
-
-def _build_gemma_output_payload(task: Task, text: str, svc: str | None = None) -> dict:
-    service_hint = (svc or "").strip()
-    intent, response_text = _safe_reply_for_service(text, service_hint)
-    business_action_requested, persistent_state_mutation_requested, business_data = _requires_human_guardrail(text)
-    decision = "conversation_request_clarification" if service_hint == "" else "conversation_safe_reply"
-    result_data = {
-        "intent": intent,
-        "catalog_intent": intent,
-        "catalog_match": True,
-        "out_of_catalog": False,
-        "business_action_requested": business_action_requested,
-        "persistent_state_mutation_requested": persistent_state_mutation_requested,
-        "business_data": business_data,
-        "sensitive_action": business_action_requested or persistent_state_mutation_requested,
-        "service_hint": service_hint or "general",
-    }
-    if decision == "conversation_request_clarification":
-        result_data["clarification"] = response_text
-    else:
-        result_data["reply"] = response_text
-
-    return {
-        "task_id": task.task_id,
-        "agent": Agent.GEMMA.value,
-        "contract_version": _BOARDROOM_CONTRACT_VERSION,
-        "decision": decision,
-        "confidence": 0.92,
-        "status": "completed",
-        "result_data": result_data,
-    }
-
-
-def _build_standard_hydra_response(task: Task, plan, *, reply_text: str | None,
-                                   mode: str, summary: str,
-                                   metadata: dict | None = None) -> dict:
-    return {
-        "task_id": task.task_id,
-        "status": "ok",
-        "response": {
-            "reply_text": reply_text,
-            "mode": mode,
-            "summary": summary,
-        },
-        "task": task.to_dict(),
-        "execution_plan": plan.to_dict() if plan is not None else None,
-        "metadata": metadata or {},
-    }
-
-
-def _conversation_hold_reply() -> str:
-    return (
-        "Gracias por tu mensaje. Para darte una respuesta exacta lo canalicé con el asesor. "
-        "¿Me compartes tu nombre completo para seguimiento?"
-    )
-
-
-_init_boardroom_runtime()
 
 # ── Idempotencia ──────────────────────────────────────────────────────────────
 _seen_ids: set = set()
@@ -861,6 +468,84 @@ def notify_advisor(msg: str) -> bool:
         log.exception("💥 notify_advisor")
         return False
 
+
+BOARDROOM_URL = os.getenv(
+    "BOARDROOM_URL",
+    "https://boardroom-engine.onrender.com"
+).strip()
+BOARDROOM_API_TOKEN = os.getenv("BOARDROOM_API_TOKEN", "").strip()
+
+
+def _notify_boardroom_document(phone: str, media_id: str, doc_type: str) -> None:
+    """Notifica a Boardroom que Vicky Redes recibió un documento."""
+    if not BOARDROOM_URL or not BOARDROOM_API_TOKEN:
+        log.warning("boardroom_not_configured: documento no notificado")
+        return
+    try:
+        resp = requests.post(
+            f"{BOARDROOM_URL}/api/document/process",
+            json={
+                "phone": phone,
+                "media_id": media_id,
+                "doc_type": doc_type,
+                "source": "vicky_redes"
+            },
+            headers={
+                "Content-Type": "application/json",
+                "X-Boardroom-Token": BOARDROOM_API_TOKEN
+            },
+            timeout=5
+        )
+        log.info("boardroom_doc_notified: phone=%s status=%s", phone, resp.status_code)
+    except Exception as e:
+        log.error("boardroom_doc_notify_failed: phone=%s error=%s", phone, e)
+
+
+def _notify_boardroom_lead_qualified(phone: str, product_code: str, data: dict) -> None:
+    """Notifica a Boardroom cuando Vicky Redes completa calificación."""
+    if not BOARDROOM_URL or not BOARDROOM_API_TOKEN:
+        log.warning("boardroom_not_configured: lead no notificado")
+        return
+    try:
+        from uuid import uuid4
+        resp = requests.post(
+            f"{BOARDROOM_URL}/boardroom/tasks/commercial",
+            json={
+                "event_id": str(uuid4()),
+                "lead_id": phone,
+                "event_type": "lead_new",
+                "product_code": product_code,
+                "product_config": {
+                    "product_code": product_code,
+                    "product_name": product_code.replace("_", " ").title(),
+                    "priority": "A",
+                    "requirements": ["ine", "comprobante_domicilio"],
+                    "stage_scripts": {
+                        "qualification": "Prospecto calificado por Vicky Redes.",
+                        "default": "Seguimos con tu proceso COHIFIS."
+                    },
+                    "commission_rate": 0.12
+                },
+                "classification": {
+                    "intent": "lead_new",
+                    "confidence": 0.95
+                },
+                "advisor_id": "don_chiwy",
+                "channel": "whatsapp",
+                "source": "vicky_redes",
+                "metadata": data
+            },
+            headers={
+                "Content-Type": "application/json",
+                "X-Boardroom-Token": BOARDROOM_API_TOKEN
+            },
+            timeout=8
+        )
+        log.info("boardroom_lead_notified: phone=%s product=%s status=%s",
+                 phone, product_code, resp.status_code)
+    except Exception as e:
+        log.error("boardroom_lead_notify_failed: phone=%s error=%s", phone, e)
+
 # ── Utilidades ────────────────────────────────────────────────────────────────
 def norm(text: str) -> str:
     if not text:
@@ -892,6 +577,10 @@ def extract_num(text: str):
         return float(m.group(1) + (m.group(2) or ""))
     except Exception:
         return None
+
+
+def _ensure_user(phone: str) -> dict:
+    return dict(user_data.get(phone) or {})
 
 def reset(phone: str):
     user_state.pop(phone, None)
@@ -965,7 +654,21 @@ _SYS = (
     "Resuelve dudas reales del cliente. Si la pregunta es abierta, contesta de forma útil; "
     "no mandes al menú salvo que el cliente lo pida. "
     "Termina con UNA sola pregunta cuando ayude a avanzar. "
-    "No inventes tasas, requisitos ni condiciones no confirmadas."
+    "No inventes tasas, requisitos ni condiciones no confirmadas. "
+    "DATOS FINANCIEROS COHIFIS: "
+    "IMSS Ley 73: CAT 29.3% Inbursa vs 75.19% competencia. "
+    "Monto $40,000 a $650,000. Sin aval. Sin cambio de banco. "
+    "Regalo VRIM Plus en créditos >= $50,000. "
+    "PyME Alta Eficiencia: 18%. PyME Flexible: 36%. "
+    "Tolerancia buró hasta $30,000 de mancha. "
+    "TPV: desde 1.05% por transacción. Sin mensualidad fija. "
+    "VRIM: membresía médica incluida como regalo con IMSS >= $50k. "
+    "COMPORTAMIENTO: Si cliente objeta precio comparar con competencia (75.19% vs 29.3%). "
+    "Si cliente objeta trámite enfatizar proceso 100% digital. "
+    "Si cliente muestra intención de compra dirigir al funnel correcto. "
+    "NUNCA mezclar productos B2C con B2B en misma respuesta. "
+    "Cierre siempre: Ten listos tus documentos en PDF o foto clara. "
+    "Christian López te contactará por WhatsApp para recibirlos y agendar tu cierre sin salir de casa."
 )
 
 _SERVICE_LABELS = {
@@ -994,211 +697,7 @@ def ask_gpt(prompt: str, svc: str | None = None) -> str:
         log.exception("GPT error")
         return "Ocurrió un error. ¿Sobre qué servicio te puedo orientar?"
 
-def _extract_hydra_reply(data):
-    if not isinstance(data, dict):
-        return None
-    response = data.get("response")
-    if not isinstance(response, dict):
-        return None
-    for key in ("reply_text", "safe_reply", "clarification"):
-        val = response.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-    return None
 
-
-def _hydra_post_with_retry(url: str, payload: dict, headers: dict, timeout: int, lead: str):
-    for attempt in range(3):
-        try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
-            log.info("hydra_trigger status=%s lead=%s attempt=%s", resp.status_code, lead, attempt + 1)
-            if resp.status_code in (200, 201, 202):
-                return resp
-            log.warning("hydra_trigger_bad_status lead=%s attempt=%s body=%s", lead, attempt + 1, resp.text[:250])
-        except Exception as e:
-            if attempt == 2:
-                log.exception("hydra_trigger_failed lead=%s err=%s", lead, e)
-            else:
-                log.warning("hydra_trigger_retry lead=%s attempt=%s err=%s", lead, attempt + 1, e)
-        if attempt < 2:
-            time.sleep(1)
-    return None
-
-def _trigger_hydra_lead(phone: str, product_code: str, metadata: dict | None = None,
-                        product_name: str | None = None, product_config: dict | None = None,
-                        confidence: float = 0.95, source: str = "bot_vicky_redes",
-                        svc_log: str | None = None):
-    if not _boardroom_enabled():
-        log.error("❌ Hydra local Boardroom v1 no está disponible para lead_new.")
-        return None
-
-    metadata = dict(metadata or {})
-    metadata.update({
-        "hydra_event_type": "lead_new",
-        "product_code": product_code,
-        "product_name": product_name or product_code,
-        "product_config": product_config or {},
-        "channel": "whatsapp",
-        "source": source,
-        "service_log": svc_log or product_code,
-        "phone": phone,
-    })
-
-    task = None
-    try:
-        policy = _build_lead_policy(phone, product_code, confidence=confidence)
-        task, plan = _boardroom_hydra.orchestrate_policy(
-            policy,
-            trace_id=str(uuid.uuid4()),
-            conversation_id=re.sub(r"\D", "", str(phone)),
-            request_id=_mid() or str(uuid.uuid4()),
-            metadata=metadata,
-            apply_plan=True,
-        )
-        _boardroom_trace(
-            task,
-            AuthorityActor.HYDRA,
-            TraceStage.ROUTING,
-            TraceStatus.SUCCEEDED,
-            f"Lead '{product_code}' registrado en Hydra local.",
-            metadata={"svc_log": svc_log or product_code, "hydra_event_type": "lead_new"},
-        )
-        _boardroom_record_task(task, authority_events=list(plan.events))
-        _boardroom_notify(
-            task,
-            authority_events=list(plan.events),
-            summary=f"Lead '{product_code}' escalado para seguimiento comercial.",
-        )
-        return _build_standard_hydra_response(
-            task,
-            plan,
-            reply_text=None,
-            mode="manual_review",
-            summary="Lead registrado y escalado a revisión humana.",
-            metadata={"hydra_event_type": "lead_new"},
-        )
-    except Exception as exc:
-        log.exception("❌ Error registrando lead_new en Hydra local: %s", exc)
-        if task is not None:
-            _boardroom_trace(
-                task,
-                AuthorityActor.HYDRA,
-                TraceStage.ROUTING,
-                TraceStatus.FAILED,
-                "Fallo registrando lead_new en Hydra local.",
-                metadata={"error": str(exc)[:300], "hydra_event_type": "lead_new"},
-            )
-            _boardroom_apply_failure_fallback(
-                task,
-                "Falló el registro del lead en Hydra local.",
-                metadata={"error": str(exc)[:300], "hydra_event_type": "lead_new"},
-            )
-        return None
-
-
-def ask_hydra(phone: str, text: str, svc: str | None = None):
-    if not _boardroom_enabled():
-        return None
-
-    task = None
-    try:
-        policy = _build_conversation_policy(phone, text, svc)
-        task, plan = _boardroom_hydra.orchestrate_policy(
-            policy,
-            trace_id=str(uuid.uuid4()),
-            conversation_id=re.sub(r"\D", "", str(phone)),
-            request_id=_mid() or str(uuid.uuid4()),
-            metadata={
-                "hydra_event_type": "conversation_message",
-                "message_text": text,
-                "service_hint": svc or "general",
-                "nombre": _nombre(phone),
-                "state": user_state.get(phone, ""),
-                "phone": phone,
-                "product_code": _service_to_product_code(svc),
-            },
-            apply_plan=True,
-        )
-        _boardroom_trace(
-            task,
-            AuthorityActor.HYDRA,
-            TraceStage.ROUTING,
-            TraceStatus.SUCCEEDED,
-            "Conversación enrutada por Hydra local.",
-            metadata={"service_hint": svc or "general", "hydra_event_type": "conversation_message"},
-        )
-        _boardroom_record_task(task, authority_events=list(plan.events))
-
-        if _boardroom_gemma_flow is None:
-            raise RuntimeError("GemmaDecisionLayerFlow no está disponible.")
-
-        gemma_payload = _build_gemma_output_payload(task, text, svc)
-        flow_result = _boardroom_gemma_flow.receive_gemma_capture(task, gemma_payload)
-        authority_events = list(flow_result.authority_events)
-        if flow_result.fallback_resolution is not None:
-            authority_events.extend(list(flow_result.fallback_resolution.record.authority_events))
-
-        _boardroom_record_task(task, authority_events=authority_events)
-
-        if task.current_state == TaskState.DONE and task.metadata.get("safe_reply_text"):
-            payload = _build_standard_hydra_response(
-                task,
-                plan,
-                reply_text=str(task.metadata.get("safe_reply_text")).strip(),
-                mode="safe_reply",
-                summary="Conversation_message resuelta por flow_gemma_decision_layer.",
-                metadata={"hydra_event_type": "conversation_message"},
-            )
-            return _extract_hydra_reply(payload)
-
-        if task.current_state in {TaskState.ESCALATED, TaskState.HOLD, TaskState.WAITING_AUDIT, TaskState.FAILED}:
-            summary = (
-                "La conversación requiere intervención del asesor."
-                if task.current_state == TaskState.ESCALATED
-                else "La conversación quedó en revisión por Hydra."
-            )
-            _boardroom_notify(task, authority_events=authority_events, summary=summary)
-            payload = _build_standard_hydra_response(
-                task,
-                plan,
-                reply_text=_conversation_hold_reply(),
-                mode=task.current_state.value.lower(),
-                summary=summary,
-                metadata={"hydra_event_type": "conversation_message"},
-            )
-            return _extract_hydra_reply(payload)
-
-        return None
-    except Exception as exc:
-        log.exception("❌ Error en conversación Hydra local: %s", exc)
-        if task is not None:
-            _boardroom_trace(
-                task,
-                AuthorityActor.HYDRA,
-                TraceStage.ROUTING,
-                TraceStatus.FAILED,
-                "Fallo procesando conversation_message en Hydra local.",
-                metadata={"error": str(exc)[:300], "service_hint": svc or "general"},
-            )
-            _boardroom_apply_failure_fallback(
-                task,
-                "Falló el procesamiento conversacional en Hydra local.",
-                metadata={"error": str(exc)[:300], "hydra_event_type": "conversation_message"},
-            )
-        return None
-
-
-def ask_hydra_or_gpt(phone: str, text: str, svc: str | None = None) -> str:
-    hydra_reply = ask_hydra(phone, text, svc)
-    if hydra_reply:
-        return hydra_reply
-    notify_advisor(
-        f"📣 BOARDROOM HOLD – CONVERSACIÓN\n"
-        f"WhatsApp: {phone}\n"
-        f"Servicio: {svc or 'general'}\n"
-        f"Mensaje: {text[:400]}"
-    )
-    return _conversation_hold_reply()
 
 # ── Detección de servicio ─────────────────────────────────────────────────────
 _EXACT: dict = {
@@ -1426,30 +925,7 @@ def funnel_imss(phone: str, msg: str) -> None:
             f"Inbursa:  {data.get('inbursa', 'ND')}\n"
             f"Origen:   {data.get('origen', 'directo')}\n"
             "────────────────────────")
-        _trigger_hydra_lead(
-            phone,
-            "prestamo_imss",
-            metadata={
-                "nombre": data.get("nombre", ""),
-                "pension": data.get("pension", ""),
-                "monto": data.get("monto", ""),
-                "inbursa": data.get("inbursa", "")
-            },
-            product_config={
-                "product_code": "prestamo_imss",
-                "product_name": "Préstamo IMSS Ley 73",
-                "priority": "A",
-                "requirements": ["ine", "estado_de_cuenta"],
-                "stage_scripts": {
-                    "qualification": "Hola, te comparto los requisitos para tu Préstamo IMSS.",
-                    "default": "Seguimos con tu proceso COHIFIS."
-                },
-                "commission_rate": 0.08
-            },
-            confidence=0.95,
-            source="bot_vicky_redes",
-            svc_log="imss_prospect"
-        )
+        _notify_boardroom_lead_qualified(phone, "prestamo_imss", _ensure_user(phone))
         reset(phone)
         return
 
@@ -1509,20 +985,7 @@ def funnel_auto(phone: str, msg: str) -> None:
             f"Vehículo: {data.get('marca_modelo', 'ND')}\n"
             f"Año: {data.get('ano', 'ND')}"
         )
-        _trigger_hydra_lead(
-            phone,
-            "seguro_auto",
-            metadata={
-                "nombre": data.get("nombre", ""),
-                "tel": data.get("tel", ""),
-                "tiene_seguro_actual": data.get("tiene_seguro_actual", ""),
-                "marca_modelo": data.get("marca_modelo", ""),
-                "ano": data.get("ano", "")
-            },
-            product_name="Seguro de Auto Inbursa",
-            source="bot_vicky_redes",
-            svc_log="auto_prospect"
-        )
+        _notify_boardroom_lead_qualified(phone, "seguro_auto", _ensure_user(phone))
         reset(phone)
         return
 
@@ -1572,19 +1035,7 @@ def funnel_vida(phone: str, msg: str) -> None:
             f"Cobertura: {data.get('tipo_cobertura', 'ND')}\n"
             f"Edad: {data.get('edad', 'ND')}"
         )
-        _trigger_hydra_lead(
-            phone,
-            "vida_salud",
-            metadata={
-                "nombre": data.get("nombre", ""),
-                "tel": data.get("tel", ""),
-                "tipo_cobertura": data.get("tipo_cobertura", ""),
-                "edad": data.get("edad", "")
-            },
-            product_name="Seguro de Vida y Salud Inbursa",
-            source="bot_vicky_redes",
-            svc_log="vida_prospect"
-        )
+        _notify_boardroom_lead_qualified(phone, "vida_oro", _ensure_user(phone))
         reset(phone)
         return
 
@@ -1626,18 +1077,7 @@ def funnel_vrim(phone: str, msg: str) -> None:
             f"Teléfono: {data.get('tel', 'ND')}\n"
             f"Personas: {data.get('personas', 'ND')}"
         )
-        _trigger_hydra_lead(
-            phone,
-            "vrim",
-            metadata={
-                "nombre": data.get("nombre", ""),
-                "tel": data.get("tel", ""),
-                "personas": data.get("personas", "")
-            },
-            product_name="Tarjeta Médica VRIM",
-            source="bot_vicky_redes",
-            svc_log="vrim_prospect"
-        )
+        _notify_boardroom_lead_qualified(phone, "vrim", _ensure_user(phone))
         reset(phone)
         return
 
@@ -1709,6 +1149,7 @@ def funnel_emp(phone: str, msg: str) -> None:
             f"Ciudad: {data.get('ciudad', 'ND')}\n"
             f"Giro:   {data.get('giro', 'ND')}\n"
             f"Monto:  ${data.get('monto', 0):,.0f}")
+        _notify_boardroom_lead_qualified(phone, "credito_pyme", _ensure_user(phone))
         reset(phone)
         return
 
@@ -1861,8 +1302,27 @@ def handle(msg_obj: dict) -> None:
             _seen_ids.add(mid)
     _tl.mid = mid
 
-    if msg_obj.get("type") != "text":
-        _log(phone, _nombre(phone), f"[{msg_obj.get('type')}]", "entrante", "cliente", "", "", mid)
+    mtype = msg_obj.get("type", "")
+    if mtype in ("image", "document"):
+        media_id = (
+            msg_obj.get("image", {}).get("id")
+            or msg_obj.get("document", {}).get("id")
+            or ""
+        )
+        if media_id:
+            threading.Thread(
+                target=_notify_boardroom_document,
+                args=(phone, media_id, mtype),
+                daemon=True
+            ).start()
+            send_msg(phone,
+                "✅ Documento recibido. Christian López lo revisará "
+                "y te confirmará en breve."
+            )
+            return jsonify({"ok": True}), 200
+
+    if mtype and mtype != "text":
+        _log(phone, _nombre(phone), f"[{mtype}]", "entrante", "cliente", "", "", mid)
         send_msg(phone, "Por ahora solo proceso mensajes de texto 📩")
         return
 
@@ -1942,7 +1402,7 @@ def handle(msg_obj: dict) -> None:
     in_finance = _is_financial_context(n, svc)
 
     if svc and is_question:
-        send_msg(phone, ask_hydra_or_gpt(phone, text, svc))
+        send_msg(phone, ask_gpt(text, svc))
         return
 
     if svc:
@@ -1950,11 +1410,11 @@ def handle(msg_obj: dict) -> None:
         return
 
     if is_question and in_finance:
-        send_msg(phone, ask_hydra_or_gpt(phone, text, svc))
+        send_msg(phone, ask_gpt(text, svc))
         return
 
     if in_finance:
-        send_msg(phone, ask_hydra_or_gpt(phone, text, svc))
+        send_msg(phone, ask_gpt(text, svc))
         return
 
     show_menu(phone)
@@ -2007,6 +1467,87 @@ def webhook():
 def health():
     return jsonify({"status": "ok", "sheets": _srdy}), 200
 
+
+@app.route("/ext/boardroom/instruct", methods=["POST"])
+def boardroom_instruct():
+    """Recibe instrucciones de Boardroom para ejecutar en Vicky Redes."""
+    token = request.headers.get("X-Internal-Token", "").strip()
+    internal_token = os.getenv("INTERNAL_TOKEN", "").strip()
+    if not internal_token or token != internal_token:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    body = request.get_json(silent=True) or {}
+    phone = str(body.get("phone", "") or "").strip()
+    instruction = str(body.get("instruction", "") or "").strip()
+    payload = body.get("payload", {})
+
+    if not phone or not instruction:
+        return jsonify({
+            "ok": False,
+            "error": "phone e instruction requeridos"
+        }), 400
+
+    if instruction == "hot_transfer":
+        asesor_origen = payload.get("asesor_origen", "don_chiwy")
+        sub_campana = payload.get("sub_campana", "")
+        nombre = payload.get("nombre", "")
+        send_msg(phone,
+            f"Hola {nombre} 👋 Veo que ya eres parte de nuestra "
+            f"familia COHIFIS "
+            f"{'en la campaña ' + sub_campana if sub_campana else ''}. "
+            f"Tu asesor asignado te contactará en breve."
+        )
+        notify_advisor(
+            f"🔥 HOT TRANSFER — Cliente existente SII SECOM\n"
+            f"WhatsApp: {phone}\n"
+            f"Nombre: {nombre}\n"
+            f"Sub-campaña: {sub_campana}\n"
+            f"Asesor origen: {asesor_origen}\n"
+            f"⚡ Requiere atención inmediata"
+        )
+
+    elif instruction == "existing_client_greeting":
+        nombre = payload.get("nombre", "")
+        producto = payload.get("producto", "")
+        send_msg(phone,
+            f"Hola {nombre} 😊 Es un gusto verte de nuevo. "
+            f"Recuerdo que estuviste interesado en {producto}. "
+            f"¿En qué te puedo ayudar hoy?"
+        )
+
+    elif instruction == "escalate_chiwy":
+        motivo = payload.get("motivo", "Solicitud especial")
+        nombre = payload.get("nombre", "")
+        notify_advisor(
+            f"⚡ ESCALACIÓN DIRECTA — {nombre}\n"
+            f"WhatsApp: {phone}\n"
+            f"Motivo: {motivo}"
+        )
+        send_msg(phone,
+            "✅ Tu solicitud es importante. Christian López te "
+            "contactará personalmente en breve."
+        )
+
+    elif instruction == "resume_funnel":
+        funnel = payload.get("funnel", "")
+        if funnel == "imss": funnel_imss(phone, "")
+        elif funnel == "auto": funnel_auto(phone, "")
+        elif funnel == "vida": funnel_vida(phone, "")
+        elif funnel == "vrim": funnel_vrim(phone, "")
+        elif funnel in ("emp", "pyme"): funnel_emp(phone, "")
+
+    else:
+        return jsonify({
+            "ok": False,
+            "error": f"Instrucción desconocida: {instruction}"
+        }), 400
+
+    return jsonify({
+        "ok": True,
+        "instruction": instruction,
+        "phone": phone
+    }), 200
+
 @app.route("/ext/lead", methods=["POST"])
 def ext_lead():
     try:
@@ -2042,36 +1583,25 @@ def ext_lead():
             return jsonify({"ok": False, "error": "advisor_notify_failed"}), 502
 
         svc = detect_svc(interest) or ""
-        hydra_result = _trigger_hydra_lead(
-            telefono,
-            _service_to_product_code(svc),
-            metadata={
+        product_code = _service_to_product_code(svc)
+        threading.Thread(
+            target=_notify_boardroom_lead_qualified,
+            args=(telefono, product_code, {
                 "lead_id": lead_id,
                 "nombre": nombre,
                 "telefono": telefono,
                 "interest": interest,
                 "source": source,
-                "hydra_event_type": "lead_new",
                 "service_hint": svc or "general",
-            },
-            product_name=interest,
-            source=source,
-            svc_log="ext_lead",
-        )
-        if hydra_result is None:
-            log.error("❌ /ext/lead no pudo registrar la tarea en Hydra local [lead_id=%s]", lead_id)
-            return jsonify({"ok": False, "error": "hydra_task_registration_failed"}), 502
+            }),
+            daemon=True
+        ).start()
 
-        task_id = str(hydra_result.get("task_id") or "").strip()
-        execution_plan = hydra_result.get("execution_plan") or {}
-        disposition = execution_plan.get("disposition") if isinstance(execution_plan, dict) else None
-
-        log.info("✅ /ext/lead OK [lead_id=%s task_id=%s]", lead_id, task_id or "nd")
+        log.info("✅ /ext/lead OK [lead_id=%s product=%s]", lead_id, product_code)
         return jsonify({
             "ok": True,
-            "task_id": task_id,
-            "disposition": disposition,
-            "hydra_event_type": "lead_new",
+            "lead_id": lead_id,
+            "product_code": product_code,
         }), 200
     except Exception as exc:
         log.exception("❌ Error en /ext/lead: %s", exc)
