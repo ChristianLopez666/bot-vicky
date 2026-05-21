@@ -1,1616 +1,2140 @@
-import os
+# app.py — Vicky SECOM (HOTFIX 2: embudo activo antes de comandos globales)
+# Python 3.11+
+# ------------------------------------------------------------
+# Correcciones incluidas:
+# 1. _route_command() protege estados activos antes de comandos globales.
+# 2. vida_objetivo + "1" cierra Vida Temporal; no inicia IMSS.
+# 3. webhook_receive() no llama Boardroom cuando hay embudo activo local.
+# 4. /ext/send-promo y _bulk_send_worker no envían texto libre proactivo sin template.
+# 5. /ext/auto-send-one exige template para mensajes business-initiated.
+# ------------------------------------------------------------
+
+from __future__ import annotations
+
+import io
 import json
 import logging
+import os
 import re
-import hmac
-import hashlib
 import threading
-import unicodedata
-import uuid
 import time
-from collections import deque
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-import openai
-from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+from flask import Flask, jsonify, request
 
-
-# ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(message)s",
-                    datefmt="%Y-%m-%d %H:%M:%S")
-log = logging.getLogger(__name__)
-
+# Google
 try:
-    import pytz
-    _TZ = pytz.timezone("America/Mexico_City")
-    def now_mx(): return datetime.now(_TZ).strftime("%Y-%m-%d %H:%M:%S")
-except ImportError:
-    _TZ = timezone(timedelta(hours=-6))
-    def now_mx(): return datetime.now(_TZ).strftime("%Y-%m-%d %H:%M:%S")
-
-# ── Google Sheets (condicional) ───────────────────────────────────────────────
-try:
-    from google.oauth2.service_account import Credentials
+    from google.oauth2 import service_account
     from googleapiclient.discovery import build
-    _glibs = True
-except ImportError:
-    _glibs = False
-    log.warning("⚠️ google-api-python-client no instalado. Sheets deshabilitado.")
+    from googleapiclient.http import MediaIoBaseUpload
+except Exception:  # pragma: no cover - dependencias opcionales de entorno
+    service_account = None
+    build = None
+    MediaIoBaseUpload = None
 
+# GPT opcional
 try:
-    import redis
-    _redis_libs = True
-except ImportError:
-    redis = None
-    _redis_libs = False
-    log.warning("⚠️ redis no instalado. Persistencia en memoria.")
+    import openai
+except Exception:  # pragma: no cover - dependencia opcional
+    openai = None
 
-# ── Variables de entorno ──────────────────────────────────────────────────────
+
+# ==========================
+# Carga entorno + logging
+# ==========================
 load_dotenv()
 
-META_TOKEN   = os.getenv("META_TOKEN")
-WABA_ID      = os.getenv("WABA_PHONE_ID")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-ADVISOR_NUM  = os.getenv("ADVISOR_NUMBER", "5216682478005")
-OPENAI_KEY   = os.getenv("OPENAI_API_KEY")
-APP_SECRET   = os.getenv("META_APP_SECRET", "").strip()
-INTERNAL_TOKEN = os.getenv("INTERNAL_TOKEN", "").strip()
+META_TOKEN = os.getenv("META_TOKEN", "").strip()
+WABA_PHONE_ID = os.getenv("WABA_PHONE_ID", "").strip()
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "").strip()
+ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
+BOARDROOM_DECISION_URL = os.getenv("BOARDROOM_DECISION_URL", "").strip()
+BOARDROOM_AUTH_TOKEN = os.getenv("BOARDROOM_AUTH_TOKEN", "").strip()
+BOARDROOM_ENABLED = os.getenv("BOARDROOM_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+BOARDROOM_ORCHESTRATE_PATH = "/api/boardroom/orchestrate"
 
-# Notificación al asesor fuera de ventana 24h:
-# Crea un template aprobado en Meta Business Manager con un parámetro {{1}}.
-# Configura: ADVISOR_TEMPLATE_NAME=nombre_del_template
-ADV_TPL      = os.getenv("ADVISOR_TEMPLATE_NAME", "").strip()
-ADV_TPL_LANG = os.getenv("ADVISOR_TEMPLATE_LANG", "es_MX").strip()
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
+SHEETS_ID_LEADS = os.getenv("SHEETS_ID_LEADS", "").strip()
+SHEETS_TITLE_LEADS = os.getenv("SHEETS_TITLE_LEADS", "Prospectos SECOM Auto").strip()
+DRIVE_PARENT_FOLDER_ID = os.getenv("DRIVE_PARENT_FOLDER_ID", "").strip()
+AUTO_SEND_TOKEN = os.getenv("AUTO_SEND_TOKEN", "").strip()
 
-GG_CREDS  = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
-SHEET_ID  = os.getenv("SHEETS_ID_CONVERSACIONES", "").strip()
-SHEET_TAB = os.getenv("SHEETS_TAB_CONVERSACIONES", "Conversaciones").strip()
+PORT = int(os.getenv("PORT", "5000"))
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("vicky-secom")
 
-STATE_TTL = 24 * 60 * 60
-
-class StateStore:
-    def __init__(self, ttl: int = STATE_TTL):
-        self.ttl = ttl
-        self._redis = None
-        self._state_mem = {}
-        self._data_mem = {}
-        redis_url = (os.getenv("KV_URL", "").strip() or os.getenv("REDIS_URL", "").strip())
-        if redis_url and _redis_libs:
-            try:
-                self._redis = redis.Redis.from_url(redis_url, decode_responses=True)
-                self._redis.ping()
-                log.info("✅ StateStore conectado a Redis/Valkey.")
-            except Exception as e:
-                self._redis = None
-                log.warning("⚠️ Redis/Valkey no disponible. Usando memoria. err=%s", e)
-        elif redis_url and not _redis_libs:
-            log.warning("⚠️ KV_URL/REDIS_URL configurado pero redis no está instalado. Usando memoria.")
-        else:
-            log.warning("⚠️ KV_URL/REDIS_URL no configurado. Estado en memoria.")
-
-    def _key(self, kind: str, phone: str) -> str:
-        ph = re.sub(r"\D", "", str(phone))
-        return f"vicky:{kind}:{ph}"
-
-    def get_state(self, phone: str, default: str = "") -> str:
-        if self._redis:
-            key = self._key("state", phone)
-            val = self._redis.get(key)
-            if val is not None:
-                self._redis.expire(key, self.ttl)
-                return val
-            return default
-        return self._state_mem.get(str(phone), default)
-
-    def set_state(self, phone: str, state: str) -> None:
-        if self._redis:
-            self._redis.setex(self._key("state", phone), self.ttl, state or "")
-            return
-        self._state_mem[str(phone)] = state or ""
-
-    def pop_state(self, phone: str, default=None):
-        if self._redis:
-            key = self._key("state", phone)
-            val = self._redis.get(key)
-            self._redis.delete(key)
-            return val if val is not None else default
-        return self._state_mem.pop(str(phone), default)
-
-    def get_data(self, phone: str, default=None):
-        default = {} if default is None else default
-        if self._redis:
-            key = self._key("data", phone)
-            raw = self._redis.get(key)
-            if raw is None:
-                return dict(default) if isinstance(default, dict) else default
-            self._redis.expire(key, self.ttl)
-            try:
-                val = json.loads(raw)
-                return val if isinstance(val, dict) else (dict(default) if isinstance(default, dict) else default)
-            except Exception:
-                return dict(default) if isinstance(default, dict) else default
-        val = self._data_mem.get(str(phone))
-        if val is None:
-            return dict(default) if isinstance(default, dict) else default
-        return val
-
-    def set_data(self, phone: str, data: dict) -> None:
-        data = data if isinstance(data, dict) else {}
-        if self._redis:
-            self._redis.setex(self._key("data", phone), self.ttl, json.dumps(data, ensure_ascii=False))
-            return
-        self._data_mem[str(phone)] = data
-
-    def pop_data(self, phone: str, default=None):
-        if self._redis:
-            key = self._key("data", phone)
-            raw = self._redis.get(key)
-            self._redis.delete(key)
-            if raw is None:
-                return default
-            try:
-                return json.loads(raw)
-            except Exception:
-                return default
-        return self._data_mem.pop(str(phone), default)
-
-class _StateMap:
-    def __init__(self, store: StateStore):
-        self.store = store
-
-    def get(self, key, default=None):
-        return self.store.get_state(key, "" if default is None else default)
-
-    def __getitem__(self, key):
-        val = self.store.get_state(key, None)
-        if val is None:
-            raise KeyError(key)
-        return val
-
-    def __setitem__(self, key, value):
-        self.store.set_state(key, value)
-
-    def pop(self, key, default=None):
-        return self.store.pop_state(key, default)
-
-    def setdefault(self, key, default=None):
-        cur = self.store.get_state(key, None)
-        if cur is None:
-            self.store.set_state(key, "" if default is None else default)
-            return "" if default is None else default
-        return cur
-
-class _DataMap:
-    def __init__(self, store: StateStore):
-        self.store = store
-
-    def get(self, key, default=None):
-        return self.store.get_data(key, {} if default is None else default)
-
-    def __getitem__(self, key):
-        val = self.store.get_data(key, None)
-        if val is None:
-            raise KeyError(key)
-        return val
-
-    def __setitem__(self, key, value):
-        self.store.set_data(key, value)
-
-    def pop(self, key, default=None):
-        return self.store.pop_data(key, default)
-
-    def setdefault(self, key, default=None):
-        cur = self.store.get_data(key, None)
-        if cur is None:
-            val = {} if default is None else default
-            self.store.set_data(key, val)
-            return val
-        return cur
-
-
-
-# ── OpenAI ────────────────────────────────────────────────────────────────────
-_oai = None
-if OPENAI_KEY:
+if OPENAI_API_KEY and openai:
     try:
-        _oai = openai.OpenAI(api_key=OPENAI_KEY)
-        log.info("✅ OpenAI inicializado.")
+        openai.api_key = OPENAI_API_KEY
+        log.info("OpenAI configurado correctamente")
     except Exception:
-        log.exception("❌ Error inicializando OpenAI.")
+        log.warning("OpenAI configurado pero no disponible")
+
+
+# ==========================
+# Google setup degradable
+# ==========================
+creds = None
+sheets_svc = None
+drive_svc = None
+google_ready = False
+
+if GOOGLE_CREDENTIALS_JSON and service_account and build:
+    try:
+        info = json.loads(GOOGLE_CREDENTIALS_JSON)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+        sheets_svc = build("sheets", "v4", credentials=creds)
+        drive_svc = build("drive", "v3", credentials=creds)
+        google_ready = True
+        log.info("✅ Google services listos (Sheets + Drive)")
+    except Exception:
+        log.exception("❌ No fue posible inicializar Google. Modo mínimo activo.")
 else:
-    log.warning("⚠️ OPENAI_API_KEY no configurado. GPT deshabilitado.")
+    log.warning("⚠️ Credenciales de Google no disponibles. Modo mínimo activo.")
 
-# ── Flask + estado ────────────────────────────────────────────────────────────
+
+# =================================
+# Estado por usuario en memoria
+# =================================
 app = Flask(__name__)
-_state_store = StateStore()
-user_state = _StateMap(_state_store)
-user_data = _DataMap(_state_store)
+user_state: Dict[str, str] = {}
+user_data: Dict[str, Dict[str, Any]] = {}
 
 
+# ==========================
+# Constantes de router
+# ==========================
+ACTIVE_FUNNEL_PREFIXES = ("vida_", "imss_", "auto_", "tpv_", "emp_", "fp_")
+ESCAPE_COMMANDS = {"menu", "menú", "inicio", "cancelar", "salir"}
 
-def _service_to_product_code(svc: str | None) -> str:
-    return {
-        "imss": "prestamo_imss",
-        "auto": "seguro_auto",
-        "vida": "vida_salud",
-        "vrim": "vrim",
-        "emp": "credito_empresarial",
-        "fp": "financiamiento_practico",
-    }.get((svc or "").strip(), "general")
+# Campos que Boardroom/Vida puede actualizar sin abrir superficie de escritura arbitraria.
+VIDA_SHEET_FIELDS = {
+    "ESTATUS",
+    "PRODUCTO",
+    "ULTIMO_CONTACTO",
+    "NOTAS",
+    "BENEFICIO_OFRECIDO",
+    "LAST_MESSAGE",
+    "LAST_MESSAGE_AT",
+}
 
+TPV_TEMPLATE_NAME = "promo_tpv"
+ALLIANCE_TEMPLATES = {"despachis_contables"}
 
-def _conversation_intent(text: str) -> str:
-    n = norm(text)
-    if any(k in n for k in ("estatus", "seguimiento", "folio", "avance")):
-        return "policy_status"
-    if any(k in n for k in ("pago", "pagos", "mensualidad", "mensualidades")):
-        return "payment_question"
-    if any(k in n for k in ("requisito", "requisitos", "documento", "documentos", "papeles", "ine")):
-        return "document_request"
-    if any(k in n for k in ("cotiza", "cotizacion", "precio", "cuanto", "monto", "simular")):
-        return "quote_request"
-    if any(k in n for k in ("llamen", "asesor", "contacten", "ayuda humana")):
-        return "human_help"
-    return "general_question"
+SECOM_VIDA_TEMPLATES = {"vida_inbursa_proveedor_v1"}
 
+TEMPLATE_INTEREST_WORDS = {
+    "si",
+    "sí",
+    "s",
+    "ok",
+    "claro",
+    "me interesa",
+    "info",
+    "informacion",
+    "información",
+    "mas info",
+    "más info",
+}
 
-def _requires_human_guardrail(text: str) -> tuple[bool, bool, bool]:
-    n = norm(text)
-    business_action_requested = any(
-        k in n for k in (
-            "autoriza", "aprobar", "activar", "cancelar", "contratar",
-            "depositar", "transferir", "pagar", "registrar", "dar de alta"
-        )
-    )
-    persistent_state_mutation_requested = any(
-        k in n for k in (
-            "cambia mi", "actualiza mi", "modifica mi", "corrige mi",
-            "edita mi", "actualizar datos", "cambiar datos"
-        )
-    )
-    business_data = any(
-        k in n for k in (
-            "curp", "rfc", "nss", "seguro social", "numero de poliza",
-            "número de póliza", "cuenta bancaria", "clabe"
-        )
-    )
-    return business_action_requested, persistent_state_mutation_requested, business_data
+AWAITING_TEMPLATE_RECOVERABLE_STATUSES = {
+    "ENVIADO_INICIAL",
+}
 
 
-def _safe_reply_for_service(text: str, svc: str | None) -> tuple[str, str]:
-    service = (svc or "").strip()
-    n = norm(text)
-    if service == "imss":
-        if any(k in n for k in ("requisito", "requisitos", "papeles", "documento")):
-            return (
-                "document_request",
-                "Con gusto te oriento con el Préstamo IMSS Ley 73. Para revisar tu perfil necesito saber si tu pensión es del IMSS bajo Ley 73 y de cuánto es aproximadamente. ¿Me compartes esos dos datos?"
-            )
-        return (
-            "quote_request" if any(k in n for k in ("monto", "prestamo", "credito", "cuanto")) else "general_question",
-            "Sí te puedo orientar con el Préstamo IMSS Ley 73. Para darte información exacta necesito confirmar si eres pensionado del IMSS Ley 73 y el monto aproximado de tu pensión. ¿Cuál es tu pensión mensual?"
-        )
-    if service == "auto":
-        return (
-            "quote_request",
-            "Con gusto te ayudo con tu seguro de auto. La cotización depende del vehículo y perfil. ¿Me compartes marca, modelo y año de tu auto?"
-        )
-    if service == "vida":
-        return (
-            "quote_request",
-            "Te ayudo con vida y gastos médicos. Para orientarte bien necesito saber qué buscas: vida, gastos médicos mayores o ambas coberturas. ¿Cuál te interesa?"
-        )
-    if service == "vrim":
-        return (
-            "general_question",
-            "VRIM es una membresía médica. Para orientarte mejor necesito saber si la quieres solo para ti o para más personas. ¿Cuántas personas serían?"
-        )
-    if service == "emp":
-        return (
-            "quote_request",
-            "Te apoyo con financiamiento empresarial. Para darte una guía correcta necesito saber a qué se dedica tu empresa y qué monto buscas. ¿Cuál es el giro y cuánto necesitas?"
-        )
-    if service == "fp":
-        return (
-            "quote_request",
-            "Te ayudo con financiamiento práctico. Para orientarte con precisión necesito saber el monto y el tiempo en que lo requieres. ¿Cuánto necesitas y para cuándo?"
-        )
-    return (
-        _conversation_intent(text),
-        "Con gusto te oriento sobre préstamo IMSS, seguro de auto, vida/GMM, VRIM, financiamiento empresarial o financiamiento práctico. ¿Cuál de estos servicios te interesa?"
-    )
+# ==========================
+# Utilidades generales
+# ==========================
+WPP_API_URL = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages" if WABA_PHONE_ID else None
+WPP_TIMEOUT = 15
 
-
-
-# ── Idempotencia ──────────────────────────────────────────────────────────────
-_seen_ids: set = set()
-_seen_dq: deque = deque(maxlen=3000)
-_id_lock = threading.Lock()
-_tl = threading.local()
-
-def _mid() -> str:
-    return getattr(_tl, "mid", "")
-
-# ── Google Sheets ─────────────────────────────────────────────────────────────
-_svc = None
-_srdy = False
-_HDR = ["Phone", "Nombre", "Mensaje", "Fecha", "Tipo", "Origen",
-        "Servicio", "Estado", "Resultado", "Error", "MsgID"]
-
-def _sheets_init():
-    global _svc, _srdy
-    if not _glibs or not GG_CREDS or not SHEET_ID:
-        return
-    try:
-        creds = Credentials.from_service_account_info(
-            json.loads(GG_CREDS),
-            scopes=["https://www.googleapis.com/auth/spreadsheets"])
-        _svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
-        _srdy = True
-        r = _svc.spreadsheets().values().get(
-            spreadsheetId=SHEET_ID, range=f"{SHEET_TAB}!A1:K1").execute()
-        if not r.get("values"):
-            _svc.spreadsheets().values().update(
-                spreadsheetId=SHEET_ID, range=f"{SHEET_TAB}!A1:K1",
-                valueInputOption="RAW", body={"values": [_HDR]}).execute()
-        log.info("✅ Sheets inicializado.")
-    except Exception:
-        log.exception("❌ Error inicializando Sheets.")
-
-def _svc_name(phone: str) -> str:
-    s = user_state.get(phone, "")
-    if s.startswith("imss_"):
-        return "imss"
-    if s.startswith("emp_"):
-        return "empresarial"
-    if s.startswith("fp_"):
-        return "fp"
-    return "desconocido"
-
-def _nombre(phone: str) -> str:
-    return str((user_data.get(phone) or {}).get("nombre", ""))[:100]
-
-def _log(phone, nombre, msg, tipo, origen, resultado="", error="", mid=""):
-    if not _srdy:
-        return
-    try:
-        ph = re.sub(r"\D", "", str(phone))
-        _svc.spreadsheets().values().append(
-            spreadsheetId=SHEET_ID, range=f"{SHEET_TAB}!A:K",
-            valueInputOption="RAW", insertDataOption="INSERT_ROWS",
-            body={"values": [[
-                ph, str(nombre)[:100], str(msg)[:500], now_mx(),
-                tipo, origen, _svc_name(ph),
-                str(user_state.get(ph, ""))[:100],
-                resultado, str(error)[:300], str(mid)[:100]
-            ]]}).execute()
-    except Exception:
-        log.exception("❌ Error en Sheets")
-
-# ── WhatsApp helpers ──────────────────────────────────────────────────────────
-_WA_BASE = "https://graph.facebook.com/v20.0"
-
-def _wa_post(payload: dict) -> requests.Response:
-    url = f"{_WA_BASE}/{WABA_ID}/messages"
-    hdr = {"Authorization": f"Bearer {META_TOKEN}", "Content-Type": "application/json"}
-    return requests.post(url, headers=hdr, json=payload, timeout=15)
-
-def send_msg(to: str, text: str) -> bool:
-    if not META_TOKEN or not WABA_ID:
-        log.error("❌ META_TOKEN o WABA_PHONE_ID no configurados")
-        return False
-    try:
-        r = _wa_post({"messaging_product": "whatsapp", "to": str(to),
-                      "type": "text", "text": {"body": text}})
-        ok = r.status_code in (200, 201)
-        if not ok:
-            log.error(f"❌ WA {r.status_code}: {r.text[:200]}")
-        _log(to, _nombre(to), text, "saliente", "bot",
-             "ok" if ok else "error", "" if ok else r.text[:200], _mid())
-        return ok
-    except Exception as e:
-        log.exception(f"💥 send_msg {to}")
-        _log(to, _nombre(to), text, "saliente", "bot", "error", str(e)[:200], _mid())
-        return False
-
-def _is_internal_request(req) -> bool:
-    if not INTERNAL_TOKEN:
-        return False
-    provided = (req.headers.get("X-Internal-Token", "") or "").strip()
-    return bool(provided) and hmac.compare_digest(provided, INTERNAL_TOKEN)
-
-def notify_advisor(msg: str) -> bool:
-    """
-    Nivel 1 — texto libre (funciona dentro de ventana 24h del asesor).
-    Nivel 2 — template aprobada (ADVISOR_TEMPLATE_NAME) si el texto libre falla.
-    Sin template, la notificación fallará fuera de ventana 24h.
-    """
-    if not ADVISOR_NUM:
-        return False
-    try:
-        r = _wa_post({"messaging_product": "whatsapp", "to": ADVISOR_NUM,
-                      "type": "text", "text": {"body": msg}})
-        if r.status_code in (200, 201):
-            log.info("✅ Asesor notificado (texto libre)")
-            _log(ADVISOR_NUM, "Asesor", msg, "saliente", "asesor", "ok", "", _mid())
-            return True
-
-        err1 = f"HTTP {r.status_code}: {r.text[:150]}"
-        log.warning(f"⚠️ Texto libre al asesor falló ({err1}). Reintentando con template...")
-
-        if not ADV_TPL:
-            log.warning("⚠️ ADVISOR_TEMPLATE_NAME no configurado. "
-                        "Define esta variable con el template aprobado en Meta para "
-                        "notificaciones fuera de ventana 24h.")
-            _log(ADVISOR_NUM, "Asesor", msg, "saliente", "asesor", "error", err1, _mid())
-            return False
-
-        r2 = _wa_post({"messaging_product": "whatsapp", "to": ADVISOR_NUM,
-                       "type": "template", "template": {
-                           "name": ADV_TPL, "language": {"code": ADV_TPL_LANG},
-                           "components": [{"type": "body",
-                                           "parameters": [{"type": "text", "text": msg[:1024]}]}]}})
-        ok = r2.status_code in (200, 201)
-        _log(ADVISOR_NUM, "Asesor", msg, "saliente", "asesor",
-             "ok" if ok else "error", "" if ok else r2.text[:200], _mid())
-        if ok:
-            log.info("✅ Asesor notificado vía template")
-        else:
-            log.error(f"❌ Template falló: {r2.text[:200]}")
-        return ok
-
-    except Exception:
-        log.exception("💥 notify_advisor")
-        return False
-
-
-BOARDROOM_URL = os.getenv(
-    "BOARDROOM_URL",
-    "https://boardroom-engine.onrender.com"
-).strip()
-BOARDROOM_API_TOKEN = os.getenv("BOARDROOM_API_TOKEN", "").strip()
-
-
-def _notify_boardroom_document(phone: str, media_id: str, doc_type: str) -> None:
-    """Notifica a Boardroom que Vicky Redes recibió un documento."""
-    if not BOARDROOM_URL or not BOARDROOM_API_TOKEN:
-        log.warning("boardroom_not_configured: documento no notificado")
-        return
-    try:
-        resp = requests.post(
-            f"{BOARDROOM_URL}/api/document/process",
-            json={
-                "phone": phone,
-                "media_id": media_id,
-                "doc_type": doc_type,
-                "source": "vicky_redes"
-            },
-            headers={
-                "Content-Type": "application/json",
-                "X-Boardroom-Token": BOARDROOM_API_TOKEN
-            },
-            timeout=5
-        )
-        log.info("boardroom_doc_notified: phone=%s status=%s", phone, resp.status_code)
-    except Exception as e:
-        log.error("boardroom_doc_notify_failed: phone=%s error=%s", phone, e)
-
-
-def _notify_boardroom_lead_qualified(phone: str, product_code: str, data: dict) -> None:
-    """Notifica a Boardroom cuando Vicky Redes completa calificación."""
-    if not BOARDROOM_URL or not BOARDROOM_API_TOKEN:
-        log.warning("boardroom_not_configured: lead no notificado")
-        return
-    try:
-        from uuid import uuid4
-        resp = requests.post(
-            f"{BOARDROOM_URL}/boardroom/tasks/commercial",
-            json={
-                "event_id": str(uuid4()),
-                "lead_id": phone,
-                "event_type": "lead_new",
-                "product_code": product_code,
-                "product_config": {
-                    "product_code": product_code,
-                    "product_name": product_code.replace("_", " ").title(),
-                    "priority": "A",
-                    "requirements": ["ine", "comprobante_domicilio"],
-                    "stage_scripts": {
-                        "qualification": "Prospecto calificado por Vicky Redes.",
-                        "default": "Seguimos con tu proceso COHIFIS."
-                    },
-                    "commission_rate": 0.12
-                },
-                "classification": {
-                    "intent": "lead_new",
-                    "confidence": 0.95
-                },
-                "advisor_id": "don_chiwy",
-                "channel": "whatsapp",
-                "source": "vicky_redes",
-                "metadata": data
-            },
-            headers={
-                "Content-Type": "application/json",
-                "X-Boardroom-Token": BOARDROOM_API_TOKEN
-            },
-            timeout=8
-        )
-        log.info("boardroom_lead_notified: phone=%s product=%s status=%s",
-                 phone, product_code, resp.status_code)
-    except Exception as e:
-        log.error("boardroom_lead_notify_failed: phone=%s error=%s", phone, e)
-
-# ── Utilidades ────────────────────────────────────────────────────────────────
-def norm(text: str) -> str:
-    if not text:
-        return ""
-    t = unicodedata.normalize("NFD", text.lower().strip())
-    t = "".join(c for c in t if unicodedata.category(c) != "Mn")
-    t = t.replace("ñ", "n")
-    t = re.sub(r"[^\w\s]", " ", t)
-    return re.sub(r"\s+", " ", t).strip()
-
-def yes_no(text: str) -> str:
-    n = norm(text)
-    toks = set(n.split())
-    neg = {"no", "nel", "nop", "negativo", "tampoco", "nunca", "jamas"}
-    pos = {"si", "sip", "claro", "ok", "vale", "afirmativo", "yes", "correcto", "exacto", "andale", "dale"}
-    if toks & neg:
-        return "no"
-    if toks & pos or any(p in n for p in ("por supuesto", "desde luego", "claro que si")):
-        return "si"
-    return "?"
-
-def extract_num(text: str):
-    if not text:
-        return None
-    m = re.search(r"(\d{1,12})(\.\d+)?", re.sub(r"[$, ]", "", text))
-    if not m:
-        return None
-    try:
-        return float(m.group(1) + (m.group(2) or ""))
-    except Exception:
-        return None
-
-
-def _ensure_user(phone: str) -> dict:
-    return dict(user_data.get(phone) or {})
-
-def reset(phone: str):
-    user_state.pop(phone, None)
-    user_data.pop(phone, None)
-
-# ── Menú general ──────────────────────────────────────────────────────────────
-_MENU = (
-    "🏦 *Servicios Financieros Inbursa*\n"
-    "────────────────────────────\n"
-    "1️⃣  *Préstamo IMSS Pensionados Ley 73*\n"
-    "     💰 $40,000–$650,000 · Sin aval · Descuento vía pensión\n\n"
-    "2️⃣  *Seguro de Auto*\n"
-    "     🚗 Cobertura amplia · Asistencia 24/7\n\n"
-    "3️⃣  *Seguro de Vida y Salud*\n"
-    "     🏥 Vida · GMM · Hospitalización\n\n"
-    "4️⃣  *Tarjeta Médica VRIM*\n"
-    "     💳 Consultas ilimitadas · Labs · Descuentos\n\n"
-    "5️⃣  *Financiamiento Empresarial*\n"
-    "     🏢 $100K–$100M · PYMES y empresas\n\n"
-    "6️⃣  *Financiamiento Práctico Empresarial*\n"
-    "     ⚡ Aprobación desde 24 hrs · Sin garantía\n"
-    "────────────────────────────\n"
-    "Escribe el *número* o el nombre del servicio. 😊"
+MAIN_MENU = (
+    "🟦 *Vicky Bot — Inbursa*\n"
+    "Elige una opción:\n"
+    "1) Préstamo IMSS (Ley 73)\n"
+    "2) Seguro de Auto (cotización)\n"
+    "3) Seguros de Vida / Salud\n"
+    "4) Tarjeta médica VRIM\n"
+    "5) Crédito Empresarial\n"
+    "6) Financiamiento Práctico\n"
+    "7) Contactar con Christian\n"
+    "\nEscribe el número u opción (ej. 'imss', 'auto', 'empresarial', 'contactar')."
 )
 
-def show_menu(phone: str):
-    send_msg(phone, _MENU)
 
-# ── Detección de campaña IMSS ─────────────────────────────────────────────────
-_IMSS_STRONG = {
-    "prestamo imss", "credito imss",
-    "prestamos imss", "creditos imss",
-    "quiero prestamo imss", "quiero credito imss",
-    "ley 73",
-    "jubilado imss", "pensionado imss",
-    "informacion sobre el prestamo imss",
-    "quiero saber del prestamo imss",
-}
+def _utc_now_iso() -> str:
+    return datetime.utcnow().isoformat()
 
-_IMSS_REF_KW = {
-    "imss", "pension", "pensionado", "jubilado", "ley 73",
-    "prestamo imss", "credito imss"
-}
 
-def _is_campaign(msg_obj: dict, n: str) -> bool:
-    ref = msg_obj.get("referral") or {}
+def _normalize_phone_last10(phone: str) -> str:
+    digits = re.sub(r"\D", "", phone or "")
+    return digits[-10:] if len(digits) >= 10 else digits
 
-    if ref:
-        st = (ref.get("source_type") or "")
-        sid = (ref.get("source_id") or "")
-        hl = norm(ref.get("headline", ""))
-        bd = norm(ref.get("body", ""))
-        log.info(f"📎 referral source_type={st!r} source_id={sid!r} "
-                 f"headline={hl[:50]!r} body={bd[:50]!r}")
-        fields = f"{hl} {bd} {norm(sid)}"
-        if any(k in fields for k in _IMSS_REF_KW):
+
+def _normalize_to_e164_mx(phone_raw: str) -> str:
+    digits = re.sub(r"\D", "", phone_raw or "")
+    last10 = _normalize_phone_last10(digits)
+    if len(last10) == 10:
+        return f"521{last10}"
+    if digits.startswith("52") and len(digits) == 12:
+        return f"521{digits[2:]}"
+    if digits.startswith("521") and len(digits) == 13:
+        return digits
+    return digits
+
+
+def interpret_response(text: str) -> str:
+    if not text:
+        return "neutral"
+    t = text.lower().strip()
+    pos = ("sí", "si", "claro", "ok", "de acuerdo", "vale", "afirmativo", "correcto", "me interesa")
+    neg = ("no", "nel", "nop", "negativo", "no quiero", "no gracias", "no interesa")
+    if any(p in t for p in pos):
+        return "positive"
+    if any(n in t for n in neg):
+        return "negative"
+    return "neutral"
+
+
+def extract_number(text: str) -> Optional[float]:
+    if not text:
+        return None
+    clean = (
+        text.lower()
+        .replace(",", "")
+        .replace("$", "")
+        .replace("millón", "000000")
+        .replace("millon", "000000")
+        .replace("millones", "000000")
+    )
+    match = re.search(r"(\d{1,12}(?:\.\d+)?)", clean)
+    try:
+        return float(match.group(1)) if match else None
+    except Exception:
+        return None
+
+
+def _ensure_user(phone: str) -> Dict[str, Any]:
+    if phone not in user_data:
+        user_data[phone] = {}
+    return user_data[phone]
+
+
+def _is_active_funnel_state(state: str | None) -> bool:
+    return isinstance(state, str) and state.strip().startswith(ACTIVE_FUNNEL_PREFIXES)
+
+
+def _is_funnel_exit_command(text: str | None) -> bool:
+    return (text or "").strip().lower() in ESCAPE_COMMANDS
+
+
+def _should_continue_active_funnel(state: str | None, text: str | None) -> bool:
+    return _is_active_funnel_state(state) and not _is_funnel_exit_command(text)
+
+
+# ==========================
+# WhatsApp helpers
+# ==========================
+def _wpp_headers() -> Dict[str, str]:
+    return {"Authorization": f"Bearer {META_TOKEN}", "Content-Type": "application/json"}
+
+
+def _should_retry(status: int) -> bool:
+    return status == 429 or 500 <= status < 600
+
+
+def _backoff(attempt: int) -> None:
+    time.sleep(2**attempt)
+
+
+def send_message(to: str, text: str) -> bool:
+    """Envía mensaje de texto WPP dentro de conversación activa."""
+    if not (META_TOKEN and WPP_API_URL):
+        log.error("❌ WhatsApp no configurado (META_TOKEN/WABA_PHONE_ID faltan).")
+        return False
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": str(to),
+        "type": "text",
+        "text": {"body": str(text or "")[:4096]},
+    }
+
+    for attempt in range(3):
+        try:
+            log.info("📤 Enviando mensaje a %s (intento %s)", to, attempt + 1)
+            resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
+            if resp.status_code in (200, 201):
+                log.info("✅ Mensaje enviado exitosamente a %s", to)
+                return True
+            log.warning("⚠️ WPP send_message falló %s: %s", resp.status_code, resp.text[:200])
+            if _should_retry(resp.status_code) and attempt < 2:
+                _backoff(attempt)
+                continue
+            return False
+        except requests.exceptions.Timeout:
+            log.error("⏰ Timeout enviando mensaje a %s (intento %s)", to, attempt + 1)
+            if attempt < 2:
+                _backoff(attempt)
+                continue
+            return False
+        except Exception:
+            log.exception("❌ Error en send_message a %s", to)
+            if attempt < 2:
+                _backoff(attempt)
+                continue
+            return False
+    return False
+
+
+def send_template_message(to: str, template_name: str, params: Dict[str, Any] | List[Any] | None = None) -> bool:
+    """Envía plantilla Meta aprobada.
+
+    - params dict => parámetros nombrados con parameter_name.
+    - params list => parámetros posicionales.
+    """
+    if not (META_TOKEN and WPP_API_URL):
+        log.error("❌ WhatsApp no configurado para plantillas.")
+        return False
+
+    template_name = str(template_name or "").strip()
+    if not template_name:
+        log.error("❌ template_name vacío")
+        return False
+
+    components: List[Dict[str, Any]] = []
+
+    if template_name == "seguro_auto_70":
+        image_url = os.getenv("SEGURO_AUTO_70_IMAGE_URL", "").strip()
+        if not image_url:
+            log.error("❌ Falta SEGURO_AUTO_70_IMAGE_URL en entorno.")
+            return False
+        components.append({
+            "type": "header",
+            "parameters": [{"type": "image", "image": {"link": image_url}}],
+        })
+
+    params = params or {}
+    if isinstance(params, dict):
+        body_params = [
+            {"type": "text", "parameter_name": str(k), "text": str(v)}
+            for k, v in params.items()
+        ]
+        if body_params:
+            components.append({"type": "body", "parameters": body_params})
+    elif isinstance(params, list):
+        body_params = [{"type": "text", "text": str(v)} for v in params]
+        if body_params:
+            components.append({"type": "body", "parameters": body_params})
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": str(to),
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": "es_MX"},
+            **({"components": components} if components else {}),
+        },
+    }
+
+    for attempt in range(3):
+        try:
+            log.info("📤 Enviando plantilla '%s' a %s (intento %s)", template_name, to, attempt + 1)
+            resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
+            if resp.status_code in (200, 201):
+                message_id = ""
+                try:
+                    data = resp.json() if resp.text else {}
+                    messages = data.get("messages") or []
+                    if messages:
+                        message_id = (messages[0] or {}).get("id", "")
+                except Exception:
+                    message_id = ""
+                try:
+                    append_envio_status(str(to), message_id, "sent", template_name, _utc_now_iso())
+                except Exception:
+                    pass
+                log.info("✅ Plantilla '%s' enviada exitosamente a %s", template_name, to)
+                return True
+
+            log.warning("⚠️ WPP send_template falló %s: %s", resp.status_code, resp.text[:200])
+            if _should_retry(resp.status_code) and attempt < 2:
+                _backoff(attempt)
+                continue
+            return False
+        except requests.exceptions.Timeout:
+            log.error("⏰ Timeout enviando plantilla a %s (intento %s)", to, attempt + 1)
+            if attempt < 2:
+                _backoff(attempt)
+                continue
+            return False
+        except Exception:
+            log.exception("❌ Error en send_template_message a %s", to)
+            if attempt < 2:
+                _backoff(attempt)
+                continue
+            return False
+    return False
+
+
+def forward_media_to_advisor(media_type: str, media_id: str) -> None:
+    if not (META_TOKEN and WPP_API_URL and ADVISOR_NUMBER and media_id):
+        return
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": ADVISOR_NUMBER,
+        "type": media_type,
+        media_type: {"id": media_id},
+    }
+    try:
+        requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
+        log.info("📤 Multimedia reenviada al asesor (%s)", media_type)
+    except Exception:
+        log.exception("❌ Error reenviando multimedia al asesor")
+
+
+# ==========================
+# Google helpers
+# ==========================
+def _sheet_get_rows() -> Tuple[List[str], List[List[str]]]:
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
+        raise RuntimeError("Sheets no disponible (google_ready/SHEETS_ID_LEADS/SHEETS_TITLE_LEADS).")
+    rng = f"{SHEETS_TITLE_LEADS}!A:Z"
+    values = sheets_svc.spreadsheets().values().get(spreadsheetId=SHEETS_ID_LEADS, range=rng).execute()
+    rows = values.get("values", [])
+    if not rows:
+        return [], []
+    headers = [str(h).strip() for h in rows[0]]
+    return headers, rows[1:]
+
+
+def _idx(headers: List[str], name: str) -> Optional[int]:
+    target = name.strip().lower()
+    for i, header in enumerate(headers):
+        if (header or "").strip().lower() == target:
+            return i
+    return None
+
+
+def _cell(row: List[str], i: Optional[int]) -> str:
+    if i is None:
+        return ""
+    return (row[i] if i < len(row) else "") or ""
+
+
+def _update_row_cells(row_number_1based: int, updates: Dict[str, str], headers: List[str]) -> None:
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
+        raise RuntimeError("Sheets no disponible para update.")
+    data = []
+    for col_name, value in (updates or {}).items():
+        j = _idx(headers, col_name)
+        if j is None:
+            raise RuntimeError(f"No existe columna '{col_name}' en el Sheet.")
+        col_letter = chr(ord("A") + j)
+        a1 = f"{SHEETS_TITLE_LEADS}!{col_letter}{row_number_1based}"
+        data.append({"range": a1, "values": [[value]]})
+    if not data:
+        return
+    body = {"valueInputOption": "USER_ENTERED", "data": data}
+    sheets_svc.spreadsheets().values().batchUpdate(spreadsheetId=SHEETS_ID_LEADS, body=body).execute()
+
+
+def _safe_update_row_cells(
+    row_number_1based: int,
+    updates: Dict[str, str],
+    allowed_fields: Optional[set[str]] = None,
+) -> None:
+    try:
+        headers, _ = _sheet_get_rows()
+        if not headers:
+            log.warning("⚠️ Sheets sin headers; no se actualizaron campos")
+            return
+
+        filtered: Dict[str, str] = {}
+        for key, value in (updates or {}).items():
+            if allowed_fields and key not in allowed_fields:
+                log.warning("⚠️ Campo no permitido para update Sheets: %s", key)
+                continue
+            if _idx(headers, key) is None:
+                log.warning("⚠️ Columna '%s' no existe en el Sheet; se omite", key)
+                continue
+            filtered[key] = str(value)
+
+        if filtered:
+            _update_row_cells(int(row_number_1based), filtered, headers)
+    except Exception:
+        log.exception("⚠️ No fue posible actualizar Sheets; continúa flujo")
+
+
+def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
+        log.warning("⚠️ Sheets no disponible; no se puede hacer matching.")
+        return None
+    try:
+        headers, rows = _sheet_get_rows()
+        i_name = _idx(headers, "Nombre")
+        i_wa = _idx(headers, "WhatsApp")
+        i_status = _idx(headers, "ESTATUS")
+        i_last = _idx(headers, "LAST_MESSAGE_AT")
+
+        if i_wa is None:
+            log.warning("⚠️ No existe columna 'WhatsApp' en el Sheet.")
+            return None
+
+        target = str(phone_last10).strip()
+        for row_number, row in enumerate(rows, start=2):
+            if target and _normalize_phone_last10(_cell(row, i_wa)) == target:
+                nombre = _cell(row, i_name).strip() if i_name is not None else ""
+                estatus = _cell(row, i_status).strip() if i_status is not None else ""
+                last_at = _cell(row, i_last).strip() if i_last is not None else ""
+                log.info("✅ Cliente encontrado en Sheets: %s (%s)", nombre, target)
+                return {"row": row_number, "nombre": nombre, "estatus": estatus, "last_message_at": last_at, "raw": row}
+
+        log.info("ℹ️ Cliente no encontrado en Sheets: %s", target)
+        return None
+    except Exception:
+        log.exception("❌ Error buscando en Sheets")
+        return None
+
+
+def append_envio_status(phone: str, message_id: str, status: str, template_name: str, timestamp_iso: str) -> None:
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
+        return
+    try:
+        body = {"values": [[_normalize_phone_last10(phone), message_id or "", status or "", timestamp_iso or "", template_name or ""]]}
+        sheets_svc.spreadsheets().values().append(
+            spreadsheetId=SHEETS_ID_LEADS,
+            range="ENVIO_STATUS!A:E",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body=body,
+        ).execute()
+    except Exception:
+        log.exception("❌ Error escribiendo ENVIO_STATUS")
+
+
+def append_respuesta_cliente(phone: str, nombre: str, mensaje: str, fecha_iso: str) -> None:
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
+        return
+    try:
+        body = {"values": [[_normalize_phone_last10(phone), nombre or "", mensaje or "", fecha_iso or ""]]}
+        sheets_svc.spreadsheets().values().append(
+            spreadsheetId=SHEETS_ID_LEADS,
+            range="RESPUESTAS_CLIENTE!A:D",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body=body,
+        ).execute()
+    except Exception:
+        log.exception("❌ Error escribiendo RESPUESTAS_CLIENTE")
+
+
+def write_followup_to_sheets(row: int | str, note: str, date_iso: str) -> None:
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
+        log.warning("⚠️ Sheets no disponible; no se puede escribir seguimiento.")
+        return
+    try:
+        body = {"values": [[str(row), date_iso, note]]}
+        sheets_svc.spreadsheets().values().append(
+            spreadsheetId=SHEETS_ID_LEADS,
+            range="Seguimiento!A:C",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body=body,
+        ).execute()
+        log.info("✅ Seguimiento registrado en Sheets: %s", note)
+    except Exception:
+        log.exception("❌ Error escribiendo seguimiento en Sheets")
+
+
+def get_last_envio_template(phone_last10: str) -> str:
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
+        return ""
+    try:
+        resp = sheets_svc.spreadsheets().values().get(
+            spreadsheetId=SHEETS_ID_LEADS,
+            range="ENVIO_STATUS!A:E",
+        ).execute()
+        values = resp.get("values") or []
+        target = (phone_last10 or "").strip()
+        for row in reversed(values[1:]):
+            if len(row) >= 1 and _normalize_phone_last10(row[0]) == target:
+                return (row[4] if len(row) >= 5 else "").strip()
+    except Exception:
+        log.exception("❌ Error leyendo ENVIO_STATUS")
+    return ""
+
+
+def _find_or_create_client_folder(folder_name: str) -> Optional[str]:
+    if not (google_ready and drive_svc and DRIVE_PARENT_FOLDER_ID):
+        log.warning("⚠️ Drive no disponible; no se puede crear carpeta.")
+        return None
+    try:
+        safe_name = folder_name.replace("'", "\\'")
+        q = (
+            f"name = '{safe_name}' and mimeType = 'application/vnd.google-apps.folder' "
+            f"and '{DRIVE_PARENT_FOLDER_ID}' in parents and trashed = false"
+        )
+        resp = drive_svc.files().list(q=q, fields="files(id, name)").execute()
+        items = resp.get("files", [])
+        if items:
+            return items[0]["id"]
+        created = drive_svc.files().create(
+            body={
+                "name": folder_name,
+                "mimeType": "application/vnd.google-apps.folder",
+                "parents": [DRIVE_PARENT_FOLDER_ID],
+            },
+            fields="id",
+        ).execute()
+        return created.get("id")
+    except Exception:
+        log.exception("❌ Error creando/buscando carpeta en Drive")
+        return None
+
+
+def upload_to_drive(file_name: str, file_bytes: bytes, mime_type: str, folder_name: str) -> Optional[str]:
+    if not (google_ready and drive_svc and MediaIoBaseUpload):
+        log.warning("⚠️ Drive no disponible; no se puede subir archivo.")
+        return None
+    try:
+        folder_id = _find_or_create_client_folder(folder_name)
+        if not folder_id:
+            return None
+        media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=False)
+        created = drive_svc.files().create(
+            body={"name": file_name, "parents": [folder_id]},
+            media_body=media,
+            fields="id, webViewLink",
+        ).execute()
+        return created.get("webViewLink") or created.get("id")
+    except Exception:
+        log.exception("❌ Error subiendo archivo a Drive")
+        return None
+
+
+# ==========================
+# Menú y asesor
+# ==========================
+def send_main_menu(phone: str) -> None:
+    log.info("📋 Enviando menú principal a %s", phone)
+    send_message(phone, MAIN_MENU)
+
+
+def _notify_advisor(text: str) -> None:
+    try:
+        log.info("👨‍💼 Notificando al asesor: %s", text)
+        if ADVISOR_NUMBER:
+            send_message(ADVISOR_NUMBER, text)
+    except Exception:
+        log.exception("❌ Error notificando al asesor")
+
+
+def _match_name(match: Optional[Dict[str, Any]]) -> str:
+    return ((match or {}).get("nombre") or "").strip()
+
+
+# ==========================
+# Contextos post-campaña
+# ==========================
+def _parse_dt_maybe(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def _within_24h(value: str) -> bool:
+    dt = _parse_dt_maybe(value or "")
+    if not dt:
+        return False
+    now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.utcnow()
+    return (now - dt) <= timedelta(hours=24)
+
+
+def _tpv_is_context(match: Optional[Dict[str, Any]]) -> bool:
+    if not match:
+        return False
+    if (match.get("estatus") or "").strip().upper() != "ENVIADO_TPV":
+        return False
+    return _within_24h(match.get("last_message_at") or "")
+
+
+def tpv_start_from_reply(phone: str, text: str, match: Optional[Dict[str, Any]]) -> bool:
+    t = (text or "").strip().lower()
+    intent = interpret_response(text)
+    if t == "1" or intent == "positive":
+        user_state[phone] = "tpv_giro"
+        send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
+        return True
+    if t == "2" or intent == "negative":
+        user_state[phone] = "tpv_motivo"
+        send_message(phone, "Entendido. ¿Cuál fue el *motivo*? (opcional). Si no deseas responder, escribe *omitir*.")
+        return True
+    return False
+
+
+def _alianza_is_context(match: Optional[Dict[str, Any]]) -> bool:
+    if not match:
+        return False
+    if (match.get("estatus") or "").strip().upper() != "ENVIADO_ALIANZA":
+        return False
+    return _within_24h(match.get("last_message_at") or "")
+
+
+def _explicit_non_alianza_intent(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    alianza_signals = ("alianza", "despacho", "contable", "contables", "contador", "contadores", "comision", "comisión")
+    if any(k in t for k in alianza_signals):
+        return False
+    other_signals = (
+        "auto", "seguro", "póliza", "poliza", "tpv", "terminal", "imss", "ley 73",
+        "prestamo", "préstamo", "credito", "crédito", "vida", "salud", "vrim",
+    )
+    return any(k in t for k in other_signals)
+
+
+def _handle_alianza_context_response(phone: str, text: str, match: Dict[str, Any]) -> bool:
+    if user_state.get(phone, "") not in ("", "__greeted__"):
+        return False
+    if not _alianza_is_context(match):
+        return False
+    if _explicit_non_alianza_intent(text):
+        log.info("🔀 Escape ALIANZA→Router por intención explícita: %s", text)
+        return False
+    nombre = (match.get("nombre") or "").strip() or "Cliente"
+    _notify_advisor(
+        "🤝 ALIANZA — Interés/Respuesta detectada\n"
+        f"WhatsApp: {phone}\n"
+        f"Nombre: {nombre}\n"
+        f"Mensaje: {(text or '').strip()}"
+    )
+    send_message(
+        phone,
+        "✅ Gracias. Ya tengo tu interés en la *alianza para despachos contables*.\n"
+        "En breve te comparto la información y un asesor te contactará.\n"
+        "Para avanzar: ¿cómo se llama tu despacho y en qué ciudad estás?",
+    )
+    user_state[phone] = "__greeted__"
+    return True
+
+
+def _auto_is_context(match: Optional[Dict[str, Any]]) -> bool:
+    if not match:
+        return False
+    estatus = (match.get("estatus") or "").strip().upper()
+    if estatus not in {"ENVIADO_INICIAL", "ENVIADO_AUTO", "ENVIADO_SEGURO_AUTO"}:
+        return False
+    return _within_24h(match.get("last_message_at") or "")
+
+
+def _explicit_non_auto_intent(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    auto_signals = ("auto", "seguro auto", "seguro de auto", "póliza", "poliza", "placa", "placas")
+    if any(k in t for k in auto_signals):
+        return False
+    other_signals = (
+        "credito", "crédito", "prestamo", "préstamo", "imss", "ley 73", "empresarial",
+        "pyme", "tpv", "terminal", "vida", "salud", "vrim", "financiamiento",
+    )
+    return any(k in t for k in other_signals)
+
+
+def _handle_auto_context_response(phone: str, text: str, match: Dict[str, Any]) -> bool:
+    t = (text or "").strip().lower()
+    intent = interpret_response(text)
+    if user_state.get(phone, "") not in ("", "__greeted__"):
+        return False
+    if not _auto_is_context(match):
+        return False
+    if _explicit_non_auto_intent(text):
+        log.info("🔀 Escape AUTO→Router por intención explícita: %s", text)
+        return False
+
+    nombre = (match.get("nombre") or "").strip() or "Cliente"
+    if t in ("1", "si", "sí", "ok", "claro") or intent == "positive":
+        auto_start(phone, match)
+        return True
+
+    if t in ("2", "no", "nel") or intent == "negative":
+        user_state[phone] = "auto_vencimiento_fecha"
+        send_message(phone, f"Entendido {nombre}. Para poder recordarte a tiempo, ¿cuál es la *fecha de vencimiento* de tu póliza? (formato AAAA-MM-DD)")
+        _notify_advisor(
+            "🔔 AUTO — NO INTERESADO / TIENE SEGURO\n"
+            f"WhatsApp: {phone}\n"
+            f"Nombre: {nombre}\n"
+            f"Respuesta: {text}"
+        )
+        return True
+
+    if t in ("menu", "menú", "inicio"):
+        user_state[phone] = "__greeted__"
+        send_main_menu(phone)
+        return True
+
+    _notify_advisor(
+        "📩 AUTO — DUDA / INTERÉS detectada\n"
+        f"WhatsApp: {phone}\n"
+        f"Nombre: {nombre}\n"
+        f"Mensaje: {text}"
+    )
+    send_message(phone, "¿Deseas cotizar tu seguro de auto ahora? Responde *Sí* o *No*")
+    return True
+
+
+# ==========================
+# Boardroom
+# ==========================
+def _normalize_boardroom_url(url: str) -> str:
+    candidate = (url or "").strip()
+    if not candidate:
+        return ""
+    for dead_path in ("/boardroom/decision/process", "/api/decision/process"):
+        if dead_path in candidate:
+            candidate = candidate.replace(dead_path, BOARDROOM_ORCHESTRATE_PATH)
+    if candidate.endswith("/"):
+        candidate = candidate[:-1]
+    if candidate.startswith("http://") or candidate.startswith("https://"):
+        if BOARDROOM_ORCHESTRATE_PATH in candidate:
+            return candidate
+        if re.match(r"^https?://[^/]+$", candidate):
+            return f"{candidate}{BOARDROOM_ORCHESTRATE_PATH}"
+        return candidate
+    return ""
+
+
+def _infer_product_hint(text: str) -> str:
+    t = (text or "").strip().lower()
+    if t in ("3",) or any(k in t for k in ("vida", "vida temporal", "seguro de vida", "protección familiar", "proteccion familiar")):
+        return "vida_temporal"
+    if any(k in t for k in ("auto", "seguro auto", "placas", "póliza", "poliza")):
+        return "auto"
+    if any(k in t for k in ("tpv", "terminal", "punto de venta")):
+        return "tpv"
+    if any(k in t for k in ("imss", "ley 73", "pensión", "pension")):
+        return "imss"
+    if any(k in t for k in ("empresarial", "pyme")):
+        return "empresarial"
+    return "unknown"
+
+
+def send_to_boardroom(phone: str, text: str, match: Optional[Dict[str, Any]] = None, message_id: Optional[str] = None, state: Optional[str] = None) -> dict:
+    url = _normalize_boardroom_url(BOARDROOM_DECISION_URL)
+    if not (BOARDROOM_ENABLED and url and BOARDROOM_AUTH_TOKEN):
+        log.info("⚠️ Boardroom unavailable; fallback local")
+        return {"ok": False, "handled": False, "reason": "not_configured"}
+
+    payload = {
+        "source": "vicky_secom",
+        "channel": "whatsapp",
+        "phone": phone or "",
+        "message": text or "",
+        "message_id": message_id or "",
+        "state": state or "",
+        "priority": "commercial",
+        "product_hint": _infer_product_hint(text),
+        "metadata": {
+            "match_found": bool(match),
+            "lead_name": _match_name(match),
+            "sheet_row": str((match or {}).get("row") or ""),
+            "service": "vicky-bot-secom",
+        },
+    }
+    headers = {
+        "X-Boardroom-Token": BOARDROOM_AUTH_TOKEN,
+        "Authorization": f"Bearer {BOARDROOM_AUTH_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=3)
+        log.info("🧠 Boardroom request enviado")
+        if resp.status_code >= 400:
+            return {"ok": False, "handled": False, "reason": f"http_{resp.status_code}"}
+        data = resp.json() if resp.text else {}
+        return data if isinstance(data, dict) else {"ok": False, "handled": False, "reason": "invalid_response"}
+    except requests.exceptions.Timeout:
+        return {"ok": False, "handled": False, "reason": "timeout"}
+    except Exception:
+        log.exception("⚠️ Boardroom unavailable; fallback local")
+        return {"ok": False, "handled": False, "reason": "exception"}
+
+
+def _extract_boardroom_decision(decision: Any) -> Dict[str, Any]:
+    if not isinstance(decision, dict):
+        return {}
+    nested = decision.get("decision")
+    if isinstance(nested, dict):
+        merged = dict(decision)
+        merged.update(nested)
+        return merged
+    return dict(decision)
+
+
+def execute_boardroom_decision(phone: str, decision: Any, match: Optional[Dict[str, Any]] = None) -> bool:
+    try:
+        data = _extract_boardroom_decision(decision)
+        if not data:
+            return False
+
+        reply_raw = data.get("reply") or data.get("response") or data.get("message")
+        reply = reply_raw.strip() if isinstance(reply_raw, str) else ""
+        action = (data.get("action") or "").strip()
+        product = (data.get("product") or "").strip()
+        advisor_message = data.get("advisor_message")
+        notify_advisor = data.get("notify_advisor")
+        sheet_update = data.get("sheet_update")
+        valid_sheet_update = isinstance(sheet_update, dict) and bool(sheet_update)
+
+        if product == "vida_temporal" and match and match.get("row"):
+            _safe_update_row_cells(int(match["row"]), {"PRODUCTO": "vida_temporal"}, VIDA_SHEET_FIELDS)
+
+        if reply:
+            if valid_sheet_update and match and match.get("row"):
+                _safe_update_row_cells(int(match["row"]), sheet_update, VIDA_SHEET_FIELDS)
+            send_message(phone, reply)
+            log.info("✅ Boardroom decision handled")
             return True
 
-    if any(norm(k) in n for k in _IMSS_STRONG):
+        if action == "start_vida_temporal_flow":
+            vida_start(phone, match)
+            log.info("✅ Boardroom decision handled")
+            return True
+
+        if advisor_message:
+            _notify_advisor(str(advisor_message))
+            log.info("✅ Boardroom decision handled")
+            return True
+
+        if notify_advisor:
+            _notify_advisor(
+                "🔔 Boardroom — seguimiento requerido\n"
+                f"WhatsApp: {phone}\n"
+                f"Producto: {product or '(sin producto)'}\n"
+                f"Acción: {action or '(sin acción)'}"
+            )
+            log.info("✅ Boardroom decision handled")
+            return True
+
+        if valid_sheet_update and match and match.get("row"):
+            _safe_update_row_cells(int(match["row"]), sheet_update, VIDA_SHEET_FIELDS)
+            log.info("✅ Boardroom decision handled")
+            return True
+
+        return False
+    except Exception:
+        log.exception("⚠️ Error ejecutando decisión Boardroom; fallback local")
+        return False
+
+
+# ==========================
+# Embudos
+# ==========================
+def vida_start(phone: str, match: Optional[Dict[str, Any]] = None) -> None:
+    user_state[phone] = "vida_edad"
+    data = _ensure_user(phone)
+    data["producto"] = "vida_temporal"
+    log.info("🧬 Vida Temporal flow started")
+    try:
+        if match and match.get("row"):
+            _safe_update_row_cells(
+                int(match["row"]),
+                {
+                    "ESTATUS": "interesado",
+                    "PRODUCTO": "vida_temporal",
+                    "ULTIMO_CONTACTO": _utc_now_iso(),
+                    "NOTAS": "interesado en vida temporal desde WhatsApp",
+                    "BENEFICIO_OFRECIDO": "posible descuento hasta 40% sujeto a edad, perfil y condiciones",
+                    "LAST_MESSAGE": data.get("last_message", ""),
+                },
+                VIDA_SHEET_FIELDS,
+            )
+    except Exception:
+        log.exception("⚠️ No fue posible actualizar Sheets al iniciar Vida Temporal")
+
+    send_message(
+        phone,
+        "Perfecto, te ayudo con Seguro de Vida Temporal.\n\n"
+        "Para revisar una opción necesito algunos datos rápidos.\n\n"
+        "¿Cuál es tu edad?",
+    )
+
+
+def _vida_next(phone: str, text: str, match: Optional[Dict[str, Any]] = None) -> None:
+    st = user_state.get(phone, "")
+    data = _ensure_user(phone)
+    data["last_message"] = text or ""
+
+    if st == "vida_edad":
+        edad = extract_number(text)
+        if edad is None or edad < 18 or edad > 75:
+            send_message(phone, "Para revisar Seguro de Vida Temporal necesito una edad entre 18 y 75. ¿Cuál es tu edad?")
+            return
+        data["edad"] = int(edad)
+        user_state[phone] = "vida_fuma"
+        send_message(phone, "¿Fumas actualmente? Responde *sí* o *no*.")
+        return
+
+    if st == "vida_fuma":
+        intent = interpret_response(text)
+        if intent == "positive":
+            data["fuma"] = "sí"
+        elif intent == "negative":
+            data["fuma"] = "no"
+        else:
+            send_message(phone, "¿Fumas actualmente? Responde *sí* o *no*.")
+            return
+        user_state[phone] = "vida_estado"
+        send_message(phone, "¿En qué estado de la República vives?")
+        return
+
+    if st == "vida_estado":
+        estado = (text or "").strip()
+        if not estado:
+            send_message(phone, "¿En qué estado de la República vives?")
+            return
+        data["estado"] = estado
+        user_state[phone] = "vida_suma"
+        send_message(phone, "¿Qué suma asegurada te gustaría revisar? Ejemplo: 500 mil, 1 millón o 2 millones.")
+        return
+
+    if st == "vida_suma":
+        suma = (text or "").strip()
+        if not suma:
+            send_message(phone, "¿Qué suma asegurada te gustaría revisar? Ejemplo: 500 mil, 1 millón o 2 millones.")
+            return
+        data["suma"] = suma
+        user_state[phone] = "vida_objetivo"
+        send_message(phone, "¿Qué buscas proteger principalmente?\n1) Familia\n2) Deuda\n3) Negocio\n4) Otro")
+        return
+
+    if st == "vida_objetivo":
+        raw = (text or "").strip()
+        objetivo = {"1": "Familia", "2": "Deuda", "3": "Negocio", "4": "Otro"}.get(raw, raw.capitalize() if raw else "Otro")
+        data["objetivo"] = objetivo
+        send_message(
+            phone,
+            "Gracias. Ya tengo los datos iniciales para revisar una opción de Seguro de Vida Temporal.\n\n"
+            "Christian te dará seguimiento para revisar una propuesta según tu edad, perfil, suma asegurada y condiciones de contratación.",
+        )
+        _notify_advisor(
+            "🔔 VIDA TEMPORAL — Prospecto interesado\n"
+            f"WhatsApp: {phone}\n"
+            f"Nombre: {_match_name(match) or '(sin nombre)'}\n"
+            f"Edad: {data.get('edad', '')}\n"
+            f"Fuma: {data.get('fuma', '')}\n"
+            f"Estado: {data.get('estado', '')}\n"
+            f"Suma asegurada: {data.get('suma', '')}\n"
+            f"Objetivo: {data.get('objetivo', '')}"
+        )
+        try:
+            if match and match.get("row"):
+                _safe_update_row_cells(
+                    int(match["row"]),
+                    {
+                        "ESTATUS": "perfil_inicial_capturado",
+                        "PRODUCTO": "vida_temporal",
+                        "ULTIMO_CONTACTO": _utc_now_iso(),
+                        "NOTAS": "datos iniciales capturados para vida temporal",
+                        "LAST_MESSAGE": data.get("last_message", ""),
+                    },
+                    VIDA_SHEET_FIELDS,
+                )
+        except Exception:
+            log.exception("⚠️ No fue posible actualizar Sheets al cerrar Vida Temporal")
+        user_state[phone] = "__greeted__"
+        log.info("✅ Vida Temporal perfil inicial capturado")
+        return
+
+    vida_start(phone, match)
+
+
+def imss_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
+    user_state[phone] = "imss_beneficios"
+    log.info("🏥 Iniciando embudo IMSS para %s", phone)
+    send_message(phone, "🟩 *Préstamo IMSS Ley 73*\nBeneficios clave: trámite rápido, sin aval, pagos fijos y atención personalizada. ¿Te interesa conocer requisitos? (responde *sí* o *no*)")
+
+
+def _imss_next(phone: str, text: str) -> None:
+    st = user_state.get(phone, "")
+    data = _ensure_user(phone)
+    if st == "imss_beneficios":
+        if interpret_response(text) == "positive":
+            user_state[phone] = "imss_pension"
+            send_message(phone, "¿Cuál es tu *pensión mensual* aproximada? (ej. $8,500)")
+        else:
+            send_message(phone, "Sin problema. Si deseas volver al menú, escribe *menú*.")
+        return
+
+    if st == "imss_pension":
+        pension = extract_number(text)
+        if not pension:
+            send_message(phone, "No pude leer el monto. Indica tu *pensión mensual* (ej. 8500).")
+            return
+        data["imss_pension"] = pension
+        user_state[phone] = "imss_monto"
+        send_message(phone, "Gracias. ¿Qué *monto* te gustaría solicitar? (mínimo $40,000)")
+        return
+
+    if st == "imss_monto":
+        monto = extract_number(text)
+        if not monto:
+            send_message(phone, "Escribe un *monto* (ej. 100000).")
+            return
+        data["imss_monto"] = monto
+        user_state[phone] = "imss_nombre"
+        send_message(phone, "Perfecto. ¿Cuál es tu *nombre completo*?")
+        return
+
+    if st == "imss_nombre":
+        data["imss_nombre"] = text.strip()
+        user_state[phone] = "imss_ciudad"
+        send_message(phone, "¿En qué *ciudad* te encuentras?")
+        return
+
+    if st == "imss_ciudad":
+        data["imss_ciudad"] = text.strip()
+        user_state[phone] = "imss_nomina"
+        send_message(phone, "¿Tienes *nómina Inbursa* actualmente? (sí/no)\n*Nota:* No es obligatoria; si la tienes, accedes a *beneficios adicionales*.")
+        return
+
+    if st == "imss_nomina":
+        tiene_nomina = interpret_response(text) == "positive"
+        data["imss_nomina_inbursa"] = "sí" if tiene_nomina else "no"
+        msg = (
+            "✅ *Preautorizado*. Un asesor te contactará.\n"
+            f"- Nombre: {data.get('imss_nombre','')}\n"
+            f"- Ciudad: {data.get('imss_ciudad','')}\n"
+            f"- Pensión: ${data.get('imss_pension',0):,.0f}\n"
+            f"- Monto deseado: ${data.get('imss_monto',0):,.0f}\n"
+            f"- Nómina Inbursa: {data.get('imss_nomina_inbursa','no')}\n"
+        )
+        send_message(phone, msg)
+        _notify_advisor(f"🔔 IMSS — Prospecto preautorizado\nWhatsApp: {phone}\n{msg}")
+        user_state[phone] = "__greeted__"
+        send_main_menu(phone)
+        return
+
+    imss_start(phone, None)
+
+
+def emp_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
+    user_state[phone] = "emp_confirma"
+    log.info("🏢 Iniciando embudo empresarial para %s", phone)
+    send_message(phone, "🟦 *Crédito Empresarial*\n¿Eres empresario(a) o representas una empresa? (sí/no)")
+
+
+def _emp_next(phone: str, text: str) -> None:
+    st = user_state.get(phone, "")
+    data = _ensure_user(phone)
+    if st == "emp_confirma":
+        if interpret_response(text) != "positive":
+            send_message(phone, "Entendido. Si deseas volver al menú, escribe *menú*.")
+            return
+        user_state[phone] = "emp_giro"
+        send_message(phone, "¿A qué *se dedica* tu empresa?")
+        return
+    if st == "emp_giro":
+        data["emp_giro"] = text.strip()
+        user_state[phone] = "emp_monto"
+        send_message(phone, "¿Qué *monto* deseas? (mínimo $100,000)")
+        return
+    if st == "emp_monto":
+        monto = extract_number(text)
+        if not monto or monto < 100000:
+            send_message(phone, "El monto mínimo es $100,000. Indica un monto igual o mayor.")
+            return
+        data["emp_monto"] = monto
+        user_state[phone] = "emp_nombre"
+        send_message(phone, "¿Tu *nombre completo*?")
+        return
+    if st == "emp_nombre":
+        data["emp_nombre"] = text.strip()
+        user_state[phone] = "emp_ciudad"
+        send_message(phone, "¿Tu *ciudad*?")
+        return
+    if st == "emp_ciudad":
+        data["emp_ciudad"] = text.strip()
+        resumen = (
+            "✅ Gracias. Un asesor te contactará.\n"
+            f"- Nombre: {data.get('emp_nombre','')}\n"
+            f"- Ciudad: {data.get('emp_ciudad','')}\n"
+            f"- Giro: {data.get('emp_giro','')}\n"
+            f"- Monto: ${data.get('emp_monto',0):,.0f}\n"
+        )
+        send_message(phone, resumen)
+        _notify_advisor(f"🔔 Empresarial — Nueva solicitud\nWhatsApp: {phone}\n{resumen}")
+        user_state[phone] = "__greeted__"
+        send_main_menu(phone)
+        return
+    emp_start(phone, None)
+
+
+FP_QUESTIONS = [f"Pregunta {i}" for i in range(1, 12)]
+
+
+def fp_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
+    user_state[phone] = "fp_q1"
+    _ensure_user(phone)["fp_answers"] = {}
+    log.info("💰 Iniciando embudo financiamiento práctico para %s", phone)
+    send_message(phone, "🟩 *Financiamiento Práctico*\nResponderemos 11 preguntas rápidas.\n1) " + FP_QUESTIONS[0])
+
+
+def _fp_next(phone: str, text: str) -> None:
+    st = user_state.get(phone, "")
+    data = _ensure_user(phone)
+    if st.startswith("fp_q"):
+        idx = int(st.split("_q", 1)[1]) - 1
+        data.setdefault("fp_answers", {})[f"q{idx + 1}"] = text.strip()
+        if idx + 1 < len(FP_QUESTIONS):
+            user_state[phone] = f"fp_q{idx + 2}"
+            send_message(phone, f"{idx + 2}) {FP_QUESTIONS[idx + 1]}")
+            return
+        user_state[phone] = "fp_comentario"
+        send_message(phone, "¿Algún *comentario adicional*?")
+        return
+
+    if st == "fp_comentario":
+        data["fp_comentario"] = text.strip()
+        resumen = "✅ Gracias. Un asesor te contactará.\n" + "\n".join(
+            f"{k.upper()}: {v}" for k, v in data.get("fp_answers", {}).items()
+        )
+        if data.get("fp_comentario"):
+            resumen += f"\nCOMENTARIO: {data['fp_comentario']}"
+        send_message(phone, resumen)
+        _notify_advisor(f"🔔 Financiamiento Práctico — Resumen\nWhatsApp: {phone}\n{resumen}")
+        user_state[phone] = "__greeted__"
+        send_main_menu(phone)
+        return
+
+    fp_start(phone, None)
+
+
+def auto_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
+    user_state[phone] = "auto_intro"
+    log.info("🚗 Iniciando embudo seguro auto para %s", phone)
+    send_message(
+        phone,
+        "🚗 *Seguro de Auto*\nEnvíame por favor:\n• INE (frente)\n• Tarjeta de circulación *o* número de placas\n\nCuando lo envíes, te confirmaré recepción y procesaré la cotización.",
+    )
+
+
+def _auto_next(phone: str, text: str) -> None:
+    st = user_state.get(phone, "")
+    if st == "auto_intro":
+        intent = interpret_response(text)
+        lower = text.lower()
+        if "vencimiento" in lower or "vence" in lower or "fecha" in lower:
+            user_state[phone] = "auto_vencimiento_fecha"
+            send_message(phone, "¿Cuál es la *fecha de vencimiento* de tu póliza actual? (formato AAAA-MM-DD)")
+            return
+        if intent == "negative":
+            user_state[phone] = "auto_vencimiento_fecha"
+            send_message(phone, "Entendido. Para poder recordarte a tiempo, ¿cuál es la *fecha de vencimiento* de tu póliza? (AAAA-MM-DD)")
+            return
+        send_message(phone, "Perfecto. Puedes empezar enviando los *documentos* o una *foto* de la tarjeta/placas.")
+        return
+
+    if st == "auto_vencimiento_fecha":
+        try:
+            fecha = datetime.fromisoformat(text.strip()).date()
+            objetivo = fecha - timedelta(days=30)
+            write_followup_to_sheets("auto_recordatorio", f"Recordatorio póliza -30d para {phone}", objetivo.isoformat())
+            threading.Thread(target=_retry_after_days, args=(phone, 7), daemon=True).start()
+            send_message(phone, f"✅ Gracias. Te contactaré *un mes antes* ({objetivo.isoformat()}).")
+            user_state[phone] = "__greeted__"
+            send_main_menu(phone)
+        except Exception:
+            send_message(phone, "Formato inválido. Usa AAAA-MM-DD. Ejemplo: 2025-12-31")
+        return
+
+    auto_start(phone, None)
+
+
+def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
+    st = user_state.get(phone, "")
+    data = _ensure_user(phone)
+    nombre = _match_name(match)
+
+    if st == "tpv_giro":
+        giro = (text or "").strip()
+        if not giro:
+            send_message(phone, "Solo indícame tu *giro* (ej. restaurante, abarrotes, consultorio).")
+            return
+        data["tpv_giro"] = giro
+        user_state[phone] = "tpv_horario"
+        send_message(phone, "¿Qué *horario* te conviene para que Christian te contacte? (ej. hoy 4pm, mañana 10am)")
+        return
+
+    if st == "tpv_horario":
+        horario = (text or "").strip()
+        if not horario:
+            send_message(phone, "Indícame un *horario* (ej. hoy 4pm, mañana 10am).")
+            return
+        data["tpv_horario"] = horario
+        resumen = (
+            "✅ Listo. En breve Christian te contactará para ofrecerte la mejor opción de terminal.\n"
+            f"- Giro: {data.get('tpv_giro','')}\n"
+            f"- Horario: {data.get('tpv_horario','')}"
+        )
+        send_message(phone, resumen)
+        _notify_advisor(
+            "🔔 TPV — Prospecto interesado\n"
+            f"WhatsApp: {phone}\n"
+            f"Nombre: {nombre or '(sin nombre)'}\n"
+            f"Giro: {data.get('tpv_giro','')}\n"
+            f"Horario: {data.get('tpv_horario','')}"
+        )
+        try:
+            if match and match.get("row"):
+                headers, _ = _sheet_get_rows()
+                if headers and _idx(headers, "ESTATUS") is not None:
+                    _update_row_cells(int(match["row"]), {"ESTATUS": "TPV_INTERESADO"}, headers)
+        except Exception:
+            log.exception("⚠️ No fue posible actualizar ESTATUS TPV_INTERESADO")
+        user_state[phone] = "__greeted__"
+        return
+
+    if st == "tpv_motivo":
+        motivo = (text or "").strip()
+        if motivo.lower() == "omitir":
+            motivo = ""
+        data["tpv_motivo"] = motivo
+        send_message(phone, "Gracias por tu respuesta. Si más adelante deseas una terminal, aquí estaré para ayudarte.")
+        try:
+            if match and match.get("row"):
+                headers, _ = _sheet_get_rows()
+                if headers and _idx(headers, "ESTATUS") is not None:
+                    _update_row_cells(int(match["row"]), {"ESTATUS": "TPV_NO_INTERESADO"}, headers)
+        except Exception:
+            log.exception("⚠️ No fue posible actualizar ESTATUS TPV_NO_INTERESADO")
+        user_state[phone] = "__greeted__"
+        return
+
+    user_state[phone] = "tpv_giro"
+    send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
+
+
+def _retry_after_days(phone: str, days: int) -> None:
+    try:
+        time.sleep(days * 24 * 60 * 60)
+        send_message(phone, "⏰ Seguimos a tus órdenes. ¿Deseas que coticemos tu seguro de auto cuando se acerque el vencimiento?")
+        write_followup_to_sheets("auto_reintento", f"Reintento +{days}d enviado a {phone}", _utc_now_iso())
+    except Exception:
+        log.exception("Error en reintento programado")
+
+
+# ==========================
+# Router helpers
+# ==========================
+def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
+    match = match_client_in_sheets(_normalize_phone_last10(phone))
+    base = "Dime qué necesitas y con gusto te guío para ayudarte a encontrar el servicio que necesitas."
+    nombre = _match_name(match)
+    send_message(phone, f"Hola {nombre} 👋 {base}" if nombre else f"Hola 👋 {base}")
+    return match
+
+
+def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
+    t = (text or "").strip().lower()
+    st = user_state.get(phone, "")
+
+    # HOTFIX 2 SECOM:
+    # Estado activo local tiene prioridad absoluta sobre comandos globales.
+    # Esto evita que "1" dentro de vida_objetivo active IMSS.
+    log.info("🧭 _route_command phone=%s state=%s text=%s", phone, st, text)
+
+    if st.startswith(ACTIVE_FUNNEL_PREFIXES) and t in ESCAPE_COMMANDS:
+        user_state[phone] = "__greeted__"
+        send_main_menu(phone)
+        return
+
+    if st.startswith("vida_"):
+        log.info("🧭 vida dispatch active phone=%s state=%s text=%s", phone, st, text)
+        _vida_next(phone, text, match)
+        return
+
+    if st.startswith("imss_"):
+        _imss_next(phone, text)
+        return
+
+    if st.startswith("auto_"):
+        _auto_next(phone, text)
+        return
+
+    if st.startswith("tpv_"):
+        _tpv_next(phone, text, match)
+        return
+
+    if st.startswith("emp_"):
+        _emp_next(phone, text)
+        return
+
+    if st.startswith("fp_"):
+        _fp_next(phone, text)
+        return
+
+    # TPV por contexto de plantilla queda después del dispatch temprano.
+    if _tpv_is_context(match):
+        if tpv_start_from_reply(phone, text, match):
+            return
+
+    tlow = t.lower()
+    if (
+        ("credito" in tlow or "crédito" in tlow or "prestamo" in tlow or "préstamo" in tlow)
+        and not any(k in tlow for k in ("auto", "seguro auto", "seguro de auto", "póliza", "poliza", "placa"))
+    ):
+        send_message(
+            phone,
+            "¿Qué tipo de crédito buscas?\n"
+            "1) Préstamo IMSS (Ley 73)\n"
+            "5) Crédito Empresarial\n"
+            "6) Financiamiento Práctico\n\n"
+            "Responde *1*, *5* o *6*.",
+        )
+        return
+
+    if t in ("1", "imss", "ley 73", "préstamo", "prestamo", "pension", "pensión"):
+        log.info("🧭 imss_start candidate phone=%s state=%s text=%s", phone, user_state.get(phone, ""), text)
+        imss_start(phone, match)
+    elif t in ("2", "auto", "seguros de auto", "seguro auto"):
+        auto_start(phone, match)
+    elif t in (
+        "3", "vida", "salud", "seguro de vida", "seguro de salud", "vida temporal",
+        "seguro vida", "seguros de vida", "protección familiar", "proteccion familiar",
+        "seguro de vida y salud",
+    ):
+        vida_start(phone, match)
+    elif t in ("4", "vrim", "tarjeta médica", "tarjeta medica"):
+        send_message(phone, "🩺 *VRIM* — Membresía médica. Notificaré al asesor para darte detalles.")
+        _notify_advisor(f"🔔 VRIM — Solicitud de contacto\nWhatsApp: {phone}")
+        send_main_menu(phone)
+    elif t in ("5", "empresarial", "pyme", "crédito empresarial", "credito empresarial"):
+        emp_start(phone, match)
+    elif t in ("6", "financiamiento práctico", "financiamiento practico", "crédito simple", "credito simple", "financiamiento"):
+        fp_start(phone, match)
+    elif t in ("7", "contactar", "asesor", "contactar con christian"):
+        _notify_advisor(f"🔔 Contacto directo — Cliente solicita hablar\nWhatsApp: {phone}")
+        send_message(phone, "✅ Listo. Avisé a Christian para que te contacte.")
+        send_main_menu(phone)
+    elif t in ("menu", "menú", "inicio"):
+        user_state[phone] = "__greeted__"
+        send_main_menu(phone)
+    else:
+        send_message(
+            phone,
+            "En breve, su asesor Christian López se pondrá en contacto con usted para brindarle asesoría personalizada y resolver todas sus dudas de manera directa y segura. Escribe *menú* para ver opciones.",
+        )
+
+
+# ==========================
+# Webhook
+# ==========================
+@app.get("/webhook")
+def webhook_verify():
+    try:
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge", "")
+        if mode == "subscribe" and token == VERIFY_TOKEN:
+            log.info("✅ Webhook verificado exitosamente")
+            return challenge, 200
+    except Exception:
+        log.exception("❌ Error en verificación webhook")
+    log.warning("❌ Webhook verification failed")
+    return "Error", 403
+
+
+def _download_media(media_id: str) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
+    if not META_TOKEN:
+        return None, None, None
+    try:
+        meta = requests.get(
+            f"https://graph.facebook.com/v20.0/{media_id}",
+            headers={"Authorization": f"Bearer {META_TOKEN}"},
+            timeout=WPP_TIMEOUT,
+        )
+        if meta.status_code != 200:
+            log.warning("⚠️ Meta media meta falló %s: %s", meta.status_code, meta.text[:200])
+            return None, None, None
+
+        meta_json = meta.json()
+        url = meta_json.get("url")
+        mime = meta_json.get("mime_type")
+        filename = meta_json.get("filename") or f"media_{media_id}"
+        if not url:
+            return None, None, None
+
+        binary = requests.get(url, headers={"Authorization": f"Bearer {META_TOKEN}"}, timeout=WPP_TIMEOUT)
+        if binary.status_code != 200:
+            log.warning("⚠️ Meta media download falló %s", binary.status_code)
+            return None, None, None
+
+        log.info("✅ Media descargada: %s (%s bytes)", filename, len(binary.content))
+        return binary.content, mime, filename
+    except Exception:
+        log.exception("❌ Error descargando media")
+        return None, None, None
+
+
+def _handle_media(phone: str, msg: Dict[str, Any]) -> None:
+    try:
+        media_id = None
+        media_type = msg.get("type")
+        if media_type in {"image", "document", "audio", "video"}:
+            media_id = (msg.get(media_type) or {}).get("id")
+
+        if not media_id:
+            send_message(phone, "Recibí tu archivo, gracias. (No se pudo identificar el contenido).")
+            return
+
+        forward_media_to_advisor(media_type, media_id)
+
+        file_bytes, mime, filename = _download_media(media_id)
+        if not file_bytes:
+            send_message(phone, "Recibí tu archivo, pero hubo un problema procesándolo.")
+            return
+
+        match = match_client_in_sheets(_normalize_phone_last10(phone))
+        last4 = _normalize_phone_last10(phone)[-4:]
+        folder_name = f"{_match_name(match).replace(' ', '_')}_{last4}" if _match_name(match) else f"Cliente_{last4}"
+        link = upload_to_drive(filename, file_bytes, mime or "application/octet-stream", folder_name)
+        _notify_advisor(f"🔔 Multimedia recibida\nDesde: {phone}\nArchivo: {filename}\nDrive: {link or '(sin link Drive)'}")
+        send_message(phone, "✅ *Recibido y en proceso*. En breve te doy seguimiento.")
+    except Exception:
+        log.exception("❌ Error manejando multimedia")
+        send_message(phone, "Recibí tu archivo, gracias. Si algo falla, lo reviso de inmediato.")
+
+
+def _is_recent_awaiting_template_context(phone: str, match: Optional[Dict[str, Any]]) -> bool:
+    """Valida ventana 24h usando memoria si existe, o Sheets como fallback."""
+    try:
+        started_at = (_ensure_user(phone).get("awaiting_info_started_at") or "").strip()
+        if started_at and _within_24h(started_at):
+            return True
+    except Exception:
+        pass
+
+    try:
+        last_message_at = ((match or {}).get("last_message_at") or "").strip()
+        return bool(last_message_at and _within_24h(last_message_at))
+    except Exception:
+        return False
+
+
+def _resolve_awaiting_template_context(phone: str, match: Optional[Dict[str, Any]]) -> str:
+    """
+    Resuelve template pendiente desde:
+    1) user_state en memoria.
+    2) Sheets + ENVIO_STATUS cuando Render reinició y perdió memoria.
+
+    Gobernanza:
+    - Solo recupera contexto si está dentro de 24h.
+    - Solo recupera estatus outbound permitido.
+    - Solo aplica a templates explícitamente registrados.
+    """
+    st = user_state.get(phone, "")
+
+    if st.startswith("awaiting_info:"):
+        template_name = st.split(":", 1)[1].strip()
+
+        if not _is_recent_awaiting_template_context(phone, match):
+            log.info("⏳ awaiting_info expirado para %s template=%s", phone, template_name)
+            user_state[phone] = "__greeted__"
+            return ""
+
+        return template_name
+
+    if not match:
+        return ""
+
+    if not _is_recent_awaiting_template_context(phone, match):
+        return ""
+
+    estatus = ((match or {}).get("estatus") or "").strip().upper()
+    if estatus not in AWAITING_TEMPLATE_RECOVERABLE_STATUSES:
+        return ""
+
+    last_tpl = get_last_envio_template(_normalize_phone_last10(phone))
+    if last_tpl in SECOM_VIDA_TEMPLATES:
+        log.info("♻️ Recuperando contexto awaiting_info desde Sheets/ENVIO_STATUS phone=%s template=%s", phone, last_tpl)
+        return last_tpl
+
+    return ""
+
+
+def _handle_awaiting_template_response(phone: str, text: str, match: Optional[Dict[str, Any]]) -> bool:
+    template_name = _resolve_awaiting_template_context(phone, match)
+    if not template_name:
+        return False
+
+    t = (text or "").strip().lower()
+    nombre = _match_name(match) or "(sin nombre)"
+
+    if template_name in SECOM_VIDA_TEMPLATES:
+        if t in TEMPLATE_INTEREST_WORDS or interpret_response(text) == "positive":
+            _notify_advisor(
+                "🚨 SECOM / VIDA INBURSA — Prospecto interesado\n"
+                f"Template: {template_name}\n"
+                f"WhatsApp: {phone}\n"
+                f"Nombre: {nombre}\n"
+                f"Respuesta: {text}"
+            )
+
+            try:
+                if match and match.get("row"):
+                    _safe_update_row_cells(
+                        int(match["row"]),
+                        {
+                            "ESTATUS": "INTERESADO_SECOM_VIDA",
+                            "PRODUCTO": "vida_inbursa",
+                            "ULTIMO_CONTACTO": _utc_now_iso(),
+                            "LAST_MESSAGE_AT": _utc_now_iso(),
+                            "NOTAS": f"Respondió interés a plantilla {template_name}: {text}",
+                            "LAST_MESSAGE": text,
+                        },
+                        VIDA_SHEET_FIELDS,
+                    )
+            except Exception:
+                log.exception("⚠️ No fue posible actualizar Sheets para interés SECOM VIDA")
+
+            send_message(
+                phone,
+                "En breve, su asesor Christian López se pondrá en contacto con usted para "
+                "brindarle asesoría personalizada y resolver todas sus dudas de manera directa y segura. "
+                "Escribe *menú* para ver opciones."
+            )
+            user_state[phone] = "__greeted__"
+            return True
+
+        if interpret_response(text) == "negative":
+            try:
+                if match and match.get("row"):
+                    _safe_update_row_cells(
+                        int(match["row"]),
+                        {
+                            "ESTATUS": "NO_INTERESADO_SECOM_VIDA",
+                            "ULTIMO_CONTACTO": _utc_now_iso(),
+                            "LAST_MESSAGE_AT": _utc_now_iso(),
+                            "NOTAS": f"No interesado a plantilla {template_name}: {text}",
+                            "LAST_MESSAGE": text,
+                        },
+                        VIDA_SHEET_FIELDS,
+                    )
+            except Exception:
+                log.exception("⚠️ No fue posible actualizar Sheets para rechazo SECOM VIDA")
+
+            send_message(phone, "Gracias por tu respuesta. Quedo a tus órdenes si más adelante deseas revisarlo.")
+            user_state[phone] = "__greeted__"
+            return True
+
+        _notify_advisor(
+            "📩 SECOM / VIDA INBURSA — Respuesta o duda detectada\n"
+            f"Template: {template_name}\n"
+            f"WhatsApp: {phone}\n"
+            f"Nombre: {nombre}\n"
+            f"Mensaje: {text}"
+        )
+
+        try:
+            if match and match.get("row"):
+                _safe_update_row_cells(
+                    int(match["row"]),
+                    {
+                        "ESTATUS": "DUDA_SECOM_VIDA",
+                        "ULTIMO_CONTACTO": _utc_now_iso(),
+                        "LAST_MESSAGE_AT": _utc_now_iso(),
+                        "NOTAS": f"Respuesta neutral a plantilla {template_name}: {text}",
+                        "LAST_MESSAGE": text,
+                    },
+                    VIDA_SHEET_FIELDS,
+                )
+        except Exception:
+            log.exception("⚠️ No fue posible actualizar Sheets para duda SECOM VIDA")
+
+        send_message(
+            phone,
+            "Gracias. En breve, su asesor Christian López se pondrá en contacto con usted para darle seguimiento."
+        )
+        user_state[phone] = "__greeted__"
         return True
 
     return False
 
-# ── GPT ───────────────────────────────────────────────────────────────────────
-_SYS = (
-    "Eres Vicky, asistente comercial de Christian López, asesor financiero de Inbursa. "
-    "Orientas sobre 6 servicios: (1) Préstamo IMSS Pensionados Ley 73 $40K–$650K sin aval, "
-    "(2) Seguro Auto, (3) Seguro Vida/GMM, (4) VRIM tarjeta médica, "
-    "(5) Financiamiento Empresarial $100K–$100M, (6) Financiamiento Práctico 24hrs sin garantía. "
-    "Responde en español mexicano, máximo 100 palabras, tono profesional y cálido. "
-    "Resuelve dudas reales del cliente. Si la pregunta es abierta, contesta de forma útil; "
-    "no mandes al menú salvo que el cliente lo pida. "
-    "Termina con UNA sola pregunta cuando ayude a avanzar. "
-    "No inventes tasas, requisitos ni condiciones no confirmadas. "
-    "DATOS FINANCIEROS COHIFIS: "
-    "IMSS Ley 73: CAT 29.3% Inbursa vs 75.19% competencia. "
-    "Monto $40,000 a $650,000. Sin aval. Sin cambio de banco. "
-    "Regalo VRIM Plus en créditos >= $50,000. "
-    "PyME Alta Eficiencia: 18%. PyME Flexible: 36%. "
-    "Tolerancia buró hasta $30,000 de mancha. "
-    "TPV: desde 1.05% por transacción. Sin mensualidad fija. "
-    "VRIM: membresía médica incluida como regalo con IMSS >= $50k. "
-    "COMPORTAMIENTO: Si cliente objeta precio comparar con competencia (75.19% vs 29.3%). "
-    "Si cliente objeta trámite enfatizar proceso 100% digital. "
-    "Si cliente muestra intención de compra dirigir al funnel correcto. "
-    "NUNCA mezclar productos B2C con B2B en misma respuesta. "
-    "Cierre siempre: Ten listos tus documentos en PDF o foto clara. "
-    "Christian López te contactará por WhatsApp para recibirlos y agendar tu cierre sin salir de casa."
-)
 
-_SERVICE_LABELS = {
-    "imss": "Préstamo IMSS Ley 73",
-    "auto": "Seguro de Auto",
-    "vida": "Seguro de Vida y Salud",
-    "vrim": "Tarjeta Médica VRIM",
-    "emp": "Financiamiento Empresarial",
-    "fp": "Financiamiento Práctico Empresarial",
-    "general": "Consulta general"
-}
-
-def ask_gpt(prompt: str, svc: str | None = None) -> str:
-    if not _oai:
-        return "Lo siento, servicio no disponible en este momento."
+@app.post("/webhook")
+def webhook_receive():
     try:
-        ctx = _SERVICE_LABELS.get(svc or "", "Consulta general")
-        user_prompt = f"Servicio detectado: {ctx}\nConsulta del cliente: {prompt}"
-        r = _oai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "system", "content": _SYS},
-                      {"role": "user", "content": user_prompt}],
-            temperature=0.35, max_tokens=220)
-        return r.choices[0].message.content.strip()
+        intent_handled = False
+        payload = request.get_json(force=True, silent=True) or {}
+        log.info("📥 Webhook recibido: %s...", json.dumps(payload, ensure_ascii=False)[:500])
+
+        entry = (payload.get("entry") or [{}])[0]
+        changes = (entry.get("changes") or [{}])[0]
+        value = changes.get("value", {})
+        messages = value.get("messages", [])
+        statuses = value.get("statuses", [])
+
+        if not messages:
+            if statuses:
+                for st in statuses:
+                    try:
+                        if (st.get("status") or "").lower() == "failed":
+                            log.warning("❌ STATUS failed (detalle): %s", json.dumps(st, ensure_ascii=False))
+                    except Exception:
+                        pass
+            log.info("ℹ️ Webhook sin mensajes (posible status update)")
+            return jsonify({"ok": True}), 200
+
+        msg = messages[0]
+        phone = msg.get("from")
+        if not phone:
+            log.warning("⚠️ Mensaje sin número de teléfono")
+            return jsonify({"ok": True}), 200
+
+        last10 = _normalize_phone_last10(phone)
+        match = match_client_in_sheets(last10)
+        st_now = user_state.get(phone, "")
+        idle = st_now in ("", "__greeted__")
+
+        mtype = msg.get("type")
+        if mtype == "text" and "text" in msg:
+            text = (msg.get("text") or {}).get("body", "").strip()
+            log.info("💬 Texto recibido de %s: %s", phone, text)
+
+            try:
+                append_respuesta_cliente(phone, _match_name(match), text, _utc_now_iso())
+            except Exception:
+                pass
+
+            _ensure_user(phone)["last_message"] = text
+
+            # HOTFIX 2: si hay estado activo local, NO entra Boardroom ni interceptores globales.
+            active_local_state = user_state.get(phone, "").startswith(ACTIVE_FUNNEL_PREFIXES)
+            log.info("🧭 Router input phone=%s state=%s text=%s", phone, user_state.get(phone, ""), text)
+
+            if active_local_state:
+                _route_command(phone, text, match)
+                return jsonify({"ok": True}), 200
+
+            if _handle_awaiting_template_response(phone, text, match):
+                return jsonify({"ok": True}), 200
+
+            if BOARDROOM_ENABLED:
+                boardroom_result = send_to_boardroom(
+                    phone,
+                    text,
+                    match=match,
+                    message_id=msg.get("id"),
+                    state=user_state.get(phone, ""),
+                )
+                if execute_boardroom_decision(phone, boardroom_result, match=match):
+                    return jsonify({"ok": True}), 200
+
+            t_norm_info = text.strip().lower()
+            if t_norm_info in ("info", "informacion", "información", "mas info", "más info"):
+                last_tpl = ""
+                st = user_state.get(phone, "")
+                if st.startswith("awaiting_info:"):
+                    last_tpl = st.split(":", 1)[1].strip()
+                if not last_tpl:
+                    last_tpl = get_last_envio_template(last10)
+                if last_tpl in ("tpv_3", "promo_tpv", TPV_TEMPLATE_NAME):
+                    user_state[phone] = "tpv_giro"
+                    try:
+                        _notify_advisor(
+                            "🧾 Respuesta a plantilla (TPV)\n"
+                            f"Template: {last_tpl}\n"
+                            f"WhatsApp: {phone}\n"
+                            f"Nombre: {_match_name(match) or '(sin nombre)'}\n"
+                            f"Mensaje: {text}"
+                        )
+                    except Exception:
+                        pass
+                    send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
+                    return jsonify({"ok": True}), 200
+
+            if idle and match:
+                if _auto_is_context(match) and _explicit_non_auto_intent(text):
+                    log.info("🔀 Escape de flujo AUTO por intención explícita: %s", text)
+                else:
+                    if _alianza_is_context(match):
+                        if _handle_alianza_context_response(phone, text, match):
+                            intent_handled = True
+                    if intent_handled:
+                        return jsonify({"ok": True}), 200
+
+                    if _auto_is_context(match):
+                        if _handle_auto_context_response(phone, text, match):
+                            intent_handled = True
+                    if intent_handled:
+                        return jsonify({"ok": True}), 200
+
+                if _tpv_is_context(match):
+                    if tpv_start_from_reply(phone, text, match):
+                        intent_handled = True
+                if intent_handled:
+                    return jsonify({"ok": True}), 200
+
+            if idle:
+                t_norm = text.strip().lower()
+                greet_words = {
+                    "hola", "buenas", "buenos dias", "buenos días", "buen dia", "buen día",
+                    "buenas tardes", "buenas noches", "hey", "que tal", "qué tal", "holi",
+                }
+                if t_norm in greet_words:
+                    base = "Dime qué necesitas y con gusto te guío para ayudarte a encontrar el servicio que necesitas."
+                    nombre = _match_name(match)
+                    send_message(phone, f"Hola {nombre} 👋 {base}" if nombre else f"Hola 👋 {base}")
+                    user_state[phone] = "__greeted__"
+                    return jsonify({"ok": True}), 200
+
+                tpv_keywords = (
+                    "tpv", "terminal", "terminales", "punto de venta", "punto-de-venta",
+                    "cobrar con tarjeta", "cobro con tarjeta", "pagar con tarjeta",
+                    "ligas de pago", "link de pago", "link pago", "cobro a distancia",
+                )
+                if any(k in t_norm for k in tpv_keywords):
+                    user_state[phone] = "tpv_giro"
+                    _notify_advisor(
+                        "🧠 Interés detectado (TPV)\n"
+                        f"WhatsApp: {phone}\n"
+                        f"Nombre: {_match_name(match) or '(sin nombre)'}\n"
+                        f"Mensaje: {text}"
+                    )
+                    send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
+                    return jsonify({"ok": True}), 200
+
+            if idle and interpret_response(text) == "negative":
+                send_message(phone, "Gracias por tu respuesta. Quedo a tus órdenes para cualquier duda o si más adelante deseas revisarlo.")
+                user_state[phone] = "__greeted__"
+                send_main_menu(phone)
+                return jsonify({"ok": True}), 200
+
+            t_lower = text.lower().strip()
+            valid_commands = {
+                "1", "2", "3", "4", "5", "6", "7",
+                "menu", "menú", "inicio", "hola",
+                "imss", "ley 73", "prestamo", "préstamo", "pension", "pensión",
+                "auto", "seguro auto", "seguros de auto",
+                "vida", "salud", "seguro de vida", "seguro de salud",
+                "vrim", "tarjeta medica", "tarjeta médica",
+                "empresarial", "pyme", "credito", "crédito", "credito empresarial", "crédito empresarial",
+                "financiamiento", "financiamiento practico", "financiamiento práctico",
+                "contactar", "asesor", "contactar con christian",
+            }
+            if not t_lower.isdigit() and t_lower not in valid_commands and idle:
+                _notify_advisor(
+                    "📩 Cliente INTERESADO / DUDA detectada\n"
+                    f"WhatsApp: {phone}\n"
+                    f"Mensaje: {text}"
+                )
+
+            if phone not in user_state:
+                user_state[phone] = "__greeted__"
+                if not match:
+                    _greet_and_match(phone)
+
+            if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
+                prompt = text.split("sgpt:", 1)[1].strip()
+                try:
+                    log.info("🧠 Procesando solicitud GPT para %s", phone)
+                    completion = openai.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.4,
+                    )
+                    answer = completion.choices[0].message.content.strip()
+                    send_message(phone, answer)
+                    return jsonify({"ok": True}), 200
+                except Exception:
+                    log.exception("❌ Error llamando a OpenAI")
+                    send_message(phone, "Hubo un detalle al procesar tu solicitud. Intentemos de nuevo.")
+                    return jsonify({"ok": True}), 200
+
+            _route_command(phone, text, match)
+            return jsonify({"ok": True}), 200
+
+        if mtype in {"image", "document", "audio", "video"}:
+            log.info("📎 Multimedia recibida de %s: %s", phone, mtype)
+            _handle_media(phone, msg)
+            return jsonify({"ok": True}), 200
+
+        log.info("ℹ️ Tipo de mensaje no manejado: %s", mtype)
+        return jsonify({"ok": True}), 200
+
     except Exception:
-        log.exception("GPT error")
-        return "Ocurrió un error. ¿Sobre qué servicio te puedo orientar?"
+        log.exception("❌ Error en webhook_receive")
+        return jsonify({"ok": True}), 200
 
 
+# ==========================
+# Endpoints auxiliares
+# ==========================
+@app.get("/")
+def index():
+    return jsonify({"ok": True, "service": "Vicky Bot SECOM"}), 200
 
-# ── Detección de servicio ─────────────────────────────────────────────────────
-_EXACT: dict = {
-    "1": "imss", "imss": "imss", "prestamo imss": "imss", "credito imss": "imss",
-    "prestamos imss": "imss", "ley 73": "imss",
-    "pensionado imss": "imss", "jubilado imss": "imss",
-    "2": "auto", "seguro auto": "auto", "seguro de auto": "auto", "seguro carro": "auto",
-    "seguros de auto": "auto", "seguro vehiculo": "auto",
-    "3": "vida", "seguro vida": "vida", "seguro de vida": "vida", "gastos medicos": "vida",
-    "seguro salud": "vida", "seguro medico": "vida", "gastos medicos mayores": "vida",
-    "4": "vrim", "vrim": "vrim", "tarjeta medica": "vrim", "consultas medicas": "vrim",
-    "5": "emp", "financiamiento empresarial": "emp", "credito empresarial": "emp", "pyme": "emp",
-    "6": "fp", "financiamiento practico": "fp", "credito rapido": "fp",
-    "financiamiento practico empresarial": "fp",
-}
 
-_SEM = [
-    ("imss", ["prestamo imss", "credito imss", "ley 73", "jubilado imss", "pensionado imss"]),
-    ("auto", ["seguro carro", "seguro auto", "asegurar carro", "asegurar vehiculo", "poliza auto"]),
-    ("vida", ["seguro de vida", "gastos medicos", "seguro medico", "cobertura medica", "seguro salud"]),
-    ("vrim", ["tarjeta medica", "consultas medicas", "membresia medica", "consultas ilimitadas"]),
-    ("fp", ["credito rapido", "24 horas", "aprobacion rapida", "sin garantia empresa", "liquidez"]),
-    ("emp", ["credito empresa", "prestamo empresa", "capital trabajo", "financiar negocio", "credito pyme"]),
-]
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok", "service": "Vicky Bot Inbursa", "timestamp": _utc_now_iso()}), 200
 
-def detect_svc(text: str) -> str | None:
-    n = norm(text)
-    toks = set(n.split())
-    if n in _EXACT:
-        return _EXACT[n]
 
-    for svc, kws in _SEM:
-        for k in kws:
-            nk = norm(k)
-            if nk in n:
-                return svc
-            parts = nk.split()
-            if parts and all(p in toks for p in parts):
-                return svc
+@app.get("/ext/health")
+def ext_health():
+    return jsonify({
+        "status": "ok",
+        "whatsapp_configured": bool(META_TOKEN and WABA_PHONE_ID),
+        "google_ready": google_ready,
+        "openai_ready": bool(openai and OPENAI_API_KEY),
+        "boardroom_enabled": BOARDROOM_ENABLED,
+    }), 200
 
-    if ("imss" in toks and ({"prestamo", "prestamos", "credito", "creditos", "pension", "pensionado", "pensionada", "jubilado", "jubilada"} & toks)) or ("ley" in toks and "73" in toks):
-        return "imss"
 
-    if ({"seguro", "seguros", "cobertura", "coberturas", "poliza", "polizas"} & toks) and ({"auto", "autos", "carro", "carros", "vehiculo", "vehiculos", "placa", "placas"} & toks):
-        return "auto"
+@app.post("/ext/test-send")
+def ext_test_send():
+    try:
+        data = request.get_json(force=True) or {}
+        to = str(data.get("to", "")).strip()
+        text = str(data.get("text", "")).strip()
+        if not to or not text:
+            return jsonify({"ok": False, "error": "Faltan parámetros 'to' o 'text'"}), 400
+        ok = send_message(to, text)
+        return jsonify({"ok": bool(ok)}), 200
+    except Exception as exc:
+        log.exception("❌ Error en /ext/test-send")
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
-    if ({"vida", "gmm", "hospitalizacion", "hospitalario"} & toks) and ({"seguro", "seguros", "salud", "medico", "medicos", "gastos"} & toks):
-        return "vida"
 
-    if "vrim" in toks or ({"tarjeta", "membresia", "consultas"} & toks and {"medica", "medicas", "medico", "medicos"} & toks):
-        return "vrim"
+def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
+    """Worker de outbound proactivo. Requiere template; no envía texto libre proactivo."""
+    successful = 0
+    failed = 0
+    log.info("🚀 Iniciando envío masivo de %s mensajes", len(items))
 
-    if ({"empresa", "empresas", "empresarial", "negocio", "negocios", "pyme", "pymes"} & toks) and ({"credito", "creditos", "financiamiento", "prestamo", "prestamos"} & toks):
-        return "emp"
+    for i, item in enumerate(items, 1):
+        try:
+            to = str(item.get("to", "")).strip()
+            text = str(item.get("text", "")).strip()
+            template = str(item.get("template", "")).strip()
+            params = item.get("params", [])
 
-    if ({"practico", "rapido", "rapida", "liquidez", "24", "horas"} & toks) and ({"empresa", "empresarial", "financiamiento", "credito"} & toks):
-        return "fp"
+            if not to:
+                log.warning("⏭️ Item %s sin destinatario, omitiendo", i)
+                failed += 1
+                continue
+
+            log.info("📤 [%s/%s] Procesando: %s", i, len(items), to)
+
+            if not template and text:
+                log.warning("⚠️ Outbound proactivo sin template rechazado para %s", to)
+                failed += 1
+                continue
+
+            if template:
+                success = send_template_message(to, template, params)
+                log.info("   ↳ Plantilla '%s' a %s: %s", template, to, "✅" if success else "❌")
+            else:
+                log.warning("   ↳ Item %s sin contenido válido", i)
+                failed += 1
+                continue
+
+            successful += 1 if success else 0
+            failed += 0 if success else 1
+            time.sleep(0.5)
+
+        except Exception:
+            failed += 1
+            log.exception("❌ Error procesando item %s para %s", i, item.get("to", "unknown"))
+
+    log.info("🎯 Envío masivo completado: %s ✅, %s ❌", successful, failed)
+
+    if ADVISOR_NUMBER:
+        send_message(ADVISOR_NUMBER, f"📊 Resumen envío masivo:\n• Exitosos: {successful}\n• Fallidos: {failed}\n• Total: {len(items)}")
+
+
+@app.post("/ext/send-promo")
+def ext_send_promo():
+    """Endpoint de outbound proactivo. Solo encola templates; rechaza text sin template."""
+    try:
+        if not META_TOKEN or not WABA_PHONE_ID:
+            log.error("❌ META_TOKEN o WABA_PHONE_ID no configurados")
+            return jsonify({"queued": False, "error": "WhatsApp Business API no configurada"}), 500
+
+        body = request.get_json(force=True) or {}
+        items = body.get("items", [])
+        log.info("📨 Recibida solicitud send-promo con %s items", len(items) if isinstance(items, list) else "invalid")
+
+        if not isinstance(items, list):
+            return jsonify({"queued": False, "error": "Formato inválido: 'items' debe ser una lista"}), 400
+        if not items:
+            return jsonify({"queued": False, "error": "Lista 'items' vacía"}), 400
+
+        valid_items: List[Dict[str, Any]] = []
+        rejected_items: List[Dict[str, Any]] = []
+
+        for i, item in enumerate(items):
+            if not isinstance(item, dict):
+                rejected_items.append({"index": i, "reason": "invalid_item"})
+                continue
+
+            to = str(item.get("to", "")).strip()
+            text = str(item.get("text", "")).strip()
+            template = str(item.get("template", "")).strip()
+
+            if not to:
+                rejected_items.append({"index": i, "reason": "missing_to"})
+                continue
+
+            if text and not template:
+                log.warning("⚠️ Outbound proactivo sin template rechazado para %s", to)
+                rejected_items.append({"index": i, "to": to, "reason": "outbound_requires_template"})
+                continue
+
+            if not template:
+                rejected_items.append({"index": i, "to": to, "reason": "missing_template"})
+                continue
+
+            valid_items.append(item)
+
+        if not valid_items:
+            return jsonify({
+                "queued": False,
+                "error": "No hay items válidos para enviar",
+                "failed": len(rejected_items),
+                "rejected": rejected_items,
+            }), 400
+
+        threading.Thread(target=_bulk_send_worker, args=(valid_items,), daemon=True, name="BulkSendWorker").start()
+
+        return jsonify({
+            "queued": True,
+            "message": f"Procesando {len(valid_items)} mensajes en background",
+            "total_received": len(items),
+            "valid_items": len(valid_items),
+            "failed": len(rejected_items),
+            "rejected": rejected_items,
+            "timestamp": _utc_now_iso(),
+        }), 202
+
+    except Exception as exc:
+        log.exception("❌ Error crítico en /ext/send-promo")
+        return jsonify({"queued": False, "error": f"Error interno: {str(exc)}"}), 500
+
+
+def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Dict[str, Any]]:
+    i_name = _idx(headers, "Nombre")
+    i_wa = _idx(headers, "WhatsApp")
+    i_status = _idx(headers, "ESTATUS")
+
+    if i_name is None or i_wa is None:
+        raise RuntimeError("Faltan columnas requeridas: 'Nombre' y/o 'WhatsApp'.")
+
+    for row_number, row in enumerate(rows, start=2):
+        wa = _cell(row, i_wa).strip()
+        if not wa:
+            continue
+
+        estatus = _cell(row, i_status).strip().upper() if i_status is not None else ""
+        if estatus not in ("", "PENDIENTE"):
+            continue
+
+        nombre = _cell(row, i_name).strip()
+        return {"row_number": row_number, "nombre": nombre, "whatsapp": wa}
 
     return None
 
-# ── Enrutamiento a servicio ───────────────────────────────────────────────────
-def route(phone: str, svc: str) -> None:
-    if svc == "imss":
-        user_state[phone] = "imss_open"
-        user_data.setdefault(phone, {})
-        funnel_imss(phone, "")
-    elif svc == "emp":
-        user_state[phone] = "emp_start"
-        user_data.setdefault(phone, {})
-        funnel_emp(phone, "")
-    elif svc == "fp":
-        user_state[phone] = "fp_start"
-        user_data.setdefault(phone, {})
-        funnel_fp(phone, "")
-    elif svc == "auto":
-        user_state[phone] = "auto_open"
-        user_data.setdefault(phone, {})
-        funnel_auto(phone, "")
-    elif svc == "vida":
-        user_state[phone] = "vida_open"
-        user_data.setdefault(phone, {})
-        funnel_vida(phone, "")
-    elif svc == "vrim":
-        user_state[phone] = "vrim_open"
-        user_data.setdefault(phone, {})
-        funnel_vrim(phone, "")
 
-# ── Flujo IMSS ────────────────────────────────────────────────────────────────
-def funnel_imss(phone: str, msg: str) -> None:
-    state = user_state.get(phone, "imss_open")
-    data = user_data.get(phone, {})
-
-    if state == "imss_filtro":
-        r = yes_no(msg)
-        if r == "si":
-            data["origen"] = "interes_filtrado_IMSS"
-            user_data[phone] = data
-            send_msg(phone, "Perfecto 👏\n*¿Cuánto recibes al mes por concepto de pensión?* _(ej. 7500)_")
-            user_state[phone] = "imss_q_pension"
-        elif r == "no":
-            send_msg(phone,
-                "Entendido 🙏 El préstamo IMSS Ley 73 aplica para pensionados de ese régimen.\n\n"
-                "¿Te gustaría que un asesor te oriente sobre otras opciones disponibles?")
-            user_state[phone] = "imss_no_califica"
-        else:
-            send_msg(phone, "Por favor responde *sí* o *no*. 😊")
-        return
-
-    if state == "imss_open":
-        send_msg(phone,
-            "💰 *Préstamo para Pensionados IMSS (Ley 73)*\n\n"
-            "✅ Montos desde *$40,000 hasta $650,000*\n"
-            "✅ Sin aval ni garantía\n"
-            "✅ Descuento directo vía tu pensión\n"
-            "✅ Depósito a tu cuenta en días\n\n"
-            "*¿Ya eres pensionado o jubilado del IMSS bajo la Ley 73?*")
-        user_state[phone] = "imss_q_califica"
-        return
-
-    if state == "imss_q_califica":
-        r = yes_no(msg)
-        if r == "si":
-            send_msg(phone, "¡Perfecto! 👏\n"
-                            "*¿Cuánto recibes al mes por concepto de pensión?* _(ej. 7500)_")
-            user_state[phone] = "imss_q_pension"
-        elif r == "no":
-            send_msg(phone,
-                "Entendido 🙏 Este financiamiento aplica para pensionados IMSS Ley 73.\n\n"
-                "¿Te gustaría que un asesor te oriente sobre otras opciones?")
-            user_state[phone] = "imss_no_califica"
-        else:
-            send_msg(phone, "Por favor responde *sí* o *no*. 😊")
-        return
-
-    if state == "imss_no_califica":
-        r = yes_no(msg)
-        if r == "si":
-            notify_advisor(
-                f"📣 NO CALIFICA – IMSS LEY 73\n"
-                f"WhatsApp: {phone}\n"
-                f"Origen: {data.get('origen', 'directo')}\n"
-                "Solicita orientación sobre otras alternativas.")
-            send_msg(phone, "¡Perfecto! 👍 Le aviso a nuestro asesor *Christian López* "
-                            "para que te contacte a la brevedad.")
-        else:
-            send_msg(phone, "¡Cuando gustes consultar, aquí estaremos! 😊")
-        reset(phone)
-        return
-
-    if state == "imss_q_pension":
-        m = extract_num(msg)
-        if m is None:
-            send_msg(phone, "Indícame el monto mensual de tu pensión _(ej. 6500)_.")
-            return
-        data["pension"] = m
-        user_data[phone] = data
-        if m < 5000:
-            send_msg(phone,
-                "Gracias 🙏 Por ahora los créditos aplican a pensiones desde *$5,000 mensuales*.\n\n"
-                "¿Deseas que un asesor te contacte para explorar otras opciones?")
-            user_state[phone] = "imss_pension_baja"
-            return
-        send_msg(phone, "Excelente 💪\n"
-                        "*¿Qué monto deseas solicitar?* _(mínimo $40,000 — máximo $650,000)_")
-        user_state[phone] = "imss_q_monto"
-        return
-
-    if state == "imss_pension_baja":
-        if yes_no(msg) == "si":
-            notify_advisor(f"🔔 PENSIÓN BAJA – IMSS\nWhatsApp: {phone}\n"
-                           f"Pensión: ${data.get('pension', 'ND')}\n"
-                           f"Origen: {data.get('origen', 'directo')}")
-            send_msg(phone, "✅ ¡Listo! Un asesor te contactará con opciones para tu situación.")
-        else:
-            send_msg(phone, "Entendido 😊 Aquí estamos cuando lo necesites.")
-        reset(phone)
-        return
-
-    if state == "imss_q_monto":
-        m = extract_num(msg)
-        if m is None or m < 40000:
-            send_msg(phone, "Indica el monto deseado _(mínimo $40,000)_, ej. *65000*.")
-            return
-        data["monto"] = m
-        user_data[phone] = data
-        send_msg(phone, f"Anotado: *${m:,.0f}* ✅\n\n*¿Cuál es tu nombre completo?*")
-        user_state[phone] = "imss_q_nombre"
-        return
-
-    if state == "imss_q_nombre":
-        data["nombre"] = msg.title()
-        user_data[phone] = data
-        send_msg(phone, f"Mucho gusto, *{data['nombre']}* 😊\n\n"
-                        "*¿Tu número de contacto?*\n"
-                        "_(Escribe \"mismo\" si es este WhatsApp)_")
-        user_state[phone] = "imss_q_tel"
-        return
-
-    if state == "imss_q_tel":
-        data["tel"] = phone if msg.strip().lower() in ("mismo", "este", "el mismo") else msg.strip()
-        user_data[phone] = data
-        send_msg(phone, "*¿Ya recibes tu pensión en Inbursa?* "
-                        "_(Sí / No — si es en otro banco está bien)_")
-        user_state[phone] = "imss_q_inbursa"
-        return
-
-    if state == "imss_q_inbursa":
-        r = yes_no(msg)
-        if r == "?":
-            send_msg(phone, "Por favor responde *sí* o *no*.")
-            return
-        data["inbursa"] = r
-        user_data[phone] = data
-        send_msg(phone,
-            "✅ *¡Todo listo!* Solicitud registrada.\n"
-            "Nuestro asesor *Christian López* te contactará a la brevedad. 🙌")
-        notify_advisor(
-            f"🔔 NUEVO PROSPECTO – PRÉSTAMO IMSS LEY 73\n"
-            f"────────────────────────\n"
-            f"Nombre:   {data.get('nombre', 'ND')}\n"
-            f"WhatsApp: {phone}\n"
-            f"Teléfono: {data.get('tel', 'ND')}\n"
-            f"Pensión:  ${data.get('pension', 0):,.0f}/mes\n"
-            f"Monto:    ${data.get('monto', 0):,.0f}\n"
-            f"Inbursa:  {data.get('inbursa', 'ND')}\n"
-            f"Origen:   {data.get('origen', 'directo')}\n"
-            "────────────────────────")
-        _notify_boardroom_lead_qualified(phone, "prestamo_imss", _ensure_user(phone))
-        reset(phone)
-        return
-
-
-# ── Flujo Seguro Auto ─────────────────────────────────────────────────────────
-def funnel_auto(phone: str, msg: str) -> None:
-    state = user_state.get(phone, "auto_open")
-    data = user_data.get(phone, {})
-
-    if state == "auto_open":
-        send_msg(phone,
-            "🚗 *Seguro de Auto Inbursa*\n\n"
-            "Te ayudo a solicitar tu cotización.\n"
-            "*¿Tienes seguro actualmente?* _(Sí/No)_")
-        user_state[phone] = "auto_q_tipo"
-        return
-
-    if state == "auto_q_tipo":
-        r = yes_no(msg)
-        data["tiene_seguro_actual"] = r if r in ("si", "no") else msg.strip()
-        user_data[phone] = data
-        send_msg(phone, "*¿Marca y modelo de tu vehículo?*")
-        user_state[phone] = "auto_q_modelo"
-        return
-
-    if state == "auto_q_modelo":
-        data["marca_modelo"] = msg.title()
-        user_data[phone] = data
-        send_msg(phone, "*¿Año del vehículo?*")
-        user_state[phone] = "auto_q_ano"
-        return
-
-    if state == "auto_q_ano":
-        data["ano"] = msg.strip()
-        user_data[phone] = data
-        send_msg(phone, "*¿Tu nombre completo?*")
-        user_state[phone] = "auto_q_nombre"
-        return
-
-    if state == "auto_q_nombre":
-        data["nombre"] = msg.title()
-        user_data[phone] = data
-        send_msg(phone, "*¿Tu número de contacto?*\n_(Escribe \"mismo\" si es este WhatsApp)_")
-        user_state[phone] = "auto_q_tel"
-        return
-
-    if state == "auto_q_tel":
-        data["tel"] = phone if msg.strip().lower() in ("mismo", "este", "el mismo") else msg.strip()
-        user_data[phone] = data
-        send_msg(phone, "✅ Listo. El asesor *Christian López* te contactará para tu cotización de auto.")
-        notify_advisor(
-            f"🚗 PROSPECTO – SEGURO AUTO\n"
-            f"Nombre: {data.get('nombre', 'ND')}\n"
-            f"WhatsApp: {phone}\n"
-            f"Teléfono: {data.get('tel', 'ND')}\n"
-            f"Seguro actual: {data.get('tiene_seguro_actual', 'ND')}\n"
-            f"Vehículo: {data.get('marca_modelo', 'ND')}\n"
-            f"Año: {data.get('ano', 'ND')}"
-        )
-        _notify_boardroom_lead_qualified(phone, "seguro_auto", _ensure_user(phone))
-        reset(phone)
-        return
-
-# ── Flujo Vida y Salud ────────────────────────────────────────────────────────
-def funnel_vida(phone: str, msg: str) -> None:
-    state = user_state.get(phone, "vida_open")
-    data = user_data.get(phone, {})
-
-    if state == "vida_open":
-        send_msg(phone,
-            "🏥 *Seguro de Vida y Salud Inbursa*\n\n"
-            "Con gusto te ayudo a perfilar tu solicitud.\n"
-            "*¿Qué tipo de cobertura te interesa?* _(Vida / GMM / Ambas)_")
-        user_state[phone] = "vida_q_tipo"
-        return
-
-    if state == "vida_q_tipo":
-        data["tipo_cobertura"] = msg.strip()
-        user_data[phone] = data
-        send_msg(phone, "*¿Tu edad aproximada?*")
-        user_state[phone] = "vida_q_edad"
-        return
-
-    if state == "vida_q_edad":
-        data["edad"] = msg.strip()
-        user_data[phone] = data
-        send_msg(phone, "*¿Tu nombre completo?*")
-        user_state[phone] = "vida_q_nombre"
-        return
-
-    if state == "vida_q_nombre":
-        data["nombre"] = msg.title()
-        user_data[phone] = data
-        send_msg(phone, "*¿Tu número de contacto?*\n_(Escribe \"mismo\" si es este WhatsApp)_")
-        user_state[phone] = "vida_q_tel"
-        return
-
-    if state == "vida_q_tel":
-        data["tel"] = phone if msg.strip().lower() in ("mismo", "este", "el mismo") else msg.strip()
-        user_data[phone] = data
-        send_msg(phone, "✅ Listo. El asesor *Christian López* te contactará para revisar tu cobertura.")
-        notify_advisor(
-            f"🏥 PROSPECTO – VIDA Y SALUD\n"
-            f"Nombre: {data.get('nombre', 'ND')}\n"
-            f"WhatsApp: {phone}\n"
-            f"Teléfono: {data.get('tel', 'ND')}\n"
-            f"Cobertura: {data.get('tipo_cobertura', 'ND')}\n"
-            f"Edad: {data.get('edad', 'ND')}"
-        )
-        _notify_boardroom_lead_qualified(phone, "vida_oro", _ensure_user(phone))
-        reset(phone)
-        return
-
-# ── Flujo VRIM ────────────────────────────────────────────────────────────────
-def funnel_vrim(phone: str, msg: str) -> None:
-    state = user_state.get(phone, "vrim_open")
-    data = user_data.get(phone, {})
-
-    if state == "vrim_open":
-        send_msg(phone,
-            "💳 *Tarjeta Médica VRIM*\n\n"
-            "Te ayudo a registrar tu interés.\n"
-            "*¿Para cuántas personas sería la membresía?*")
-        user_state[phone] = "vrim_q_personas"
-        return
-
-    if state == "vrim_q_personas":
-        data["personas"] = msg.strip()
-        user_data[phone] = data
-        send_msg(phone, "*¿Tu nombre completo?*")
-        user_state[phone] = "vrim_q_nombre"
-        return
-
-    if state == "vrim_q_nombre":
-        data["nombre"] = msg.title()
-        user_data[phone] = data
-        send_msg(phone, "*¿Tu número de contacto?*\n_(Escribe \"mismo\" si es este WhatsApp)_")
-        user_state[phone] = "vrim_q_tel"
-        return
-
-    if state == "vrim_q_tel":
-        data["tel"] = phone if msg.strip().lower() in ("mismo", "este", "el mismo") else msg.strip()
-        user_data[phone] = data
-        send_msg(phone, "✅ Listo. El asesor *Christian López* te contactará para tu membresía VRIM.")
-        notify_advisor(
-            f"💳 PROSPECTO – VRIM\n"
-            f"Nombre: {data.get('nombre', 'ND')}\n"
-            f"WhatsApp: {phone}\n"
-            f"Teléfono: {data.get('tel', 'ND')}\n"
-            f"Personas: {data.get('personas', 'ND')}"
-        )
-        _notify_boardroom_lead_qualified(phone, "vrim", _ensure_user(phone))
-        reset(phone)
-        return
-
-# ── Flujo Empresarial ─────────────────────────────────────────────────────────
-def funnel_emp(phone: str, msg: str) -> None:
-    state = user_state.get(phone, "emp_start")
-    data = user_data.get(phone, {})
-
-    if state == "emp_start":
-        send_msg(phone,
-            "🏢 *Crédito Empresarial Inbursa*\n"
-            "💰 $100,000–$100,000,000 · Tasas preferenciales · Sin aval con buen historial\n\n"
-            "¿Representas una empresa o eres empresario? _(Sí/No)_")
-        user_state[phone] = "emp_q_confirm"
-        return
-
-    if state == "emp_q_confirm":
-        r = yes_no(msg)
-        if r == "si" or any(k in msg.lower() for k in ["empresario", "empresa", "negocio", "pyme", "comercio"]):
-            send_msg(phone, "¿A qué *se dedica* tu empresa?")
-            user_state[phone] = "emp_q_giro"
-        elif r == "no":
-            send_msg(phone, "Entendido 😊 ¿Hay algo más en que pueda ayudarte?")
-            reset(phone)
-        else:
-            send_msg(phone, "Responde *sí* o *no* para continuar.")
-        return
-
-    if state == "emp_q_giro":
-        data["giro"] = msg.title()
-        user_data[phone] = data
-        send_msg(phone, "¿Qué *monto* necesitas? _(mínimo $100,000)_")
-        user_state[phone] = "emp_q_monto"
-        return
-
-    if state == "emp_q_monto":
-        m = extract_num(msg)
-        if not m or m < 100000:
-            send_msg(phone, "Indica el monto _(mínimo $100,000)_, ej. *250000*.")
-            return
-        data["monto"] = m
-        user_data[phone] = data
-        send_msg(phone, "*¿Tu nombre completo?*")
-        user_state[phone] = "emp_q_nombre"
-        return
-
-    if state == "emp_q_nombre":
-        data["nombre"] = msg.title()
-        user_data[phone] = data
-        send_msg(phone, "*¿Tu número de contacto?*")
-        user_state[phone] = "emp_q_tel"
-        return
-
-    if state == "emp_q_tel":
-        data["tel"] = msg.strip()
-        user_data[phone] = data
-        send_msg(phone, "*¿En qué ciudad está tu empresa?*")
-        user_state[phone] = "emp_q_ciudad"
-        return
-
-    if state == "emp_q_ciudad":
-        data["ciudad"] = msg.title()
-        user_data[phone] = data
-        send_msg(phone, "✅ Listo. El asesor *Christian López* te contactará a la brevedad.")
-        notify_advisor(
-            f"🔔 PROSPECTO – CRÉDITO EMPRESARIAL\n"
-            f"Nombre: {data.get('nombre', 'ND')}\n"
-            f"WA: {phone} · Tel: {data.get('tel', 'ND')}\n"
-            f"Ciudad: {data.get('ciudad', 'ND')}\n"
-            f"Giro:   {data.get('giro', 'ND')}\n"
-            f"Monto:  ${data.get('monto', 0):,.0f}")
-        _notify_boardroom_lead_qualified(phone, "credito_pyme", _ensure_user(phone))
-        reset(phone)
-        return
-
-# ── Flujo Financiamiento Práctico ─────────────────────────────────────────────
-_FP_STEPS = [
-    ("fp_q1", "fp_q2", "¿Antigüedad fiscal de la empresa?"),
-    ("fp_q2", "fp_q3", "¿Persona física con actividad empresarial o persona moral?"),
-    ("fp_q3", "fp_q4", "¿Edad del representante legal?"),
-    ("fp_q4", "fp_q5", "¿Buró de crédito empresa y accionistas al día? _(positivo/negativo)_"),
-    ("fp_q5", "fp_q6", "¿Facturación anual aproximada?"),
-    ("fp_q6", "fp_q7", "¿Facturación constante en los últimos 6 meses? _(Sí/No)_"),
-    ("fp_q7", "fp_q8", "¿Monto de financiamiento requerido?"),
-    ("fp_q8", "fp_q9", "¿Cuenta con opinión de cumplimiento SAT positiva?"),
-    ("fp_q9", "fp_q10", "¿Qué tipo de financiamiento requiere?"),
-    ("fp_q10", "fp_q11", "¿Tiene financiamiento activo actualmente? ¿Con quién?"),
-    ("fp_q11", "fp_end", "📝 ¿Algún comentario adicional para el asesor?"),
-]
-
-def funnel_fp(phone: str, msg: str) -> None:
-    state = user_state.get(phone, "fp_start")
-    data = user_data.get(phone, {})
-
-    if state == "fp_start":
-        send_msg(phone,
-            "💼 *Financiamiento Práctico Empresarial – Inbursa*\n\n"
-            "⚡ Aprobación desde *24 horas* · Sin garantía · Desde *$100,000 MXN*\n"
-            "Para empresas y personas físicas con actividad empresarial.\n\n"
-            "¿Deseas saber si puedes acceder? _(Sí/No)_")
-        user_state[phone] = "fp_q_interes"
-        return
-
-    if state == "fp_q_interes":
-        r = yes_no(msg)
-        if r == "si":
-            send_msg(phone, "Excelente 🙌 Empecemos.\n*¿Cuál es el giro de tu empresa?*")
-            user_state[phone] = "fp_q1"
-        elif r == "no":
-            notify_advisor(f"📩 NO INTERESADO – Financiamiento Práctico\nWhatsApp: {phone}")
-            send_msg(phone, "Entendido 👍 Si deseas otro servicio, con gusto te oriento.")
-            reset(phone)
-        else:
-            send_msg(phone, "Responde *sí* o *no*.")
-        return
-
-    for (cur, nxt, nxt_q) in _FP_STEPS:
-        if state == cur:
-            data[cur] = msg
-            user_data[phone] = data
-            user_state[phone] = nxt
-            send_msg(phone, nxt_q)
-            return
-
-    if state == "fp_end":
-        data["comentario"] = msg
-        notify_advisor(
-            f"🔔 PROSPECTO – FINANCIAMIENTO PRÁCTICO\n"
-            f"WhatsApp: {phone}\n"
-            f"Giro:           {data.get('fp_q1', 'ND')}\n"
-            f"Antigüedad:     {data.get('fp_q2', 'ND')}\n"
-            f"Tipo persona:   {data.get('fp_q3', 'ND')}\n"
-            f"Edad rep legal: {data.get('fp_q4', 'ND')}\n"
-            f"Buró:           {data.get('fp_q5', 'ND')}\n"
-            f"Facturación:    {data.get('fp_q6', 'ND')}\n"
-            f"Constante 6m:   {data.get('fp_q7', 'ND')}\n"
-            f"Monto req.:     {data.get('fp_q8', 'ND')}\n"
-            f"Opinión SAT:    {data.get('fp_q9', 'ND')}\n"
-            f"Tipo financ.:   {data.get('fp_q10', 'ND')}\n"
-            f"Financ. actual: {data.get('fp_q11', 'ND')}\n"
-            f"Comentario:     {data.get('comentario', 'Ninguno')}")
-        send_msg(phone, "✅ Listo. El asesor *Christian López* te contactará a la brevedad.")
-        reset(phone)
-        return
-
-# ── Pregunta filtro para mensajes ambiguos relacionados a pensión/crédito ─────
-_FILT_PHRASES = {
-    "soy pensionado", "soy pensionada", "soy jubilado", "soy jubilada",
-    "estoy pensionado", "estoy pensionada", "estoy jubilado", "estoy jubilada",
-    "me interesa el prestamo", "me interesa el credito",
-    "quiero saber si califico",
-    "prestamo pensionado", "credito pensionado",
-    "pension", "pensionado", "pensionada", "jubilado", "jubilada",
-}
-
-def _needs_filter(n: str) -> bool:
-    return any(norm(k) in n for k in _FILT_PHRASES)
-
-# ── Triggers de menú explícito ────────────────────────────────────────────────
-_MENU_EXACT = {
-    "menu", "memu", "inicio", "start",
-    "hola", "buenas", "buenos dias", "buenas tardes", "buenas noches",
-    "servicios", "opciones", "catalogo", "productos",
-    "que manejas", "que ofrecen", "que ofreces", "que tienes", "que tienen",
-    "que servicios tienen", "que servicios ofrecen",
-    "quiero ver opciones", "ver menu", "ver el menu", "mostrar menu",
-}
-_MENU_CONTAINS = {"que servicios", "ver el menu", "mostrar opciones", "ver opciones"}
-
-_FIN_KW = {
-    "seguro", "seguros", "cobertura", "coberturas", "poliza", "polizas",
-    "prestamo", "prestamos", "credito", "creditos", "financiamiento",
-    "inbursa", "pension", "pensionado", "pensionada", "jubilado", "jubilada",
-    "cotizar", "califico", "requisito", "requisitos", "tarjeta",
-    "medico", "medica", "medicos", "medicas", "gmm", "auto", "carro",
-    "vehiculo", "vrim", "empresa", "empresarial", "ley", "73"
-}
-
-_Q_WORDS = {
-    "que", "como", "cual", "cuales", "cuanto", "cuantos",
-    "donde", "cuando", "por", "porque", "requisito", "requisitos",
-    "duda", "explica", "explicas", "ayuda", "ayudar", "cotizar"
-}
-
-_Q_PHRASES = {
-    "tengo duda", "me puedes ayudar", "me puedes explicar", "quiero saber",
-    "quisiera saber", "tengo una duda", "me orientas", "me apoyas",
-    "como funciona", "cuales son", "que incluye", "que cubre",
-    "me puedes decir", "necesito informacion"
-}
-
-def _is_open_question(raw: str, n: str) -> bool:
-    toks = set(n.split())
-    if "?" in raw or "¿" in raw:
-        return True
-    if any(p in n for p in _Q_PHRASES):
-        return True
-    if "duda" in toks:
-        return True
-    if len(toks) >= 5 and toks & _Q_WORDS:
-        return True
-    return False
-
-def _is_financial_context(n: str, svc: str | None = None) -> bool:
-    toks = set(n.split())
-    return bool(svc) or bool(toks & _FIN_KW)
-
-# ── Procesamiento del mensaje ─────────────────────────────────────────────────
-def handle(msg_obj: dict) -> None:
-    phone = msg_obj.get("from", "")
-    if not phone:
-        return
-
-    mid = msg_obj.get("id", "")
-    if mid:
-        with _id_lock:
-            if mid in _seen_ids:
-                return
-            if len(_seen_dq) >= 3000:
-                _seen_ids.discard(_seen_dq[0])
-            _seen_dq.append(mid)
-            _seen_ids.add(mid)
-    _tl.mid = mid
-
-    mtype = msg_obj.get("type", "")
-    if mtype in ("image", "document"):
-        media_id = (
-            msg_obj.get("image", {}).get("id")
-            or msg_obj.get("document", {}).get("id")
-            or ""
-        )
-        if media_id:
-            threading.Thread(
-                target=_notify_boardroom_document,
-                args=(phone, media_id, mtype),
-                daemon=True
-            ).start()
-            send_msg(phone,
-                "✅ Documento recibido. Christian López lo revisará "
-                "y te confirmará en breve."
-            )
-            return jsonify({"ok": True}), 200
-
-    if mtype and mtype != "text":
-        _log(phone, _nombre(phone), f"[{mtype}]", "entrante", "cliente", "", "", mid)
-        send_msg(phone, "Por ahora solo proceso mensajes de texto 📩")
-        return
-
-    text = (msg_obj.get("text") or {}).get("body", "").strip()[:500]
-    if not text:
-        return
-
-    log.info(f"📱 {phone}: {text[:80]}")
-    _log(phone, _nombre(phone), text, "entrante", "cliente", "", "", mid)
-
-    n = norm(text)
-
-    if text.lower().startswith("sgpt:"):
-        p = text[5:].strip()
-        if p:
-            send_msg(phone, ask_gpt(p))
-        return
-
-    state = user_state.get(phone, "")
-    if state.startswith("imss_"):
-        funnel_imss(phone, text)
-        return
-    if state.startswith("auto_"):
-        funnel_auto(phone, text)
-        return
-    if state.startswith("vida_"):
-        funnel_vida(phone, text)
-        return
-    if state.startswith("vrim_"):
-        funnel_vrim(phone, text)
-        return
-    if state.startswith("emp_"):
-        funnel_emp(phone, text)
-        return
-    if state.startswith("fp_"):
-        funnel_fp(phone, text)
-        return
-
-    if _is_campaign(msg_obj, n):
-        user_data.setdefault(phone, {})
-        ref = msg_obj.get("referral") or {}
-        if ref:
-            hl = ref.get("headline", "")
-            sid = ref.get("source_id", "")
-            origen = "campaña_IMSS" + (f" | {hl or sid}" if hl or sid else "")
-        else:
-            origen = "interes_directo_IMSS"
-        log.info(f"📌 {phone}: origen={origen!r}")
-        user_data[phone]["origen"] = origen
-        user_state[phone] = "imss_open"
-        funnel_imss(phone, "")
-        return
-
-    if _needs_filter(n):
-        log.info(f"🔍 {phone}: filtro IMSS activado para: {n[:60]!r}")
-        user_data.setdefault(phone, {})
-        user_data[phone]["origen"] = "filtro_ambiguo"
-        user_state[phone] = "imss_filtro"
-        send_msg(phone, "Para orientarte bien: ¿tu pensión es del *IMSS bajo la Ley 73*? 😊")
-        return
-
-    if n in _MENU_EXACT or any(p in n for p in _MENU_CONTAINS):
-        reset(phone)
-        show_menu(phone)
-        return
-
-    _adv = {"hablar con un asesor", "contactar asesor", "que me llamen", "llamame",
-            "quiero que me llamen", "hablar con un ejecutivo", "comunicame con alguien"}
-    if any(t in n for t in _adv):
-        send_msg(phone, "📞 Avisaré a nuestro asesor *Christian López* para que te contacte.\n"
-                        "¿Hay algo en que pueda orientarte mientras tanto?")
-        notify_advisor(f"📣 CONTACTO DIRECTO\nWhatsApp: {phone}\nMensaje: {text}")
-        return
-
-    svc = detect_svc(text)
-    is_question = _is_open_question(text, n)
-    in_finance = _is_financial_context(n, svc)
-
-    if svc and is_question:
-        send_msg(phone, ask_gpt(text, svc))
-        return
-
-    if svc:
-        route(phone, svc)
-        return
-
-    if is_question and in_finance:
-        send_msg(phone, ask_gpt(text, svc))
-        return
-
-    if in_finance:
-        send_msg(phone, ask_gpt(text, svc))
-        return
-
-    show_menu(phone)
-
-# ── Verificación de firma Meta (HMAC-SHA256) ──────────────────────────────────
-_WARNED_NO_APP_SECRET = False
-
-def _verify_sig(raw: bytes, hdr: str) -> bool:
-    global _WARNED_NO_APP_SECRET
-    if not APP_SECRET:
-        if not _WARNED_NO_APP_SECRET:
-            log.error("❌ META_APP_SECRET no configurado. Webhook bloqueado hasta que se configure la firma de Meta.")
-            _WARNED_NO_APP_SECRET = True
-        return False
-    if not hdr.startswith("sha256="):
-        return False
-    exp = "sha256=" + hmac.new(APP_SECRET.encode(), raw, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(exp, hdr)
-
-# ── Flask routes ──────────────────────────────────────────────────────────────
-@app.route("/", methods=["GET"])
-def root():
-    return jsonify({"status": "online", "service": "Vicky Bot Inbursa",
-                    "sheets": _srdy, "ts": now_mx()}), 200
-
-@app.route("/webhook", methods=["GET", "POST"])
-def webhook():
-    if request.method == "GET":
-        m = request.args.get("hub.mode")
-        t = request.args.get("hub.verify_token")
-        c = request.args.get("hub.challenge")
-        if m == "subscribe" and VERIFY_TOKEN and t == VERIFY_TOKEN:
-            return c, 200
-        return "forbidden", 403
+@app.post("/ext/auto-send-one")
+def ext_auto_send_one():
+    """Cron: envía 1 plantilla al siguiente prospecto pendiente."""
     try:
-        raw = request.get_data()
-        if not _verify_sig(raw, request.headers.get("X-Hub-Signature-256", "")):
-            return jsonify({"status": "forbidden"}), 403
-        data = request.get_json(force=True, silent=True) or {}
-        for entry in data.get("entry", []):
-            for chg in entry.get("changes", []):
-                for msg in (chg.get("value") or {}).get("messages", []):
-                    handle(msg)
-        return jsonify({"status": "ok"}), 200
-    except Exception:
-        log.exception("❌ webhook POST")
-        return jsonify({"status": "ok"}), 200
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "sheets": _srdy}), 200
-
-
-@app.route("/ext/boardroom/instruct", methods=["POST"])
-def boardroom_instruct():
-    """Recibe instrucciones de Boardroom para ejecutar en Vicky Redes."""
-    token = request.headers.get("X-Internal-Token", "").strip()
-    internal_token = os.getenv("INTERNAL_TOKEN", "").strip()
-    if not internal_token or token != internal_token:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-
-    body = request.get_json(silent=True) or {}
-    phone = str(body.get("phone", "") or "").strip()
-    instruction = str(body.get("instruction", "") or "").strip()
-    payload = body.get("payload", {})
-
-    if not phone or not instruction:
-        return jsonify({
-            "ok": False,
-            "error": "phone e instruction requeridos"
-        }), 400
-
-    if instruction == "hot_transfer":
-        asesor_origen = payload.get("asesor_origen", "don_chiwy")
-        sub_campana = payload.get("sub_campana", "")
-        nombre = payload.get("nombre", "")
-        send_msg(phone,
-            f"Hola {nombre} 👋 Veo que ya eres parte de nuestra "
-            f"familia COHIFIS "
-            f"{'en la campaña ' + sub_campana if sub_campana else ''}. "
-            f"Tu asesor asignado te contactará en breve."
-        )
-        notify_advisor(
-            f"🔥 HOT TRANSFER — Cliente existente SII SECOM\n"
-            f"WhatsApp: {phone}\n"
-            f"Nombre: {nombre}\n"
-            f"Sub-campaña: {sub_campana}\n"
-            f"Asesor origen: {asesor_origen}\n"
-            f"⚡ Requiere atención inmediata"
-        )
-
-    elif instruction == "existing_client_greeting":
-        nombre = payload.get("nombre", "")
-        producto = payload.get("producto", "")
-        send_msg(phone,
-            f"Hola {nombre} 😊 Es un gusto verte de nuevo. "
-            f"Recuerdo que estuviste interesado en {producto}. "
-            f"¿En qué te puedo ayudar hoy?"
-        )
-
-    elif instruction == "escalate_chiwy":
-        motivo = payload.get("motivo", "Solicitud especial")
-        nombre = payload.get("nombre", "")
-        notify_advisor(
-            f"⚡ ESCALACIÓN DIRECTA — {nombre}\n"
-            f"WhatsApp: {phone}\n"
-            f"Motivo: {motivo}"
-        )
-        send_msg(phone,
-            "✅ Tu solicitud es importante. Christian López te "
-            "contactará personalmente en breve."
-        )
-
-    elif instruction == "resume_funnel":
-        funnel = payload.get("funnel", "")
-        if funnel == "imss": funnel_imss(phone, "")
-        elif funnel == "auto": funnel_auto(phone, "")
-        elif funnel == "vida": funnel_vida(phone, "")
-        elif funnel == "vrim": funnel_vrim(phone, "")
-        elif funnel in ("emp", "pyme"): funnel_emp(phone, "")
-
-    else:
-        return jsonify({
-            "ok": False,
-            "error": f"Instrucción desconocida: {instruction}"
-        }), 400
-
-    return jsonify({
-        "ok": True,
-        "instruction": instruction,
-        "phone": phone
-    }), 200
-
-@app.route("/ext/lead", methods=["POST"])
-def ext_lead():
-    try:
-        if not INTERNAL_TOKEN:
-            log.error("❌ INTERNAL_TOKEN no configurado")
-            return jsonify({"ok": False, "error": "internal_token_not_configured"}), 500
-        if not _is_internal_request(request):
+        token = (request.headers.get("X-AUTO-TOKEN") or "").strip()
+        if not AUTO_SEND_TOKEN or token != AUTO_SEND_TOKEN:
             return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-        data = request.get_json(force=True, silent=True) or {}
-        lead_id = str(data.get("lead_id", "")).strip()
-        nombre = str(data.get("nombre", "")).strip() or "Sin nombre"
-        telefono = re.sub(r"\D", "", str(data.get("telefono", "")))[-10:]
-        interest = str(data.get("interest") or data.get("interes") or "").strip() or "sin_especificar"
-        source = str(data.get("source", "")).strip() or "desconocido"
+        body = request.get_json(force=True, silent=True) or {}
+        template_name = str(body.get("template", "")).strip()
+        if not template_name:
+            return jsonify({
+                "ok": False,
+                "reason": "template_required_for_business_initiated_message",
+            }), 400
 
-        if not lead_id:
-            return jsonify({"ok": False, "error": "missing_lead_id"}), 422
-        if len(telefono) != 10:
-            return jsonify({"ok": False, "error": "invalid_telefono"}), 422
+        headers, rows = _sheet_get_rows()
+        if not headers:
+            return jsonify({"ok": False, "error": "Sheet vacío"}), 400
 
-        advisor_msg = (
-            f"🔔 Lead nuevo desde cohifis.com\n"
-            f"Nombre: {nombre}\n"
-            f"Teléfono: {telefono}\n"
-            f"Interés: {interest}\n"
-            f"Fuente: {source}\n"
-            f"Lead ID: {lead_id}"
+        nxt = _pick_next_pending(headers, rows)
+        if not nxt:
+            return jsonify({"ok": True, "sent": False, "reason": "no_pending"}), 200
+
+        to = _normalize_to_e164_mx(nxt["whatsapp"])
+        nombre = (nxt["nombre"] or "").strip() or "Cliente"
+        params = {} if template_name == "vrim_ideal" else {"nombre": nombre}
+
+        now_iso = _utc_now_iso()
+        ok = send_template_message(to, template_name, params)
+
+        if ok:
+            user_state[to] = f"awaiting_info:{template_name}"
+            data = _ensure_user(to)
+            data["awaiting_info_template"] = template_name
+            data["awaiting_info_started_at"] = now_iso
+        else:
+            try:
+                append_envio_status(to, "", "failed", template_name, now_iso)
+            except Exception:
+                pass
+
+        estatus_val = "FALLO_ENVIO" if not ok else (
+            "ENVIADO_TPV" if template_name == TPV_TEMPLATE_NAME else
+            ("ENVIADO_ALIANZA" if template_name in ALLIANCE_TEMPLATES else "ENVIADO_INICIAL")
         )
-        ok = notify_advisor(advisor_msg)
-        if not ok:
-            log.warning("⚠️ /ext/lead notify_advisor falló [lead_id=%s]", lead_id)
-            return jsonify({"ok": False, "error": "advisor_notify_failed"}), 502
+        _update_row_cells(nxt["row_number"], {"ESTATUS": estatus_val, "LAST_MESSAGE_AT": now_iso}, headers)
 
-        svc = detect_svc(interest) or ""
-        product_code = _service_to_product_code(svc)
-        threading.Thread(
-            target=_notify_boardroom_lead_qualified,
-            args=(telefono, product_code, {
-                "lead_id": lead_id,
-                "nombre": nombre,
-                "telefono": telefono,
-                "interest": interest,
-                "source": source,
-                "service_hint": svc or "general",
-            }),
-            daemon=True
-        ).start()
-
-        log.info("✅ /ext/lead OK [lead_id=%s product=%s]", lead_id, product_code)
         return jsonify({
             "ok": True,
-            "lead_id": lead_id,
-            "product_code": product_code,
+            "sent": bool(ok),
+            "to": to,
+            "row": nxt["row_number"],
+            "nombre": nombre,
+            "template": template_name,
+            "timestamp": now_iso,
         }), 200
-    except Exception as exc:
-        log.exception("❌ Error en /ext/lead: %s", exc)
-        return jsonify({"ok": False, "error": "internal_server_error"}), 500
 
-# ── Arranque ──────────────────────────────────────────────────────────────────
-_sheets_init()
+    except Exception as exc:
+        log.exception("❌ Error en /ext/auto-send-one")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    log.info(f"🚀 Vicky Bot en puerto {port}")
-    app.run(host="0.0.0.0", port=port)
+    log.info("🚀 Iniciando Vicky Bot SECOM en puerto %s", PORT)
+    log.info("📞 WhatsApp configurado: %s", bool(META_TOKEN and WABA_PHONE_ID))
+    log.info("📊 Google Sheets/Drive: %s", google_ready)
+    log.info("🧠 OpenAI: %s", bool(openai and OPENAI_API_KEY))
+    app.run(host="0.0.0.0", port=PORT, debug=False)
