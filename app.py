@@ -474,6 +474,60 @@ BOARDROOM_URL = os.getenv(
     "https://boardroom-engine.onrender.com"
 ).strip()
 BOARDROOM_API_TOKEN = os.getenv("BOARDROOM_API_TOKEN", "").strip()
+BUS_URL = os.getenv("BUS_URL", "").strip()
+BUS_INTERNAL_TOKEN = os.getenv("BUS_INTERNAL_TOKEN", "").strip()
+_BUS_ACTIVE = os.getenv("BUS_ENABLED", "true").strip().lower() \
+              in {"1", "true", "yes", "on"}
+
+
+def _emit_bus_event(
+    phone: str,
+    text: str,
+    event_type: str = "inbound_message",
+    template_name: str | None = None,
+    intent: str | None = None,
+    metadata: dict | None = None,
+) -> None:
+    if not _BUS_ACTIVE:
+        return
+    if not BUS_URL or not BUS_INTERNAL_TOKEN:
+        log.warning("BUS_URL o BUS_INTERNAL_TOKEN no configurados — emit omitido")
+        return
+
+    payload: dict = {
+        "source": "vicky_redes",
+        "event_type": event_type,
+        "telefono": phone,
+        "mensaje": text or "",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if template_name:
+        payload["template_name"] = template_name
+    if intent:
+        payload["intent"] = intent
+    if metadata:
+        payload["metadata"] = metadata
+
+    def _post() -> None:
+        try:
+            requests.post(
+                BUS_URL,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {BUS_INTERNAL_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                timeout=3,
+            )
+        except Exception as exc:
+            log.warning(
+                "Bus emit fallido phone_last4=%s error=%s: %s",
+                str(phone)[-4:],
+                type(exc).__name__,
+                str(exc),
+            )
+
+    threading.Thread(target=_post, daemon=True).start()
 
 
 def _notify_boardroom_document(phone: str, media_id: str, doc_type: str) -> None:
@@ -1340,6 +1394,8 @@ def handle(msg_obj: dict) -> None:
         if p:
             send_msg(phone, ask_gpt(p))
         return
+
+    _emit_bus_event(phone=phone, text=text)
 
     state = user_state.get(phone, "")
     if state.startswith("imss_"):
