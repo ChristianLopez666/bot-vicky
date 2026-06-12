@@ -1604,6 +1604,23 @@ def boardroom_instruct():
         "phone": phone
     }), 200
 
+
+def _lead_payload_to_service(data: dict) -> str:
+    """Deriva el servicio ('imss', 'auto', …) de un payload de /ext/lead sin mutarlo."""
+    raw_interest = str(data.get("interes") or data.get("producto_interes") or "").strip()
+    raw_service = str(data.get("servicio") or "").strip()
+
+    interes = norm(str(data.get("interes") or ""))
+    producto_interes = norm(str(data.get("producto_interes") or ""))
+    servicio = norm(str(data.get("servicio") or ""))
+
+    if (interes == "prestamo_imss" or producto_interes == "prestamo_imss"
+            or "imss" in servicio or "ley 73" in servicio):
+        return "imss"
+
+    return detect_svc(raw_interest or raw_service) or ""
+
+
 @app.route("/ext/lead", methods=["POST"])
 def ext_lead():
     try:
@@ -1614,14 +1631,14 @@ def ext_lead():
             return jsonify({"ok": False, "error": "unauthorized"}), 401
 
         data = request.get_json(force=True, silent=True) or {}
-        lead_id = str(data.get("lead_id", "")).strip()
+        lead_id = str(data.get("lead_id") or "").strip()
         nombre = str(data.get("nombre", "")).strip() or "Sin nombre"
         telefono = re.sub(r"\D", "", str(data.get("telefono", "")))[-10:]
         interest = str(data.get("interest") or data.get("interes") or "").strip() or "sin_especificar"
         source = str(data.get("source", "")).strip() or "desconocido"
 
         if not lead_id:
-            return jsonify({"ok": False, "error": "missing_lead_id"}), 422
+            lead_id = f"cohifis-{telefono}-{int(time.time())}"
         if len(telefono) != 10:
             return jsonify({"ok": False, "error": "invalid_telefono"}), 422
 
@@ -1638,7 +1655,7 @@ def ext_lead():
             log.warning("⚠️ /ext/lead notify_advisor falló [lead_id=%s]", lead_id)
             return jsonify({"ok": False, "error": "advisor_notify_failed"}), 502
 
-        svc = detect_svc(interest) or ""
+        svc = _lead_payload_to_service(data)
         product_code = _service_to_product_code(svc)
         threading.Thread(
             target=_notify_boardroom_lead_qualified,
