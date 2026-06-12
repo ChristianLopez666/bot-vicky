@@ -1592,6 +1592,27 @@ def boardroom_instruct():
         elif funnel == "vrim": funnel_vrim(phone, "")
         elif funnel in ("emp", "pyme"): funnel_emp(phone, "")
 
+    elif instruction == "handle_message":
+        text = str(payload.get("text") or "").strip()
+        nombre = str(payload.get("nombre") or "").strip()
+        mtype = str(payload.get("mtype") or "text").strip()
+        media_id = str(payload.get("media_id") or "").strip()
+
+        if nombre:
+            ud = dict(user_data.get(phone) or {})
+            ud["nombre"] = nombre
+            user_data[phone] = ud
+
+        msg_obj = {
+            "from": phone,
+            "id": f"boardroom-{uuid.uuid4().hex[:12]}",
+            "type": mtype,
+            "text": {"body": text},
+            "image": {"id": media_id} if mtype == "image" else {},
+            "document": {"id": media_id} if mtype == "document" else {},
+        }
+        threading.Thread(target=handle, args=(msg_obj,), daemon=True).start()
+
     else:
         return jsonify({
             "ok": False,
