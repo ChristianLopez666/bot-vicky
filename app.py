@@ -532,6 +532,37 @@ def notify_advisor_inbound(phone: str, text: str, servicio: str,
                     type(exc).__name__, str(exc)[:200])
 
 
+def notify_advisor_inbound_nontext(phone: str, mtype: str, mid: str) -> None:
+    """Notifica al asesor un mensaje entrante NO-texto (imagen, documento, audio,
+    sticker, ubicación, etc.). No descarga ni procesa el archivo. Nunca propaga error."""
+    try:
+        ph_digits = re.sub(r"\D", "", str(phone))
+        dedup_key = mid or f"{ph_digits}:{int(time.time() // 60)}"
+        if not _should_notify_inbound(dedup_key):
+            return
+        estado = user_state.get(phone, "")
+        servicio = _svc_name(phone)
+        lineas = [
+            "📎 MENSAJE NO-TEXTO RECIBIDO EN VICKY REDES (Facebook Ads)",
+            f"Tipo: {mtype or 'desconocido'}",
+            f"Teléfono: {phone}",
+            f"MessageID: {mid or 'ND'}",
+            f"Hora: {now_mx()}",
+        ]
+        if estado:
+            lineas.append(f"Estado: {estado}")
+        if servicio and servicio != "desconocido":
+            lineas.append(f"Servicio: {servicio}")
+        if not notify_advisor("\n".join(lineas)):
+            log.warning("advisor_notify_failed phone_last4=%s message_id=%s cause=send_failed",
+                        ph_digits[-4:], mid or "ND")
+    except Exception as exc:
+        # No ocultar la excepción; registrar causa sin exponer tokens ni secretos.
+        log.warning("advisor_notify_failed phone_last4=%s message_id=%s cause=%s: %s",
+                    re.sub(r"\D", "", str(phone))[-4:], mid or "ND",
+                    type(exc).__name__, str(exc)[:200])
+
+
 BOARDROOM_URL = os.getenv(
     "BOARDROOM_URL",
     "https://boardroom-engine.onrender.com"
@@ -1420,6 +1451,16 @@ def handle(msg_obj: dict) -> None:
     _tl.mid = mid
 
     mtype = msg_obj.get("type", "")
+    # Hotfix Vicky Redes (OBS-1): alerta al asesor por TODO inbound NO-texto
+    # (imagen/documento/audio/sticker/ubicación/etc.), ANTES de los return
+    # tempranos. No descarga ni procesa el archivo. Fire-and-forget: no bloquea
+    # ni altera el manejo existente del mensaje.
+    if mtype and mtype != "text":
+        threading.Thread(
+            target=notify_advisor_inbound_nontext,
+            args=(phone, mtype, mid),
+            daemon=True,
+        ).start()
     if mtype in ("image", "document"):
         media_id = (
             msg_obj.get("image", {}).get("id")
