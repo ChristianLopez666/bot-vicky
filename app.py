@@ -469,6 +469,69 @@ def notify_advisor(msg: str) -> bool:
         return False
 
 
+# ── Hotfix Vicky Redes: alerta al asesor por TODO mensaje entrante ─────────────
+# Notifica al asesor cada mensaje entrante de cliente ya registrado en
+# CONVERSACIONES. Idempotente por MessageID (fallback phone+minuto). Resiliente:
+# se ejecuta en hilo daemon, nunca bloquea ni rompe el webhook ni la respuesta.
+_NOTIFIED_TTL = 24 * 60 * 60
+_notified_ids: set = set()
+_notified_dq: deque = deque(maxlen=5000)
+_notified_lock = threading.Lock()
+
+
+def _should_notify_inbound(dedup_key: str) -> bool:
+    """True si el mensaje aún no fue notificado al asesor (primera vez).
+
+    Reserva atómica: prefiere Redis/Valkey (robusto entre workers y reinicios);
+    si no hay Redis o falla, usa dedup en memoria. Sin dedup_key, siempre notifica.
+    """
+    if not dedup_key:
+        return True
+    r = getattr(_state_store, "_redis", None)
+    if r is not None:
+        try:
+            # SET NX devuelve True solo la primera vez; None si ya existía.
+            return bool(r.set(f"vicky:advnotif:{dedup_key}", "1",
+                              nx=True, ex=_NOTIFIED_TTL))
+        except Exception:
+            pass  # degradación a memoria si Redis falla
+    with _notified_lock:
+        if dedup_key in _notified_ids:
+            return False
+        if len(_notified_dq) >= (_notified_dq.maxlen or 5000):
+            _notified_ids.discard(_notified_dq[0])
+        _notified_dq.append(dedup_key)
+        _notified_ids.add(dedup_key)
+        return True
+
+
+def notify_advisor_inbound(phone: str, text: str, servicio: str,
+                           estado: str, mid: str) -> None:
+    """Notifica al asesor un mensaje entrante de cliente. Nunca propaga error."""
+    try:
+        ph_digits = re.sub(r"\D", "", str(phone))
+        dedup_key = mid or f"{ph_digits}:{int(time.time() // 60)}"
+        if not _should_notify_inbound(dedup_key):
+            return
+        alerta = (
+            "🔔 NUEVO MENSAJE EN VICKY REDES (Facebook Ads)\n"
+            f"Teléfono: {phone}\n"
+            f"Servicio: {servicio or 'desconocido'}\n"
+            f"Estado: {estado or '—'}\n"
+            f"Mensaje: {text}\n"
+            f"MessageID: {mid or 'ND'}\n"
+            f"Hora: {now_mx()}"
+        )
+        if not notify_advisor(alerta):
+            log.warning("advisor_notify_failed phone_last4=%s message_id=%s cause=send_failed",
+                        ph_digits[-4:], mid or "ND")
+    except Exception as exc:
+        # No ocultar la excepción; registrar causa sin exponer tokens ni secretos.
+        log.warning("advisor_notify_failed phone_last4=%s message_id=%s cause=%s: %s",
+                    re.sub(r"\D", "", str(phone))[-4:], mid or "ND",
+                    type(exc).__name__, str(exc)[:200])
+
+
 BOARDROOM_URL = os.getenv(
     "BOARDROOM_URL",
     "https://boardroom-engine.onrender.com"
@@ -1386,6 +1449,16 @@ def handle(msg_obj: dict) -> None:
 
     log.info(f"📱 {phone}: {text[:80]}")
     _log(phone, _nombre(phone), text, "entrante", "cliente", "", "", mid)
+
+    # Hotfix Vicky Redes: alerta inmediata al asesor por TODO mensaje entrante,
+    # justo tras registrarlo en CONVERSACIONES. Fire-and-forget: no bloquea ni
+    # rompe la respuesta del bot aunque la notificación falle.
+    threading.Thread(
+        target=notify_advisor_inbound,
+        args=(phone, text, detect_svc(text) or _svc_name(phone),
+              user_state.get(phone, ""), mid),
+        daemon=True,
+    ).start()
 
     n = norm(text)
 
