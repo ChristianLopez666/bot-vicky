@@ -478,6 +478,17 @@ BUS_URL = os.getenv("BUS_URL", "").strip()
 BUS_INTERNAL_TOKEN = os.getenv("BUS_INTERNAL_TOKEN", "").strip()
 _BUS_ACTIVE = os.getenv("BUS_ENABLED", "true").strip().lower() \
               in {"1", "true", "yes", "on"}
+BOARDROOM_IS_AUTHORITY = True
+NEUTRAL_FALLBACK_MESSAGE = "Recibí tu mensaje. En un momento te atiendo."
+_BOARDROOM_ALLOWED_INSTRUCTIONS = {
+    "send_message",
+    "ask_question",
+    "send_options",
+    "request_document",
+    "notify_advisor",
+    "handoff",
+    "no_action",
+}
 
 
 def _emit_bus_event(
@@ -528,6 +539,231 @@ def _emit_bus_event(
             )
 
     threading.Thread(target=_post, daemon=True).start()
+
+
+def _bus_event_url() -> str:
+    url = (BUS_URL or "").strip().rstrip("/")
+    if not url:
+        return ""
+    if url.endswith("/bus/event"):
+        return url
+    return f"{url}/bus/event"
+
+
+def _bus_confirm_url() -> str:
+    url = _bus_event_url()
+    if not url:
+        return ""
+    return f"{url}/confirm"
+
+
+def _message_text(msg_obj: dict, mtype: str) -> str:
+    if mtype == "text":
+        return ((msg_obj.get("text") or {}).get("body") or "").strip()[:500]
+    if mtype == "button":
+        btn = msg_obj.get("button") or {}
+        return (btn.get("text") or btn.get("payload") or "").strip()[:500]
+    return ""
+
+
+def _canonical_message_type(mtype: str) -> str:
+    return mtype if mtype in {"text", "audio", "image", "document", "button"} else "unknown"
+
+
+def _campaign_source(ref: dict) -> str:
+    source_type = norm(ref.get("source_type", ""))
+    if source_type in {"ad", "ads", "facebook"}:
+        return "facebook"
+    if source_type in {"whatsapp", "web"}:
+        return source_type
+    return "unknown" if ref else "direct"
+
+
+def _campaign_product_hint(msg_obj: dict, n: str) -> str:
+    ref = msg_obj.get("referral") or {}
+    fields = " ".join(
+        norm(str(ref.get(k, "")))
+        for k in ("headline", "body", "source_id", "source_url")
+    )
+    if any(k in f"{fields} {n}" for k in _IMSS_REF_KW | _IMSS_STRONG):
+        return "prestamo_imss"
+    return "unknown"
+
+
+def _attachments_for_message(msg_obj: dict, mtype: str) -> list[dict]:
+    media = msg_obj.get(mtype) or {}
+    media_id = media.get("id")
+    if mtype in {"image", "document", "audio"} and media_id:
+        return [{"type": mtype, "media_id": media_id}]
+    return []
+
+
+def _build_boardroom_event(phone: str, text: str, msg_obj: dict, mtype: str) -> dict:
+    ref = msg_obj.get("referral") or {}
+    n = norm(text)
+    data = user_data.get(phone, {})
+    state = user_state.get(phone, "")
+    return {
+        "event_id": str(uuid.uuid4()),
+        "message_id": msg_obj.get("id", ""),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": "whatsapp",
+        "channel": "vicky_campanas",
+        "phone": phone,
+        "contact_name": _nombre(phone) or None,
+        "text": text or "",
+        "message_type": _canonical_message_type(mtype),
+        "campaign": {
+            "source": _campaign_source(ref),
+            "campaign_id": str(ref.get("campaign_id") or ref.get("source_id") or "") or None,
+            "ad_id": str(ref.get("ad_id") or ref.get("source_id") or "") or None,
+            "product_hint": _campaign_product_hint(msg_obj, n),
+        },
+        "conversation": {
+            "conversation_id": f"vicky_campanas:{phone}",
+            "last_known_stage": state or None,
+            "last_bot_message": data.get("last_bot_message") or None,
+        },
+        "attachments": _attachments_for_message(msg_obj, mtype),
+        "metadata": {
+            "raw_payload_available": True,
+            "vicky_version": "bot-vicky-5146-phase1",
+            "environment": "production",
+        },
+    }
+
+
+def _parse_boardroom_instruction(body: object, event_id: str) -> tuple[dict | None, str | None]:
+    if not isinstance(body, dict):
+        return None, "invalid_json"
+    status = body.get("status")
+    if status not in {"ok", "fallback", "error"}:
+        return None, "invalid_status"
+    if body.get("event_id") and body.get("event_id") != event_id:
+        log.warning("Boardroom event_id mismatch sent=%s got=%s", event_id, body.get("event_id"))
+    instruction = body.get("instruction")
+    if not isinstance(instruction, dict):
+        return None, "missing_instruction"
+    instruction_type = str(instruction.get("type") or "").strip()
+    if instruction_type not in _BOARDROOM_ALLOWED_INSTRUCTIONS:
+        log.error("Boardroom instruction type not allowed: %s", instruction_type)
+        return None, "invalid_instruction_type"
+    return body, None
+
+
+def _request_boardroom_instruction(payload: dict) -> tuple[dict | None, str | None]:
+    if not _BUS_ACTIVE or not BUS_URL:
+        return None, "bus_disabled_or_empty"
+    if not BUS_INTERNAL_TOKEN:
+        return None, "missing_bus_token"
+    try:
+        resp = requests.post(
+            _bus_event_url(),
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {BUS_INTERNAL_TOKEN}",
+                "X-Source-System": "vicky",
+                "X-Event-Type": "inbound_message",
+            },
+            timeout=3,
+        )
+        if resp.status_code >= 400:
+            return None, f"http_{resp.status_code}"
+        body = resp.json() if resp.text else {}
+        return _parse_boardroom_instruction(body, payload["event_id"])
+    except requests.exceptions.Timeout:
+        return None, "timeout"
+    except Exception as exc:
+        log.warning("Boardroom bus request failed: %s: %s", type(exc).__name__, exc)
+        return None, "exception"
+
+
+def _instruction_message(instruction: dict) -> str:
+    message = str(instruction.get("message") or "").strip()
+    options = instruction.get("options")
+    if instruction.get("type") == "send_options" and isinstance(options, list) and options:
+        labels = []
+        for idx, option in enumerate(options, start=1):
+            if isinstance(option, dict) and option.get("label"):
+                labels.append(f"{idx}. {option['label']}")
+        if labels:
+            return "\n".join([message, *labels]).strip()
+    return message
+
+
+def _execute_boardroom_instruction(phone: str, body: dict) -> tuple[bool, str, str | None]:
+    instruction = body.get("instruction") or {}
+    instruction_type = instruction.get("type")
+    advisor = body.get("advisor_notification") or {}
+    delivery_status = "unknown"
+    try:
+        if advisor.get("required") and advisor.get("message"):
+            notify_advisor(str(advisor.get("message")))
+
+        if instruction_type == "no_action":
+            return True, delivery_status, None
+
+        if instruction_type == "notify_advisor":
+            message = _instruction_message(instruction)
+            if message:
+                notify_advisor(message)
+            return True, delivery_status, None
+
+        message = _instruction_message(instruction) or NEUTRAL_FALLBACK_MESSAGE
+        ok = send_msg(phone, message)
+        delivery_status = "sent" if ok else "failed"
+        return ok, delivery_status, None if ok else "send_failed"
+    except Exception as exc:
+        log.exception("Boardroom instruction execution failed")
+        return False, "failed", f"{type(exc).__name__}: {exc}"
+
+
+def _confirm_boardroom_execution(body: dict, executed: bool, delivery_status: str, error: str | None) -> None:
+    instruction_id = body.get("instruction_id")
+    if not instruction_id or not _BUS_ACTIVE or not BUS_URL or not BUS_INTERNAL_TOKEN:
+        return
+    try:
+        requests.post(
+            _bus_confirm_url(),
+            json={
+                "instruction_id": instruction_id,
+                "executed": bool(executed),
+                "executed_at": datetime.now(timezone.utc).isoformat(),
+                "delivery_status": delivery_status,
+                "error": error,
+            },
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {BUS_INTERNAL_TOKEN}",
+                "X-Source-System": "vicky",
+            },
+            timeout=3,
+        )
+    except Exception as exc:
+        log.warning("Boardroom confirm failed instruction_id=%s error=%s", instruction_id, exc)
+
+
+def _send_neutral_fallback(phone: str) -> None:
+    send_msg(phone, NEUTRAL_FALLBACK_MESSAGE)
+
+
+def _handle_boardroom_authority(phone: str, msg_obj: dict, mtype: str, text: str) -> bool:
+    if not BOARDROOM_IS_AUTHORITY:
+        return False
+
+    payload = _build_boardroom_event(phone, text, msg_obj, mtype)
+    body, error = _request_boardroom_instruction(payload)
+    if body is None:
+        log.warning("Boardroom authority fallback reason=%s phone_last4=%s", error, phone[-4:])
+        _send_neutral_fallback(phone)
+        return True
+
+    executed, delivery_status, exec_error = _execute_boardroom_instruction(phone, body)
+    _confirm_boardroom_execution(body, executed, delivery_status, exec_error)
+    if not executed:
+        _send_neutral_fallback(phone)
+    return True
 
 
 def _notify_boardroom_document(phone: str, media_id: str, doc_type: str) -> None:
@@ -1357,6 +1593,19 @@ def handle(msg_obj: dict) -> None:
     _tl.mid = mid
 
     mtype = msg_obj.get("type", "")
+    text_for_boardroom = _message_text(msg_obj, mtype)
+    if BOARDROOM_IS_AUTHORITY:
+        logged_text = text_for_boardroom if text_for_boardroom else f"[{_canonical_message_type(mtype)}]"
+        log.info(f"📱 {phone}: {logged_text[:80]}")
+        # DEUDA TÉCNICA FASE 2: _log() registra lead en Sheets antes
+        # de recibir decisión de Boardroom. Cuando Boardroom sea
+        # responsable de Sheets (Fase 2), este log debe moverse
+        # a _execute_boardroom_instruction() usando commercial_intent
+        # y lead_status reales de la respuesta de Boardroom.
+        _log(phone, _nombre(phone), logged_text, "entrante", "cliente", "", "", mid)
+        _handle_boardroom_authority(phone, msg_obj, mtype, text_for_boardroom)
+        return
+
     if mtype in ("image", "document"):
         media_id = (
             msg_obj.get("image", {}).get("id")
