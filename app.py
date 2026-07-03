@@ -1608,6 +1608,36 @@ def handle(msg_obj: dict) -> None:
         # y lead_status reales de la respuesta de Boardroom.
         _log(phone, _nombre(phone), logged_text, "entrante", "cliente", "", "", mid)
 
+        # Pre-router local de estado activo: si el usuario esta a mitad de un
+        # funnel local (imss_/auto_/vida_/vrim_/emp_/fp_), la respuesta debe
+        # continuar ESE funnel, nunca ir a Boardroom. El contrato canonico de
+        # Boardroom para Vicky hoy es Fase 1 (siempre responde con el mensaje
+        # neutral generico -- ver audit.decision_reason=
+        # phase_1_safe_response_no_commercial_decision en boardroom-engine),
+        # asi que cualquier respuesta de continuacion de funnel que llegara
+        # ahi terminaba mostrando el fallback en vez de avanzar la
+        # conversacion (ej. opcion 6 -> "si" -> fallback en vez de la
+        # siguiente pregunta del funnel).
+        active_state = user_state.get(phone, "")
+        if active_state.startswith("imss_"):
+            funnel_imss(phone, text_for_boardroom)
+            return
+        if active_state.startswith("auto_"):
+            funnel_auto(phone, text_for_boardroom)
+            return
+        if active_state.startswith("vida_"):
+            funnel_vida(phone, text_for_boardroom)
+            return
+        if active_state.startswith("vrim_"):
+            funnel_vrim(phone, text_for_boardroom)
+            return
+        if active_state.startswith("emp_"):
+            funnel_emp(phone, text_for_boardroom)
+            return
+        if active_state.startswith("fp_"):
+            funnel_fp(phone, text_for_boardroom)
+            return
+
         # Pre-router local: comandos de UX (menu, opciones 1-6) se resuelven
         # aqui mismo, sin pasar por Boardroom. Antes de este fix, TODO mensaje
         # -- incluido "menu" -- caia directo en _handle_boardroom_authority()
