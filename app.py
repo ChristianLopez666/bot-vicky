@@ -240,7 +240,7 @@ def _service_to_product_code(svc: str | None) -> str:
         "vida": "seguro_vida",
         "vrim": "seguro_vida",
         "emp": "nomina_empresarial",
-        "fp": "nomina_empresarial",
+        "fp": "credito_empresarial_sin_garantia",
     }.get((svc or "").strip(), "seguro_vida")
 
 
@@ -1004,6 +1004,10 @@ _EXACT: dict = {
     "financiamiento practico empresarial": "fp",
 }
 
+# Opciones numericas del menu local (1-6): deben resolver de forma
+# deterministica via _EXACT/detect_svc y nunca caer en el fallback neutral.
+_LOCAL_NUMERIC_OPTIONS = {"1", "2", "3", "4", "5", "6"}
+
 _SEM = [
     ("imss", ["prestamo imss", "credito imss", "ley 73", "jubilado imss", "pensionado imss"]),
     ("auto", ["seguro carro", "seguro auto", "asegurar carro", "asegurar vehiculo", "poliza auto"]),
@@ -1603,6 +1607,24 @@ def handle(msg_obj: dict) -> None:
         # a _execute_boardroom_instruction() usando commercial_intent
         # y lead_status reales de la respuesta de Boardroom.
         _log(phone, _nombre(phone), logged_text, "entrante", "cliente", "", "", mid)
+
+        # Pre-router local: comandos de UX (menu, opciones 1-6) se resuelven
+        # aqui mismo, sin pasar por Boardroom. Antes de este fix, TODO mensaje
+        # -- incluido "menu" -- caia directo en _handle_boardroom_authority()
+        # y, si Boardroom fallaba (ej. http_401), terminaba en el fallback
+        # neutral "Recibi tu mensaje...". El menu es UX local pura, no debe
+        # depender de la disponibilidad ni autenticacion de Boardroom.
+        n_local = norm(text_for_boardroom) if text_for_boardroom else ""
+        if n_local in _MENU_EXACT or any(p in n_local for p in _MENU_CONTAINS):
+            reset(phone)
+            show_menu(phone)
+            return
+        if n_local in _LOCAL_NUMERIC_OPTIONS:
+            svc = detect_svc(text_for_boardroom)
+            if svc:
+                route(phone, svc)
+                return
+
         _handle_boardroom_authority(phone, msg_obj, mtype, text_for_boardroom)
         return
 
