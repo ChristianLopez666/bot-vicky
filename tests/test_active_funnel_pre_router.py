@@ -120,7 +120,7 @@ def test_fp_product_code_remains_credito_empresarial_sin_garantia():
 
 def test_imss_active_state_continues_before_boardroom(monkeypatch):
     sent, boardroom_calls = _base_patches(monkeypatch)
-    vicky_app.user_state["6681234567"] = "imss_q_pension"
+    vicky_app.user_state["6681234567"] = "imss_q_pension_calc"
     vicky_app.user_data["6681234567"] = {}
     vicky_app.handle(_text_msg("6681234567", "7500", "mid-imss"))
     assert boardroom_calls == []
