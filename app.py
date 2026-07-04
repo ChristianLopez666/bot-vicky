@@ -1729,6 +1729,66 @@ def _ctc_factura_label(msg: str) -> str:
         return "A veces"
     return msg.strip() or "ND"
 
+# ── Cortesia post-cierre CTC (independiente de la de IMSS, mismo patron) ──────
+_CTC_CORTESIA_KW = {"gracias", "ok", "okay", "va", "sale", "perfecto", "excelente", "entendido", "listo"}
+_CTC_CORTESIA_PHRASES = {"de acuerdo", "muy bien"}
+_CTC_CORTESIA_FILLER = {"muchas", "vicky", "quedo", "pendiente", "espero", "su", "llamada", "tambien"}
+
+def _is_ctc_pure_courtesy_message(n_msg: str) -> bool:
+    """True solo si el mensaje, quitando cortesia y relleno, no deja nada
+    sustantivo -- evita que 'gracias, tambien quiero cotizar auto' se trague
+    como cortesia en vez de rutearse como nueva intencion."""
+    n_msg = n_msg.strip()
+    if not n_msg:
+        return False
+    working = n_msg
+    for phrase in _CTC_CORTESIA_PHRASES:
+        working = working.replace(phrase, " ")
+    toks = set(working.split())
+    has_courtesy = bool(toks & _CTC_CORTESIA_KW) or any(p in n_msg for p in _CTC_CORTESIA_PHRASES)
+    if not has_courtesy:
+        return False
+    remaining = toks - _CTC_CORTESIA_KW - _CTC_CORTESIA_FILLER
+    return len(remaining) == 0
+
+CTC_POST_CLOSE_WINDOW_SECONDS = 30 * 60
+_ctc_post_close_ctx: dict = {}
+
+def _ctc_close(phone: str) -> None:
+    """Cierra el funnel CTC normalmente (reset completo) pero registra un
+    contexto post-cierre de corta duracion, independiente de user_state, para
+    poder responder cortesia ('gracias'/'ok'/etc) sin caer en el fallback
+    neutral de Boardroom ni volver a notificar al asesor -- incluso si llegan
+    varios mensajes de cortesia seguidos."""
+    reset(phone)
+    _ctc_post_close_ctx[phone] = {"ts": time.time(), "acknowledged": False}
+
+def _ctc_post_close_active(phone: str) -> bool:
+    ctx = _ctc_post_close_ctx.get(phone)
+    if not ctx:
+        return False
+    if time.time() - ctx["ts"] > CTC_POST_CLOSE_WINDOW_SECONDS:
+        _ctc_post_close_ctx.pop(phone, None)
+        return False
+    return True
+
+def _ctc_handle_post_close_courtesy(phone: str, msg: str) -> bool:
+    """Si hay un cierre CTC reciente y el mensaje es cortesia pura, la absorbe
+    localmente (primera vez con acuse, repeticiones en silencio, nunca
+    Boardroom/fallback) y devuelve True. Si el mensaje no es cortesia pura,
+    libera el contexto y devuelve False para que se enrute normalmente."""
+    if not _ctc_post_close_active(phone):
+        return False
+    n_msg = norm(msg).strip()
+    if not _is_ctc_pure_courtesy_message(n_msg):
+        _ctc_post_close_ctx.pop(phone, None)
+        return False
+    ctx = _ctc_post_close_ctx[phone]
+    if not ctx["acknowledged"]:
+        send_msg(phone, "Con gusto 😊\nChristian revisará tu caso y te contactará a la brevedad.")
+        ctx["acknowledged"] = True
+    return True
+
 def funnel_fp(phone: str, msg: str) -> None:
     state = user_state.get(phone, "fp_start")
     data = user_data.get(phone, {})
@@ -1809,7 +1869,7 @@ def funnel_fp(phone: str, msg: str) -> None:
             "Christian revisará tu caso y te contactará para decirte si podemos avanzar "
             "con una opción de crédito empresarial sin garantía.\n\n"
             "Gracias por contactar a COHIFIS.")
-        reset(phone)
+        _ctc_close(phone)
         return
 
 # ── Pregunta filtro para mensajes ambiguos relacionados a pensión/crédito ─────
@@ -1902,6 +1962,13 @@ def handle(msg_obj: dict) -> None:
         # a _execute_boardroom_instruction() usando commercial_intent
         # y lead_status reales de la respuesta de Boardroom.
         _log(phone, _nombre(phone), logged_text, "entrante", "cliente", "", "", mid)
+
+        # Cortesia post-cierre CTC: independiente de user_state (sobrevive un
+        # reset() completo), asi que "gracias"/"ok"/etc despues de un cierre
+        # exitoso de CTC nunca llega a Boardroom, sin importar cuantos mensajes
+        # de cortesia seguidos lleguen dentro de la ventana.
+        if _ctc_handle_post_close_courtesy(phone, text_for_boardroom):
+            return
 
         # Pre-router local de estado activo: si el usuario esta a mitad de un
         # funnel local (imss_/auto_/vida_/vrim_/emp_/fp_), la respuesta debe
@@ -2019,6 +2086,9 @@ def handle(msg_obj: dict) -> None:
         return
 
     _emit_bus_event(phone=phone, text=text)
+
+    if _ctc_handle_post_close_courtesy(phone, text):
+        return
 
     state = user_state.get(phone, "")
     if state == "imss_post_cierre" and not _is_pure_courtesy_message(n):

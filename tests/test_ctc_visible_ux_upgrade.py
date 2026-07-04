@@ -36,6 +36,7 @@ def _base_patches(monkeypatch):
     monkeypatch.setattr(vicky_app, "user_data", {})
     monkeypatch.setattr(vicky_app, "_seen_ids", set())
     monkeypatch.setattr(vicky_app, "_seen_dq", vicky_app.__dict__.get("_seen_dq", []).__class__())
+    monkeypatch.setattr(vicky_app, "_ctc_post_close_ctx", {})
 
     sent = []
 
