@@ -890,8 +890,8 @@ _MENU = (
     "     💳 Consultas ilimitadas · Labs · Descuentos\n\n"
     "5️⃣  *Financiamiento Empresarial*\n"
     "     🏢 $100K–$100M · PYMES y empresas\n\n"
-    "6️⃣  *Financiamiento Práctico Empresarial*\n"
-    "     ⚡ Aprobación desde 24 hrs · Sin garantía\n"
+    "6️⃣  *Consigue Tu Crédito (CTC)*\n"
+    "     💼 Crédito empresarial sin garantía para tu negocio o actividad independiente\n"
     "────────────────────────────\n"
     "Escribe el *número* o el nombre del servicio. 😊"
 )
@@ -939,7 +939,8 @@ _SYS = (
     "Eres Vicky, asistente comercial de Christian López, asesor financiero de Inbursa. "
     "Orientas sobre 6 servicios: (1) Préstamo IMSS Pensionados Ley 73 $40K–$650K sin aval, "
     "(2) Seguro Auto, (3) Seguro Vida/GMM, (4) VRIM tarjeta médica, "
-    "(5) Financiamiento Empresarial $100K–$100M, (6) Financiamiento Práctico 24hrs sin garantía. "
+    "(5) Financiamiento Empresarial $100K–$100M, (6) Consigue Tu Crédito (CTC): crédito empresarial "
+    "sin garantía para negocio o actividad independiente. "
     "Responde en español mexicano, máximo 100 palabras, tono profesional y cálido. "
     "Resuelve dudas reales del cliente. Si la pregunta es abierta, contesta de forma útil; "
     "no mandes al menú salvo que el cliente lo pida. "
@@ -967,7 +968,7 @@ _SERVICE_LABELS = {
     "vida": "Seguro de Vida y Salud",
     "vrim": "Tarjeta Médica VRIM",
     "emp": "Financiamiento Empresarial",
-    "fp": "Financiamiento Práctico Empresarial",
+    "fp": "Consigue Tu Crédito (CTC)",
     "general": "Consulta general"
 }
 
@@ -1002,6 +1003,7 @@ _EXACT: dict = {
     "5": "emp", "financiamiento empresarial": "emp", "credito empresarial": "emp", "pyme": "emp",
     "6": "fp", "financiamiento practico": "fp", "credito rapido": "fp",
     "financiamiento practico empresarial": "fp",
+    "consigue tu credito": "fp", "ctc": "fp", "consigue tu credito ctc": "fp",
 }
 
 # Opciones numericas del menu local (1-6): deben resolver de forma
@@ -1447,20 +1449,29 @@ def funnel_emp(phone: str, msg: str) -> None:
         reset(phone)
         return
 
-# ── Flujo Financiamiento Práctico ─────────────────────────────────────────────
-_FP_STEPS = [
-    ("fp_q1", "fp_q2", "¿Antigüedad fiscal de la empresa?"),
-    ("fp_q2", "fp_q3", "¿Persona física con actividad empresarial o persona moral?"),
-    ("fp_q3", "fp_q4", "¿Edad del representante legal?"),
-    ("fp_q4", "fp_q5", "¿Buró de crédito empresa y accionistas al día? _(positivo/negativo)_"),
-    ("fp_q5", "fp_q6", "¿Facturación anual aproximada?"),
-    ("fp_q6", "fp_q7", "¿Facturación constante en los últimos 6 meses? _(Sí/No)_"),
-    ("fp_q7", "fp_q8", "¿Monto de financiamiento requerido?"),
-    ("fp_q8", "fp_q9", "¿Cuenta con opinión de cumplimiento SAT positiva?"),
-    ("fp_q9", "fp_q10", "¿Qué tipo de financiamiento requiere?"),
-    ("fp_q10", "fp_q11", "¿Tiene financiamiento activo actualmente? ¿Con quién?"),
-    ("fp_q11", "fp_end", "📝 ¿Algún comentario adicional para el asesor?"),
-]
+# ── Flujo Consigue Tu Crédito (CTC) ────────────────────────────────────────────
+CTC_PRODUCT_LABEL = "Crédito empresarial sin garantía"
+CTC_CAMPAIGN_LABEL = "CTC julio 2026"
+
+def _ctc_tipo_label(msg: str) -> str:
+    n = norm(msg).strip()
+    if n == "1" or "tengo negocio" in n:
+        return "Tiene negocio"
+    if n == "2" or "independiente" in n:
+        return "Actividad independiente"
+    if n == "3" or "empezando" in n or "apenas" in n:
+        return "Apenas está empezando"
+    return msg.strip() or "ND"
+
+def _ctc_factura_label(msg: str) -> str:
+    n = norm(msg).strip()
+    if n == "1" or n == "si":
+        return "Sí"
+    if n == "2" or n == "no":
+        return "No"
+    if n == "3" or "a veces" in n:
+        return "A veces"
+    return msg.strip() or "ND"
 
 def funnel_fp(phone: str, msg: str) -> None:
     state = user_state.get(phone, "fp_start")
@@ -1468,52 +1479,80 @@ def funnel_fp(phone: str, msg: str) -> None:
 
     if state == "fp_start":
         send_msg(phone,
-            "💼 *Financiamiento Práctico Empresarial – Inbursa*\n\n"
-            "⚡ Aprobación desde *24 horas* · Sin garantía · Desde *$100,000 MXN*\n"
-            "Para empresas y personas físicas con actividad empresarial.\n\n"
-            "¿Deseas saber si puedes acceder? _(Sí/No)_")
-        user_state[phone] = "fp_q_interes"
+            "💼 *Consigue Tu Crédito — COHIFIS*\n\n"
+            "Te ayudo a revisar si puedes acceder a un *crédito empresarial sin garantía* "
+            "para tu negocio o actividad independiente.\n\n"
+            "No es una aprobación automática; primero hacemos una preevaluación rápida "
+            "para saber si podemos avanzar.\n\n"
+            "Para empezar:\n\n"
+            "¿Tienes negocio o actividad independiente?\n\n"
+            "Responde:\n"
+            "1. Sí, tengo negocio\n"
+            "2. Trabajo de forma independiente\n"
+            "3. Apenas estoy empezando")
+        user_state[phone] = "fp_tipo"
         return
 
-    if state == "fp_q_interes":
-        r = yes_no(msg)
-        if r == "si":
-            send_msg(phone, "Excelente 🙌 Empecemos.\n*¿Cuál es el giro de tu empresa?*")
-            user_state[phone] = "fp_q1"
-        elif r == "no":
-            notify_advisor(f"📩 NO INTERESADO – Financiamiento Práctico\nWhatsApp: {phone}")
-            send_msg(phone, "Entendido 👍 Si deseas otro servicio, con gusto te oriento.")
-            reset(phone)
-        else:
-            send_msg(phone, "Responde *sí* o *no*.")
+    if state == "fp_tipo":
+        data["tipo_actividad"] = _ctc_tipo_label(msg)
+        user_data[phone] = data
+        send_msg(phone, "¿Cuánto crédito necesitas aproximadamente?")
+        user_state[phone] = "fp_monto"
         return
 
-    for (cur, nxt, nxt_q) in _FP_STEPS:
-        if state == cur:
-            data[cur] = msg
-            user_data[phone] = data
-            user_state[phone] = nxt
-            send_msg(phone, nxt_q)
-            return
+    if state == "fp_monto":
+        data["monto"] = msg.strip()
+        user_data[phone] = data
+        send_msg(phone,
+            "¿Para qué lo usarías?\n"
+            "_(ej. inventario, capital de trabajo, maquinaria/equipo, expansión, "
+            "pagar proveedores, otro)_")
+        user_state[phone] = "fp_uso"
+        return
 
-    if state == "fp_end":
-        data["comentario"] = msg
+    if state == "fp_uso":
+        data["uso_credito"] = msg.strip()
+        user_data[phone] = data
+        send_msg(phone, "¿Cuál es el giro o actividad de tu negocio?")
+        user_state[phone] = "fp_giro"
+        return
+
+    if state == "fp_giro":
+        data["giro"] = msg.strip()
+        user_data[phone] = data
+        send_msg(phone, "¿Actualmente facturas?\n1. Sí\n2. No\n3. A veces")
+        user_state[phone] = "fp_factura"
+        return
+
+    if state == "fp_factura":
+        data["factura"] = _ctc_factura_label(msg)
+        user_data[phone] = data
+        send_msg(phone, "Para revisar tu caso, dime tu nombre completo.")
+        user_state[phone] = "fp_nombre"
+        return
+
+    if state == "fp_nombre":
+        data["nombre"] = msg.strip()
+        user_data[phone] = data
         notify_advisor(
-            f"🔔 PROSPECTO – FINANCIAMIENTO PRÁCTICO\n"
+            "NUEVO LEAD — CONSIGUE TU CRÉDITO\n\n"
+            f"Producto: {CTC_PRODUCT_LABEL}\n"
+            f"Campaña: {CTC_CAMPAIGN_LABEL}\n"
+            "Estado: Pendiente de calificación\n\n"
+            f"Nombre: {data.get('nombre', 'ND')}\n"
             f"WhatsApp: {phone}\n"
-            f"Giro:           {data.get('fp_q1', 'ND')}\n"
-            f"Antigüedad:     {data.get('fp_q2', 'ND')}\n"
-            f"Tipo persona:   {data.get('fp_q3', 'ND')}\n"
-            f"Edad rep legal: {data.get('fp_q4', 'ND')}\n"
-            f"Buró:           {data.get('fp_q5', 'ND')}\n"
-            f"Facturación:    {data.get('fp_q6', 'ND')}\n"
-            f"Constante 6m:   {data.get('fp_q7', 'ND')}\n"
-            f"Monto req.:     {data.get('fp_q8', 'ND')}\n"
-            f"Opinión SAT:    {data.get('fp_q9', 'ND')}\n"
-            f"Tipo financ.:   {data.get('fp_q10', 'ND')}\n"
-            f"Financ. actual: {data.get('fp_q11', 'ND')}\n"
-            f"Comentario:     {data.get('comentario', 'Ninguno')}")
-        send_msg(phone, "✅ Listo. El asesor *Christian López* te contactará a la brevedad.")
+            f"Tipo de actividad: {data.get('tipo_actividad', 'ND')}\n"
+            f"Monto solicitado: {data.get('monto', 'ND')}\n"
+            f"Uso del crédito: {data.get('uso_credito', 'ND')}\n"
+            f"Giro: {data.get('giro', 'ND')}\n"
+            f"Factura actualmente: {data.get('factura', 'ND')}\n\n"
+            "Resumen: Lead interesado en crédito empresarial sin garantía. "
+            "Requiere revisión manual para validar viabilidad.")
+        send_msg(phone,
+            "Listo, ya tengo tus datos iniciales.\n\n"
+            "Christian revisará tu caso y te contactará para decirte si podemos avanzar "
+            "con una opción de crédito empresarial sin garantía.\n\n"
+            "Gracias por contactar a COHIFIS.")
         reset(phone)
         return
 

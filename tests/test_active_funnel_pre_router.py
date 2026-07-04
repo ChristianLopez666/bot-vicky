@@ -77,31 +77,31 @@ def test_option_6_starts_fp_funnel(monkeypatch):
     sent, boardroom_calls = _base_patches(monkeypatch)
     vicky_app.handle(_text_msg("6681234567", "6", "mid-6"))
     assert boardroom_calls == []
-    assert vicky_app.user_state.get("6681234567") == "fp_q_interes"
-    assert "Financiamiento Práctico Empresarial" in sent[0][1]
+    assert vicky_app.user_state.get("6681234567") == "fp_tipo"
+    assert "Consigue Tu Crédito" in sent[0][1]
 
 
 def test_si_after_option_6_continues_funnel_fp(monkeypatch):
     sent, boardroom_calls = _base_patches(monkeypatch)
     vicky_app.handle(_text_msg("6681234567", "6", "mid-6"))
-    vicky_app.handle(_text_msg("6681234567", "si", "mid-si"))
+    vicky_app.handle(_text_msg("6681234567", "1", "mid-si"))
     assert boardroom_calls == []
-    assert vicky_app.user_state.get("6681234567") == "fp_q1"
+    assert vicky_app.user_state.get("6681234567") == "fp_monto"
 
 
 def test_si_does_not_call_boardroom_when_state_is_fp_q_interes(monkeypatch):
     sent, boardroom_calls = _base_patches(monkeypatch)
-    vicky_app.user_state["6681234567"] = "fp_q_interes"
-    vicky_app.handle(_text_msg("6681234567", "si", "mid-si2"))
+    vicky_app.user_state["6681234567"] = "fp_tipo"
+    vicky_app.handle(_text_msg("6681234567", "1", "mid-si2"))
     assert boardroom_calls == []
 
 
 def test_si_after_option_6_sends_giro_question(monkeypatch):
     sent, boardroom_calls = _base_patches(monkeypatch)
     vicky_app.handle(_text_msg("6681234567", "6", "mid-6"))
-    vicky_app.handle(_text_msg("6681234567", "si", "mid-si"))
+    vicky_app.handle(_text_msg("6681234567", "1", "mid-si"))
     assert len(sent) == 2
-    assert "giro de tu empresa" in sent[1][1]
+    assert "crédito necesitas aproximadamente" in sent[1][1]
 
 
 def test_si_after_option_6_no_neutral_fallback(monkeypatch):
@@ -176,7 +176,7 @@ def test_option_6_still_returns_fp_prompt(monkeypatch):
     sent, boardroom_calls = _base_patches(monkeypatch)
     vicky_app.handle(_text_msg("6681234567", "6", "mid-6b"))
     assert boardroom_calls == []
-    assert "Financiamiento Práctico Empresarial" in sent[0][1]
+    assert "Consigue Tu Crédito" in sent[0][1]
 
 
 def test_free_form_without_active_state_still_calls_boardroom(monkeypatch):

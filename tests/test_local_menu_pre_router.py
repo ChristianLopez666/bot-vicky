@@ -131,8 +131,8 @@ def test_option_6_starts_correct_fp_flow(monkeypatch):
     vicky_app.handle(_text_msg("6681234567", "6", "mid-opt6-flow"))
     assert boardroom_calls == []
     assert len(sent) == 1
-    assert "Financiamiento Práctico Empresarial" in sent[0][1]
-    assert "Sin garantía" in sent[0][1]
+    assert "Consigue Tu Crédito" in sent[0][1]
+    assert "crédito empresarial sin garantía" in sent[0][1]
 
 
 # ── Boardroom sigue siendo la autoridad para mensajes libres ───────────────
