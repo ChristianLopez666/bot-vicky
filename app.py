@@ -1227,7 +1227,36 @@ def _imss_extract_monto_plazo(text: str):
     monto = extract_num(texto_sin_plazo)
     return monto, plazo
 
-_IMSS_CORTESIA_KW = {"gracias", "ok", "okay", "perfecto", "sale", "de acuerdo", "vale", "genial", "excelente"}
+_IMSS_CORTESIA_KW = {"gracias", "ok", "okay", "perfecto", "sale", "vale", "genial", "excelente"}
+_IMSS_CORTESIA_PHRASES = {"de acuerdo"}
+_IMSS_CORTESIA_FILLER = {"tambien", "y", "ademas", "porfavor", "por", "favor", "muchas", "muy", "super"}
+
+def _is_pure_courtesy_message(n_msg: str) -> bool:
+    """True solo si el mensaje, quitando cortesia y relleno, no deja nada
+    sustantivo -- evita que 'gracias, tambien quiero cotizar auto' se trague
+    como cortesia en vez de rutearse como nueva intencion."""
+    n_msg = n_msg.strip()
+    if not n_msg:
+        return False
+    working = n_msg
+    for phrase in _IMSS_CORTESIA_PHRASES:
+        working = working.replace(phrase, " ")
+    toks = set(working.split())
+    has_courtesy = bool(toks & _IMSS_CORTESIA_KW) or any(p in n_msg for p in _IMSS_CORTESIA_PHRASES)
+    if not has_courtesy:
+        return False
+    remaining = toks - _IMSS_CORTESIA_KW - _IMSS_CORTESIA_FILLER
+    return len(remaining) == 0
+
+def _imss_close(phone: str, tipo: str = "generico") -> None:
+    """Cierra un tramo terminal del funnel IMSS pero deja un estado corto
+    (imss_post_cierre) para poder responder cortesia ('gracias'/'ok'/etc)
+    sin caer en el fallback neutral de Boardroom. 'tipo' distingue el cierre
+    exitoso (con notificacion al asesor ya enviada) de los demas, para dar
+    la cortesia correcta sin volver a notificar."""
+    reset(phone)
+    user_state[phone] = "imss_post_cierre"
+    user_data[phone] = {"cierre_tipo": tipo}
 
 # ── Flujo IMSS ────────────────────────────────────────────────────────────────
 def funnel_imss(phone: str, msg: str) -> None:
@@ -1278,7 +1307,7 @@ def funnel_imss(phone: str, msg: str) -> None:
             send_msg(phone,
                 "Entendido 🙏 Para calcular una propuesta necesitamos que la pensión ya esté activa.\n\n"
                 "Aun así, si gustas, *Christian* puede revisar tu caso para cuando te pensiones.")
-            reset(phone)
+            _imss_close(phone)
         elif r == "4":
             data["relacion"] = "familiar"
             user_data[phone] = data
@@ -1300,7 +1329,7 @@ def funnel_imss(phone: str, msg: str) -> None:
                             "para que te contacte a la brevedad.")
         else:
             send_msg(phone, "¡Cuando gustes consultar, aquí estaremos! 😊")
-        reset(phone)
+        _imss_close(phone)
         return
 
     if state == "imss_q_pension_calc":
@@ -1347,7 +1376,7 @@ def funnel_imss(phone: str, msg: str) -> None:
             send_msg(phone, "✅ ¡Listo! Un asesor te contactará con opciones para tu situación.")
         else:
             send_msg(phone, "Entendido 😊 Aquí estamos cuando lo necesites.")
-        reset(phone)
+        _imss_close(phone)
         return
 
     if state == "imss_q_revision":
@@ -1399,18 +1428,20 @@ def funnel_imss(phone: str, msg: str) -> None:
             send_msg(phone,
                 "De acuerdo. Si después quieres revisar una propuesta, escríbeme "
                 "\"Préstamo IMSS\" o \"cuánto me prestan\".")
-            user_state[phone] = "imss_post_cierre"
+            _imss_close(phone)
         else:
             send_msg(phone, "Responde *1* si quieres que Christian revise tu caso, o *2* si no por ahora.")
         return
 
     if state == "imss_post_cierre":
         n_msg = norm(msg).strip()
-        toks = set(n_msg.split())
-        if n_msg in _IMSS_CORTESIA_KW or (toks & _IMSS_CORTESIA_KW):
-            send_msg(phone,
-                "Con gusto 😊\nSi después quieres revisar una propuesta, escríbeme "
-                "\"Préstamo IMSS\" o \"cuánto me prestan\".")
+        if _is_pure_courtesy_message(n_msg):
+            if data.get("cierre_tipo") == "revision_aceptada":
+                send_msg(phone, "Con gusto 😊\nChristian revisará tu caso y te contactará a la brevedad.")
+            else:
+                send_msg(phone,
+                    "Con gusto 😊\nSi después quieres revisar una propuesta, escríbeme "
+                    "\"Préstamo IMSS\" o \"cuánto me prestan\".")
         else:
             send_msg(phone, "¡Con gusto! Si necesitas algo más, aquí estoy 😊")
         reset(phone)
@@ -1447,7 +1478,7 @@ def funnel_imss(phone: str, msg: str) -> None:
             "estimada usando la calculadora existente. Requiere revisión manual antes de "
             "prometer condiciones.")
         _notify_boardroom_lead_qualified(phone, "prestamo_imss_ley73", _ensure_user(phone))
-        reset(phone)
+        _imss_close(phone, tipo="revision_aceptada")
         return
 
 
@@ -1883,7 +1914,14 @@ def handle(msg_obj: dict) -> None:
         # conversacion (ej. opcion 6 -> "si" -> fallback en vez de la
         # siguiente pregunta del funnel).
         active_state = user_state.get(phone, "")
-        if active_state.startswith("imss_"):
+        if active_state == "imss_post_cierre" and not _is_pure_courtesy_message(norm(text_for_boardroom) if text_for_boardroom else ""):
+            # Mensaje post-cierre que no es cortesia pura (ej. "gracias, tambien
+            # quiero cotizar auto"): se libera el estado y se deja caer al resto
+            # del pre-router (menu/opciones/intent IMSS/campana/Boardroom) en vez
+            # de tragarlo como agradecimiento.
+            reset(phone)
+            active_state = ""
+        elif active_state.startswith("imss_"):
             funnel_imss(phone, text_for_boardroom)
             return
         if active_state.startswith("auto_"):
@@ -1983,7 +2021,10 @@ def handle(msg_obj: dict) -> None:
     _emit_bus_event(phone=phone, text=text)
 
     state = user_state.get(phone, "")
-    if state.startswith("imss_"):
+    if state == "imss_post_cierre" and not _is_pure_courtesy_message(n):
+        reset(phone)
+        state = ""
+    elif state.startswith("imss_"):
         funnel_imss(phone, text)
         return
     if state.startswith("auto_"):

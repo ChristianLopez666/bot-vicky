@@ -130,7 +130,8 @@ def test_ley73_response_3_explains_and_does_not_ask_pension(monkeypatch):
     vicky_app.handle(_text_msg("6682222222", "1", "m1"))
     vicky_app.handle(_text_msg("6682222222", "3", "m2"))
     assert "Christian" in sent[-1][1]
-    assert vicky_app.user_state.get("6682222222") is None
+    # queda en post-cierre (no None) para poder responder cortesia sin fallback
+    assert vicky_app.user_state.get("6682222222") == "imss_post_cierre"
     assert len(advisor_msgs) == 1
 
 
@@ -357,14 +358,53 @@ def test_active_imss_calc_state_never_calls_boardroom(monkeypatch):
     assert boardroom_calls == []
 
 
-def test_post_cierre_state_never_calls_boardroom(monkeypatch):
+def test_post_cierre_courtesy_message_never_calls_boardroom(monkeypatch):
     sent, _, boardroom_calls = _base_patches(monkeypatch)
     vicky_app.handle(_text_msg("6682222222", "1", "m1"))
     vicky_app.handle(_text_msg("6682222222", "1", "m2"))
     vicky_app.handle(_text_msg("6682222222", "12000", "m3"))
     vicky_app.handle(_text_msg("6682222222", "2", "m4"))
-    vicky_app.handle(_text_msg("6682222222", "algo random no relacionado", "m5"))
+    vicky_app.handle(_text_msg("6682222222", "gracias", "m5"))
     assert boardroom_calls == []
+
+
+# Correccion (production verification failed): cortesia tras el CIERRE EXITOSO
+# (acepta revision -> nombre -> ciudad -> notificacion), no solo tras declinar.
+def test_gracias_after_successful_close_gets_courtesy_not_fallback(monkeypatch):
+    sent, advisor_msgs, boardroom_calls = _run_full_imss_flow(monkeypatch)
+    assert len(advisor_msgs) == 1  # notificacion ya enviada por el cierre exitoso
+    vicky_app.handle(_text_msg("6682222222", "gracias", "m7"))
+    assert boardroom_calls == []
+    assert all(vicky_app.NEUTRAL_FALLBACK_MESSAGE not in s[1] for s in sent)
+    assert "Christian" in sent[-1][1]
+    # no se manda una segunda notificacion al asesor
+    assert len(advisor_msgs) == 1
+    assert vicky_app.user_state.get("6682222222") is None
+
+
+def test_courtesy_after_successful_close_does_not_spam_on_second_message(monkeypatch):
+    sent, advisor_msgs, boardroom_calls = _run_full_imss_flow(monkeypatch)
+    vicky_app.handle(_text_msg("6682222222", "gracias", "m7"))
+    sent.clear()
+    vicky_app.handle(_text_msg("6682222222", "hola", "m8"))
+    # el estado ya se limpio tras la primera cortesia; "hola" es un menu trigger
+    assert "Servicios Financieros Inbursa" in sent[0][1]
+
+
+# Mensaje que combina cortesia con una intencion nueva: no debe tragarse
+def test_courtesy_combined_with_new_intent_is_not_swallowed(monkeypatch):
+    sent, _, boardroom_calls = _base_patches(monkeypatch)
+    vicky_app.handle(_text_msg("6682222222", "1", "m1"))
+    vicky_app.handle(_text_msg("6682222222", "1", "m2"))
+    vicky_app.handle(_text_msg("6682222222", "12000", "m3"))
+    vicky_app.handle(_text_msg("6682222222", "2", "m4"))
+    vicky_app.handle(_text_msg("6682222222", "gracias, también quiero cotizar auto", "m5"))
+    # no debe responder el acuse de cortesia especifico de cierre IMSS
+    assert "Si después quieres revisar una propuesta" not in sent[-1][1]
+    assert vicky_app.user_state.get("6682222222") != "imss_post_cierre"
+    # se libero el estado y se enruto como mensaje nuevo (aqui: a Boardroom,
+    # que es la autoridad comercial para texto libre sin producto local claro)
+    assert len(boardroom_calls) == 1
 
 
 # 10. Mensajes libres no-IMSS sin estado activo siguen yendo a Boardroom
