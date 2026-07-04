@@ -4,6 +4,11 @@ Upgrade visible de UX para Prestamo IMSS: de un formulario generico de lead
 mostrar nunca un numero) a un flujo que usa la calculadora existente
 (cotizador_prestamos_imss.jsx, puerto exacto en calcular_propuesta_imss()) para
 dar una propuesta estimada inmediata a partir de la pension mensual.
+
+V2 (acceptance fix): agrega bienvenida + filtro Ley 73 antes de pedir la
+pension, continuidad de "propuesta activa" para preguntas de seguimiento
+sobre monto/plazo/pago, y cortesia despues del cierre para evitar el
+fallback neutral de Boardroom tras un "gracias"/"ok"/etc.
 """
 
 import os
@@ -60,12 +65,14 @@ def _base_patches(monkeypatch):
 
 
 def _run_full_imss_flow(monkeypatch, phone="6682222222"):
+    """menu -> 1 (abre calculadora) -> 1 (Ley 73) -> pension -> revision -> nombre -> ciudad"""
     sent, advisor_msgs, boardroom_calls = _base_patches(monkeypatch)
-    vicky_app.handle(_text_msg(phone, "1", "m1"))          # menu -> abre calculadora
-    vicky_app.handle(_text_msg(phone, "12000", "m2"))      # pension -> propuesta
-    vicky_app.handle(_text_msg(phone, "1", "m3"))          # quiere revision
-    vicky_app.handle(_text_msg(phone, "Juan Prueba IMSS", "m4"))  # nombre
-    vicky_app.handle(_text_msg(phone, "Los Mochis", "m5")) # ciudad -> cierre
+    vicky_app.handle(_text_msg(phone, "1", "m1"))                      # menu -> bienvenida + filtro Ley73
+    vicky_app.handle(_text_msg(phone, "1", "m2"))                      # Ley73 = si -> pide pension
+    vicky_app.handle(_text_msg(phone, "12000", "m3"))                  # pension -> propuesta
+    vicky_app.handle(_text_msg(phone, "1", "m4"))                      # quiere revision
+    vicky_app.handle(_text_msg(phone, "Juan Prueba IMSS", "m5"))       # nombre
+    vicky_app.handle(_text_msg(phone, "Los Mochis", "m6"))             # ciudad -> cierre
     return sent, advisor_msgs, boardroom_calls
 
 
@@ -83,42 +90,82 @@ def test_menu_mentions_proposal_calculation(monkeypatch):
     assert "pensión" in sent[0][1]
 
 
-# 3 & 4. Seleccionar opcion 1 pide pension primero, sin prometer aprobacion
-def test_option_1_asks_pension_first(monkeypatch):
+# Correccion 1 -- bienvenida + filtro Ley 73
+def test_option_1_shows_welcome(monkeypatch):
     sent, _, _ = _base_patches(monkeypatch)
     vicky_app.handle(_text_msg("6682222222", "1", "mid-1"))
     msg = sent[0][1]
     assert "Préstamo IMSS" in msg
-    assert "pensión IMSS" in msg
+    assert "soy Vicky" in msg
+
+
+def test_option_1_asks_ley73_before_pension(monkeypatch):
+    sent, _, _ = _base_patches(monkeypatch)
+    vicky_app.handle(_text_msg("6682222222", "1", "mid-1b"))
+    msg = sent[0][1]
+    assert "Ley 73" in msg
+    assert "pensión IMSS" not in msg  # todavia no pide el monto de pension
     for forbidden in ("aprobado", "autorizado", "credito seguro", "ya calificaste"):
         assert forbidden not in msg.lower()
 
 
-# 5 & 6. Intent libre entra al flujo de calculadora
+def test_ley73_response_1_continues_to_pension_question(monkeypatch):
+    sent, _, boardroom_calls = _base_patches(monkeypatch)
+    vicky_app.handle(_text_msg("6682222222", "1", "m1"))
+    vicky_app.handle(_text_msg("6682222222", "1", "m2"))
+    assert boardroom_calls == []
+    assert "pensión" in sent[-1][1].lower()
+    assert vicky_app.user_state.get("6682222222") == "imss_q_pension_calc"
+
+
+def test_ley73_response_2_also_continues_to_pension(monkeypatch):
+    sent, _, _ = _base_patches(monkeypatch)
+    vicky_app.handle(_text_msg("6682222222", "1", "m1"))
+    vicky_app.handle(_text_msg("6682222222", "2", "m2"))
+    assert vicky_app.user_state.get("6682222222") == "imss_q_pension_calc"
+
+
+def test_ley73_response_3_explains_and_does_not_ask_pension(monkeypatch):
+    sent, advisor_msgs, _ = _base_patches(monkeypatch)
+    vicky_app.handle(_text_msg("6682222222", "1", "m1"))
+    vicky_app.handle(_text_msg("6682222222", "3", "m2"))
+    assert "Christian" in sent[-1][1]
+    assert vicky_app.user_state.get("6682222222") is None
+    assert len(advisor_msgs) == 1
+
+
+def test_ley73_response_4_asks_familiar_pension(monkeypatch):
+    sent, _, _ = _base_patches(monkeypatch)
+    vicky_app.handle(_text_msg("6682222222", "1", "m1"))
+    vicky_app.handle(_text_msg("6682222222", "4", "m2"))
+    assert "familiar" in sent[-1][1].lower()
+    assert vicky_app.user_state.get("6682222222") == "imss_q_pension_calc"
+
+
+# 5 & 6. Intent libre entra al flujo (siempre inicia con bienvenida+filtro)
 def test_cuanto_me_prestan_enters_imss_flow(monkeypatch):
     sent, _, boardroom_calls = _base_patches(monkeypatch)
     vicky_app.handle(_text_msg("6682222222", "cuanto me prestan", "mid-free1"))
     assert boardroom_calls == []
-    assert vicky_app.user_state.get("6682222222", "").startswith("imss_")
-    assert "pensión IMSS" in sent[0][1]
+    assert vicky_app.user_state.get("6682222222") == "imss_q_ley73"
+    assert "Ley 73" in sent[0][1]
 
 
 def test_con_mi_pension_cuanto_alcanzo_enters_imss_flow(monkeypatch):
     sent, _, boardroom_calls = _base_patches(monkeypatch)
     vicky_app.handle(_text_msg("6682222222", "con mi pension cuanto alcanzo", "mid-free2"))
     assert boardroom_calls == []
-    assert vicky_app.user_state.get("6682222222", "").startswith("imss_")
+    assert vicky_app.user_state.get("6682222222") == "imss_q_ley73"
 
 
-# 7. Extrae pension de un mensaje libre y calcula directo
-def test_free_form_with_pension_extracts_and_calculates(monkeypatch):
+def test_free_form_with_pension_still_asks_ley73_first(monkeypatch):
+    """Correccion 1: incluso si el mensaje ya trae una pension, primero se
+    confirma Ley 73 -- no se salta directo al calculo."""
     sent, _, boardroom_calls = _base_patches(monkeypatch)
     vicky_app.handle(_text_msg("6682222222", "mi pension es de 12000 cuanto me prestan", "mid-free3"))
     assert boardroom_calls == []
-    msg = sent[0][1]
-    assert "12,000" in msg
-    assert "Monto aproximado" in msg
-    assert vicky_app.user_state.get("6682222222") == "imss_q_revision"
+    assert vicky_app.user_state.get("6682222222") == "imss_q_ley73"
+    assert "Ley 73" in sent[0][1]
 
 
 # 8. Monto sin contexto de pension no se confunde con pension
@@ -127,9 +174,8 @@ def test_necesito_amount_does_not_treat_as_pension(monkeypatch):
     vicky_app.handle(_text_msg("6682222222", "necesito 50000", "mid-necesito"))
     assert boardroom_calls == []
     assert vicky_app.user_data.get("6682222222", {}).get("pension") is None
-    assert "pensión IMSS" in sent[0][1]
     assert "50,000" not in sent[0][1]
-    assert vicky_app.user_state.get("6682222222") == "imss_q_pension_calc"
+    assert vicky_app.user_state.get("6682222222") == "imss_q_ley73"
 
 
 # 9. La calculadora existente se usa (mismo puerto de cotizador_prestamos_imss.jsx)
@@ -142,36 +188,97 @@ def test_calculator_matches_ported_formula():
     assert propuesta["total"] == propuesta["cuota"] * propuesta["plazo"]
 
 
-# 10-14. Contenido del mensaje de propuesta
-def test_proposal_message_content(monkeypatch):
+# 4 & 10-14. Contenido del mensaje de propuesta
+def test_pension_10000_calculates_proposal(monkeypatch):
     sent, _, _ = _base_patches(monkeypatch)
     vicky_app.handle(_text_msg("6682222222", "1", "m1"))
-    vicky_app.handle(_text_msg("6682222222", "12000", "m2"))
+    vicky_app.handle(_text_msg("6682222222", "1", "m2"))
+    vicky_app.handle(_text_msg("6682222222", "10000", "m3"))
     msg = sent[-1][1]
-    assert "12,000" in msg
+    assert "10,000" in msg
     assert "Monto aproximado" in msg
     assert "Pago aproximado" in msg
     assert "Plazo" in msg
     assert "informativa" in msg
     for forbidden in ("aprobado", "autorizado", "ya calificaste", "garantizado", "credito seguro"):
         assert forbidden not in msg.lower()
+    assert vicky_app.user_state.get("6682222222") == "imss_q_revision"
+
+
+# Correccion 2 -- continuidad ante pregunta de seguimiento
+def test_followup_question_recalculates_with_requested_amount_and_plazo(monkeypatch):
+    sent, _, boardroom_calls = _base_patches(monkeypatch)
+    vicky_app.handle(_text_msg("6682222222", "1", "m1"))
+    vicky_app.handle(_text_msg("6682222222", "1", "m2"))
+    vicky_app.handle(_text_msg("6682222222", "10000", "m3"))
+    vicky_app.handle(_text_msg("6682222222", "cuánto pagaría por 100,000 pesos a 60 meses", "m4"))
+    assert boardroom_calls == []
+    msg = sent[-1][1]
+    assert "100,000" in msg
+    assert "60 meses" in msg
+    assert "pago" in msg.lower()
+    # sigue en propuesta activa, no se rompe ni cae al "responde 1 o 2"
+    assert "Responde" not in msg
+    assert vicky_app.user_state.get("6682222222") == "imss_q_revision"
+
+
+def test_followup_question_with_only_amount(monkeypatch):
+    sent, _, _ = _base_patches(monkeypatch)
+    vicky_app.handle(_text_msg("6682222222", "1", "m1"))
+    vicky_app.handle(_text_msg("6682222222", "1", "m2"))
+    vicky_app.handle(_text_msg("6682222222", "10000", "m3"))
+    vicky_app.handle(_text_msg("6682222222", "y si quiero 50000", "m4"))
+    msg = sent[-1][1]
+    assert "50,000" in msg
+
+
+def test_followup_question_with_only_plazo(monkeypatch):
+    sent, _, _ = _base_patches(monkeypatch)
+    vicky_app.handle(_text_msg("6682222222", "1", "m1"))
+    vicky_app.handle(_text_msg("6682222222", "1", "m2"))
+    vicky_app.handle(_text_msg("6682222222", "10000", "m3"))
+    vicky_app.handle(_text_msg("6682222222", "a 48 meses cuánto pago", "m4"))
+    msg = sent[-1][1]
+    assert "48 meses" in msg
+
+
+def test_followup_question_without_numbers_restates_proposal(monkeypatch):
+    sent, _, _ = _base_patches(monkeypatch)
+    vicky_app.handle(_text_msg("6682222222", "1", "m1"))
+    vicky_app.handle(_text_msg("6682222222", "1", "m2"))
+    vicky_app.handle(_text_msg("6682222222", "10000", "m3"))
+    vicky_app.handle(_text_msg("6682222222", "cuánto me descuentan", "m4"))
+    msg = sent[-1][1]
+    assert "$" in msg
+    assert "Responde" not in msg
+
+
+def test_no_generic_respond_1_or_2_on_valid_followup(monkeypatch):
+    sent, _, _ = _base_patches(monkeypatch)
+    vicky_app.handle(_text_msg("6682222222", "1", "m1"))
+    vicky_app.handle(_text_msg("6682222222", "1", "m2"))
+    vicky_app.handle(_text_msg("6682222222", "10000", "m3"))
+    vicky_app.handle(_text_msg("6682222222", "me prestan más", "m4"))
+    assert "Responde *1* si quieres" not in sent[-1][1]
 
 
 # 15-19. Seguimiento y cierre
 def test_after_proposal_yes_asks_name(monkeypatch):
     sent, _, _ = _base_patches(monkeypatch)
     vicky_app.handle(_text_msg("6682222222", "1", "m1"))
-    vicky_app.handle(_text_msg("6682222222", "12000", "m2"))
-    vicky_app.handle(_text_msg("6682222222", "1", "m3"))
+    vicky_app.handle(_text_msg("6682222222", "1", "m2"))
+    vicky_app.handle(_text_msg("6682222222", "12000", "m3"))
+    vicky_app.handle(_text_msg("6682222222", "1", "m4"))
     assert "nombre completo" in sent[-1][1]
 
 
 def test_captures_name_then_asks_city(monkeypatch):
     sent, _, _ = _base_patches(monkeypatch)
     vicky_app.handle(_text_msg("6682222222", "1", "m1"))
-    vicky_app.handle(_text_msg("6682222222", "12000", "m2"))
-    vicky_app.handle(_text_msg("6682222222", "1", "m3"))
-    vicky_app.handle(_text_msg("6682222222", "Juan Prueba IMSS", "m4"))
+    vicky_app.handle(_text_msg("6682222222", "1", "m2"))
+    vicky_app.handle(_text_msg("6682222222", "12000", "m3"))
+    vicky_app.handle(_text_msg("6682222222", "1", "m4"))
+    vicky_app.handle(_text_msg("6682222222", "Juan Prueba IMSS", "m5"))
     assert "ciudad" in sent[-1][1].lower()
     assert vicky_app.user_data["6682222222"]["nombre"] == "Juan Prueba Imss"
 
@@ -185,14 +292,42 @@ def test_captures_city_and_closes_with_review_message(monkeypatch):
         assert forbidden not in closing.lower()
 
 
-def test_decline_review_closes_politely_without_capturing_more_data(monkeypatch):
+# 7. "2" cierra correctamente
+def test_decline_review_closes_politely(monkeypatch):
     sent, advisor_msgs, _ = _base_patches(monkeypatch)
     vicky_app.handle(_text_msg("6682222222", "1", "m1"))
-    vicky_app.handle(_text_msg("6682222222", "12000", "m2"))
-    vicky_app.handle(_text_msg("6682222222", "2", "m3"))
+    vicky_app.handle(_text_msg("6682222222", "1", "m2"))
+    vicky_app.handle(_text_msg("6682222222", "12000", "m3"))
+    vicky_app.handle(_text_msg("6682222222", "2", "m4"))
     assert advisor_msgs == []
-    assert vicky_app.user_state.get("6682222222") is None
     assert "Préstamo IMSS" in sent[-1][1] or "cuánto me prestan" in sent[-1][1]
+    assert vicky_app.user_state.get("6682222222") == "imss_post_cierre"
+
+
+# Correccion 3 -- cortesia tras cierre, sin fallback neutral
+def test_gracias_after_close_does_not_trigger_fallback(monkeypatch):
+    sent, _, boardroom_calls = _base_patches(monkeypatch)
+    vicky_app.handle(_text_msg("6682222222", "1", "m1"))
+    vicky_app.handle(_text_msg("6682222222", "1", "m2"))
+    vicky_app.handle(_text_msg("6682222222", "12000", "m3"))
+    vicky_app.handle(_text_msg("6682222222", "2", "m4"))
+    vicky_app.handle(_text_msg("6682222222", "gracias", "m5"))
+    assert boardroom_calls == []
+    assert all(vicky_app.NEUTRAL_FALLBACK_MESSAGE not in s[1] for s in sent)
+    assert "Con gusto" in sent[-1][1]
+    assert vicky_app.user_state.get("6682222222") is None
+
+
+def test_other_courtesy_words_after_close_do_not_trigger_fallback(monkeypatch):
+    for word in ("ok", "perfecto", "sale", "de acuerdo"):
+        sent, _, boardroom_calls = _base_patches(monkeypatch)
+        vicky_app.handle(_text_msg("6682222222", "1", "m1"))
+        vicky_app.handle(_text_msg("6682222222", "1", "m2"))
+        vicky_app.handle(_text_msg("6682222222", "12000", "m3"))
+        vicky_app.handle(_text_msg("6682222222", "2", "m4"))
+        vicky_app.handle(_text_msg("6682222222", word, "m5"))
+        assert boardroom_calls == []
+        assert all(vicky_app.NEUTRAL_FALLBACK_MESSAGE not in s[1] for s in sent)
 
 
 # 20-23. Notificacion al asesor
@@ -216,20 +351,30 @@ def test_advisor_notification_contains_pending_validation(monkeypatch):
     assert "Pendiente de validación" in advisor_msgs[0]
 
 
-# 24. Estado activo IMSS no llama a Boardroom
+# 9. Estado activo IMSS no llama a Boardroom (incluye imss_post_cierre)
 def test_active_imss_calc_state_never_calls_boardroom(monkeypatch):
     sent, advisor_msgs, boardroom_calls = _run_full_imss_flow(monkeypatch)
     assert boardroom_calls == []
 
 
-# 25. Mensajes libres no-IMSS sin estado activo siguen yendo a Boardroom
+def test_post_cierre_state_never_calls_boardroom(monkeypatch):
+    sent, _, boardroom_calls = _base_patches(monkeypatch)
+    vicky_app.handle(_text_msg("6682222222", "1", "m1"))
+    vicky_app.handle(_text_msg("6682222222", "1", "m2"))
+    vicky_app.handle(_text_msg("6682222222", "12000", "m3"))
+    vicky_app.handle(_text_msg("6682222222", "2", "m4"))
+    vicky_app.handle(_text_msg("6682222222", "algo random no relacionado", "m5"))
+    assert boardroom_calls == []
+
+
+# 10. Mensajes libres no-IMSS sin estado activo siguen yendo a Boardroom
 def test_unrelated_free_form_still_calls_boardroom(monkeypatch):
     sent, _, boardroom_calls = _base_patches(monkeypatch)
     vicky_app.handle(_text_msg("6682222222", "hola quiero saber sobre opciones de inversion", "mid-free"))
     assert len(boardroom_calls) == 1
 
 
-# 26. CTC (opcion 6) sigue funcionando
+# 11. CTC (opcion 6) sigue funcionando
 def test_ctc_option_6_still_works(monkeypatch):
     sent, _, boardroom_calls = _base_patches(monkeypatch)
     vicky_app.handle(_text_msg("6682222222", "6", "mid-6"))
@@ -237,16 +382,16 @@ def test_ctc_option_6_still_works(monkeypatch):
     assert "Consigue Tu Crédito" in sent[0][1]
 
 
-# 27. Sin fallback neutral durante el flujo IMSS valido
+# Sin fallback neutral durante todo el flujo IMSS valido
 def test_no_neutral_fallback_during_imss_flow(monkeypatch):
     sent, advisor_msgs, boardroom_calls = _run_full_imss_flow(monkeypatch)
     assert all(vicky_app.NEUTRAL_FALLBACK_MESSAGE not in s[1] for s in sent)
 
 
-# 28. Sin respuestas duplicadas
+# Sin respuestas duplicadas
 def test_no_duplicate_responses_in_imss_flow(monkeypatch):
     sent, advisor_msgs, boardroom_calls = _run_full_imss_flow(monkeypatch)
-    assert len(sent) == 5
+    assert len(sent) == 6
 
 
 # Contrato tecnico: product_code no cambia

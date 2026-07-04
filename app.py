@@ -1171,17 +1171,63 @@ def _imss_revision_choice(msg: str) -> str:
         return "no"
     return yes_no(msg)
 
+def _imss_ley73_choice(msg: str) -> str:
+    n = norm(msg).strip()
+    if n in ("1", "2", "3", "4"):
+        return n
+    toks = set(n.split())
+    if "familiar" in toks:
+        return "4"
+    if "pensionar" in n or "pensionarme" in n:
+        return "3"
+    r = yes_no(msg)
+    if r == "si":
+        return "1"
+    return "?"
+
 def _imss_route_free_form(phone: str, text: str) -> None:
     """Entrada a la calculadora IMSS fuera de un estado activo (menu, intent
-    libre tipo 'cuanto me prestan', o mencion ambigua tipo 'necesito 50000')."""
+    libre tipo 'cuanto me prestan', o mencion ambigua tipo 'necesito 50000').
+    Siempre inicia con la bienvenida + filtro Ley 73 (imss_open), incluso si
+    el mensaje ya trae una pension mencionada -- ver Correccion 1."""
     user_data.setdefault(phone, {})
-    pension = extract_num(text) if text else None
-    if pension is not None:
-        user_state[phone] = "imss_q_pension_calc"
-        funnel_imss(phone, text)
-    else:
-        user_state[phone] = "imss_open"
-        funnel_imss(phone, "")
+    user_state[phone] = "imss_open"
+    funnel_imss(phone, "")
+
+# ── Seguimiento sobre monto/plazo/pago con propuesta activa ────────────────────
+_IMSS_FOLLOWUP_KW = {
+    "cuanto pagaria", "cuanto pago", "cuanto pagare", "cuanto pagara",
+    "me prestan mas", "cuanto me descuentan", "cuanto pagaria al mes",
+}
+
+def _is_imss_followup_question(n: str) -> bool:
+    if any(k in n for k in _IMSS_FOLLOWUP_KW):
+        return True
+    if any(k in n for k in ("meses", "plazo")) and any(k in n for k in ("cuanto", "pago", "pagar")):
+        return True
+    if "quiero" in n.split() and re.search(r"\d", n):
+        return True
+    if re.search(r"\d", n) and any(k in n for k in ("prestan", "presta", "dan")):
+        return True
+    return False
+
+_IMSS_PLAZO_RE = re.compile(r"(\d{1,3})\s*(?:meses|mes)\b", re.IGNORECASE)
+
+def _imss_extract_monto_plazo(text: str):
+    plazo = None
+    m_plazo = _IMSS_PLAZO_RE.search(text)
+    if m_plazo:
+        try:
+            p = int(m_plazo.group(1))
+        except Exception:
+            p = None
+        if p in (24, 36, 48, 60):
+            plazo = p
+    texto_sin_plazo = _IMSS_PLAZO_RE.sub(" ", text) if plazo is not None else text
+    monto = extract_num(texto_sin_plazo)
+    return monto, plazo
+
+_IMSS_CORTESIA_KW = {"gracias", "ok", "okay", "perfecto", "sale", "de acuerdo", "vale", "genial", "excelente"}
 
 # ── Flujo IMSS ────────────────────────────────────────────────────────────────
 def funnel_imss(phone: str, msg: str) -> None:
@@ -1207,12 +1253,39 @@ def funnel_imss(phone: str, msg: str) -> None:
     if state == "imss_open":
         send_msg(phone,
             "💰 *Préstamo IMSS — COHIFIS*\n\n"
-            "Te ayudo a calcular una propuesta estimada para pensionados IMSS.\n\n"
-            "Para hacerlo necesito saber:\n\n"
-            "¿Cuánto recibes al mes de pensión IMSS?\n\n"
-            "Escribe solo el monto aproximado.\n"
-            "Ejemplo: 12000")
-        user_state[phone] = "imss_q_pension_calc"
+            "Hola, soy Vicky.\n\n"
+            "Te ayudo a calcular una propuesta estimada para préstamo a pensionados IMSS.\n\n"
+            "Antes de calcular, necesito confirmar algo:\n\n"
+            "¿Ya estás pensionado por IMSS Ley 73?\n\n"
+            "Responde:\n"
+            "1. Sí, ya estoy pensionado por Ley 73\n"
+            "2. Estoy pensionado, pero no sé si soy Ley 73\n"
+            "3. Estoy por pensionarme\n"
+            "4. Estoy ayudando a un familiar")
+        user_state[phone] = "imss_q_ley73"
+        return
+
+    if state == "imss_q_ley73":
+        r = _imss_ley73_choice(msg)
+        if r in ("1", "2"):
+            data["ley73_estatus"] = "pensionado_ley73" if r == "1" else "pensionado_sin_confirmar_ley73"
+            data["relacion"] = "titular"
+            user_data[phone] = data
+            send_msg(phone, "Perfecto 👏\n*¿Cuánto recibes al mes por concepto de pensión?* _(ej. 7500)_")
+            user_state[phone] = "imss_q_pension_calc"
+        elif r == "3":
+            notify_advisor(f"📣 INTERÉS FUTURO – IMSS (por pensionarse)\nWhatsApp: {phone}")
+            send_msg(phone,
+                "Entendido 🙏 Para calcular una propuesta necesitamos que la pensión ya esté activa.\n\n"
+                "Aun así, si gustas, *Christian* puede revisar tu caso para cuando te pensiones.")
+            reset(phone)
+        elif r == "4":
+            data["relacion"] = "familiar"
+            user_data[phone] = data
+            send_msg(phone, "Entendido 👍\n*¿Cuánto recibe al mes de pensión tu familiar?* _(ej. 7500)_")
+            user_state[phone] = "imss_q_pension_calc"
+        else:
+            send_msg(phone, "Por favor responde *1*, *2*, *3* o *4*.")
         return
 
     if state == "imss_no_califica":
@@ -1278,6 +1351,44 @@ def funnel_imss(phone: str, msg: str) -> None:
         return
 
     if state == "imss_q_revision":
+        n_msg = norm(msg)
+        pension = data.get("pension", 0)
+
+        if _is_imss_followup_question(n_msg):
+            monto_req, plazo_req = _imss_extract_monto_plazo(msg)
+            if monto_req:
+                plazo_calc = plazo_req or data.get("propuesta_plazo", IMSS_PLAZO_MESES)
+                cuota = _imss_calcular_cuota(monto_req, plazo_calc)
+                send_msg(phone,
+                    f"Con una pensión mensual de *${pension:,.0f}*, el descuento máximo estimado "
+                    f"sería de *${pension * IMSS_LIMITE_DESCUENTO:,.0f}* al mes.\n\n"
+                    f"Para un préstamo de *${monto_req:,.0f}* a *{plazo_calc} meses*, el pago "
+                    f"aproximado sería de *${cuota:,.0f}* al mes.\n\n"
+                    "_Esta información es estimada y está sujeta a validación final._\n\n"
+                    "¿Quieres que Christian revise si podemos avanzar con esta opción?\n"
+                    "1. Sí, quiero que me contacte\n"
+                    "2. No por ahora")
+            elif plazo_req:
+                propuesta = calcular_propuesta_imss(pension, plazo_req)
+                send_msg(phone,
+                    f"A *{plazo_req} meses*, con tu pensión de *${pension:,.0f}*, el monto "
+                    f"aproximado sería de *${propuesta['monto']:,.0f}* con un pago aproximado "
+                    f"de *${propuesta['cuota']:,.0f}* al mes.\n\n"
+                    "_Esta información es estimada y está sujeta a validación final._\n\n"
+                    "¿Quieres que Christian revise si podemos avanzar con esta opción?\n"
+                    "1. Sí, quiero que me contacte\n"
+                    "2. No por ahora")
+            else:
+                send_msg(phone,
+                    f"Con tu pensión de *${pension:,.0f}*, el monto aproximado sigue siendo "
+                    f"*${data.get('propuesta_monto', 0):,.0f}* con un pago aproximado de "
+                    f"*${data.get('propuesta_cuota', 0):,.0f}* al mes a "
+                    f"{data.get('propuesta_plazo', IMSS_PLAZO_MESES)} meses.\n\n"
+                    "¿Quieres que Christian revise si podemos avanzar con esta opción?\n"
+                    "1. Sí, quiero que me contacte\n"
+                    "2. No por ahora")
+            return
+
         r = _imss_revision_choice(msg)
         if r == "si":
             data["desea_revision"] = "Sí"
@@ -1288,9 +1399,21 @@ def funnel_imss(phone: str, msg: str) -> None:
             send_msg(phone,
                 "De acuerdo. Si después quieres revisar una propuesta, escríbeme "
                 "\"Préstamo IMSS\" o \"cuánto me prestan\".")
-            reset(phone)
+            user_state[phone] = "imss_post_cierre"
         else:
             send_msg(phone, "Responde *1* si quieres que Christian revise tu caso, o *2* si no por ahora.")
+        return
+
+    if state == "imss_post_cierre":
+        n_msg = norm(msg).strip()
+        toks = set(n_msg.split())
+        if n_msg in _IMSS_CORTESIA_KW or (toks & _IMSS_CORTESIA_KW):
+            send_msg(phone,
+                "Con gusto 😊\nSi después quieres revisar una propuesta, escríbeme "
+                "\"Préstamo IMSS\" o \"cuánto me prestan\".")
+        else:
+            send_msg(phone, "¡Con gusto! Si necesitas algo más, aquí estoy 😊")
+        reset(phone)
         return
 
     if state == "imss_q_nombre_calc":
