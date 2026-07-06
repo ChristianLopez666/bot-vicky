@@ -934,6 +934,70 @@ def _is_campaign(msg_obj: dict, n: str) -> bool:
 
     return False
 
+# ── Ruteo por referral de anuncio Meta (Click to WhatsApp) ────────────────────
+# El mensaje que Meta pone en boca del prospecto ("Hello! Can I get more info
+# on this?") no dice el producto; el producto viene en msg_obj["referral"]
+# (headline/body del anuncio). Estos helpers leen ese referral para rutear
+# emp/fp localmente ANTES de Boardroom. El referral IMSS ya lo cubre
+# _is_campaign() y se evalua antes, asi que aqui solo llega lo no-IMSS.
+
+_META_REF_KEYS = ("headline", "body", "source_id", "source_url",
+                  "campaign_id", "ad_id", "ctwa_clid")
+
+# Los keywords ya estan en forma norm() (sin acentos): "crédito empresarial"
+# y "credito empresarial" colapsan al mismo termino.
+_META_REF_FP_STRONG = ("ctc", "consigue tu credito", "sin garantia")
+_META_REF_EMP_STRONG = ("factoraje", "facturas por cobrar",
+                        "creditos empresariales", "liquidez empresarial")
+_META_REF_FP_KW = ("credito empresarial sin garantia",
+                   "actividad independiente", "negocio independiente")
+_META_REF_EMP_KW = ("credito empresarial", "financiamiento empresarial",
+                    "liquidez inmediata", "capital de trabajo",
+                    "empresa", "pyme", "pymes", "negocio")
+
+
+def _campaign_referral_text(msg_obj: dict, text: str) -> str:
+    """Concatena y normaliza el texto del usuario + todos los campos string
+    del referral del anuncio (headline, body, ids, url, ctwa_clid y cualquier
+    otro string), sin romper si el referral no existe o viene incompleto."""
+    parts = [text or ""]
+    ref = msg_obj.get("referral") or {}
+    if isinstance(ref, dict):
+        for key in _META_REF_KEYS:
+            val = ref.get(key)
+            if isinstance(val, str) and val.strip():
+                parts.append(val)
+        for key, val in ref.items():
+            if key in _META_REF_KEYS:
+                continue
+            if isinstance(val, str) and val.strip():
+                parts.append(val)
+    return norm(" ".join(parts))
+
+
+def _detect_meta_referral_svc(msg_obj: dict, text: str) -> str | None:
+    """Detecta el producto (emp/fp) a partir del referral del anuncio Meta.
+    Prioridad: senales fuertes de CTC (ctc/consigue tu credito/sin garantia)
+    ganan sobre las de factoraje/empresarial, y las fuertes de empresarial
+    ganan sobre keywords genericos. Devuelve None si no hay senal clara."""
+    n = _campaign_referral_text(msg_obj, text)
+    if not n:
+        return None
+    toks = set(n.split())
+
+    def hit(kw: str) -> bool:
+        return (kw in toks) if " " not in kw else (kw in n)
+
+    if any(hit(k) for k in _META_REF_FP_STRONG):
+        return "fp"
+    if any(hit(k) for k in _META_REF_EMP_STRONG):
+        return "emp"
+    if any(hit(k) for k in _META_REF_FP_KW):
+        return "fp"
+    if any(hit(k) for k in _META_REF_EMP_KW):
+        return "emp"
+    return None
+
 # ── GPT ───────────────────────────────────────────────────────────────────────
 _SYS = (
     "Eres Vicky, asistente comercial de Christian López, asesor financiero de Inbursa. "
@@ -2043,6 +2107,51 @@ def handle(msg_obj: dict) -> None:
             user_state[phone] = "imss_filtro"
             send_msg(phone, "Para orientarte bien: ¿tu pensión es del *IMSS bajo la Ley 73*? 😊")
             return
+
+        # Ruteo por referral de anuncio Meta (Click to WhatsApp): el texto que
+        # Meta genera ("Hello! Can I get more info on this?") es generico; el
+        # producto viene en el referral del anuncio. Se rutea localmente ANTES
+        # de Boardroom. El referral IMSS ya fue atendido por _is_campaign()
+        # arriba, asi que aqui solo llegan referrals no-IMSS (emp/fp/otros).
+        referral = msg_obj.get("referral") or {}
+        if isinstance(referral, dict) and referral:
+            svc = _detect_meta_referral_svc(msg_obj, text_for_boardroom)
+            referral_text = _campaign_referral_text(msg_obj, text_for_boardroom)
+            log.info("META_REFERRAL_DETECTED phone_last4=%s fields=%s detected_svc=%s",
+                     phone[-4:], referral_text[:300], svc)
+            if svc:
+                data = _ensure_user(phone)
+                data["origen"] = f"meta_referral_{svc}"
+                data["referral_headline"] = str(referral.get("headline") or "")[:200]
+                data["referral_source_id"] = str(referral.get("source_id") or "")[:100]
+                data["referral_ad_id"] = str(referral.get("ad_id") or "")[:100]
+                data["referral_campaign_id"] = str(referral.get("campaign_id") or "")[:100]
+                user_data[phone] = data
+                route(phone, svc)
+                return
+            # Hay referral pero sin producto detectable: pregunta aclaratoria
+            # en vez de fallback neutro, para no matar el lead de Meta. La
+            # respuesta (numero 1-6 o texto) la resuelve el pre-router local.
+            send_msg(phone,
+                "Con gusto te atiendo. ¿Te interesa *crédito empresarial*, *CTC*, "
+                "*seguro de auto*, *vida* o *VRIM*?\n\n"
+                "1️⃣ Préstamo IMSS pensionados\n"
+                "2️⃣ Seguro de Auto\n"
+                "3️⃣ Seguro de Vida y Salud\n"
+                "4️⃣ Tarjeta Médica VRIM\n"
+                "5️⃣ Financiamiento Empresarial\n"
+                "6️⃣ Consigue Tu Crédito (CTC)\n\n"
+                "Responde con el *número* o el nombre del servicio. 😊")
+            return
+
+        # Deteccion local de servicio por texto libre (ej. "ctc", "credito
+        # empresarial"): mismo criterio que el resto del pre-router — si el
+        # producto es claro, se atiende localmente y no depende de Boardroom.
+        if text_for_boardroom:
+            svc = detect_svc(text_for_boardroom)
+            if svc:
+                route(phone, svc)
+                return
 
         _handle_boardroom_authority(phone, msg_obj, mtype, text_for_boardroom)
         return
