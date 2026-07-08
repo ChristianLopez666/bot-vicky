@@ -424,10 +424,31 @@ def _is_internal_request(req) -> bool:
     provided = (req.headers.get("X-Internal-Token", "") or "").strip()
     return bool(provided) and hmac.compare_digest(provided, INTERNAL_TOKEN)
 
+_TPL_PARAM_FALLBACK = "Nuevo lead recibido. Revisar conversación en WhatsApp."
+
+
+def _sanitize_template_param(text: str, limit: int = 1024) -> str:
+    """Meta rechaza parámetros de template con saltos de línea, tabs o más de
+    4 espacios consecutivos (error 132000/132012). Los mensajes al asesor son
+    multilínea, así que pasar msg crudo hacía fallar SIEMPRE el nivel 2 fuera
+    de ventana 24h. Colapsa todo whitespace/control a espacio simple, preserva
+    acentos y emojis, trunca a `limit` y nunca regresa vacío."""
+    s = str(text) if text is not None else ""
+    s = "".join(
+        ch if (ch == " " or not unicodedata.category(ch).startswith("C")) else " "
+        for ch in s
+    )
+    s = re.sub(r"\s+", " ", s).strip()
+    if limit > 0:
+        s = s[:limit].strip()
+    return s or _TPL_PARAM_FALLBACK
+
+
 def notify_advisor(msg: str) -> bool:
     """
     Nivel 1 — texto libre (funciona dentro de ventana 24h del asesor).
-    Nivel 2 — template aprobada (ADVISOR_TEMPLATE_NAME) si el texto libre falla.
+    Nivel 2 — template aprobada (ADVISOR_TEMPLATE_NAME) si el texto libre falla,
+    con el parámetro sanitizado (_sanitize_template_param), nunca msg crudo.
     Sin template, la notificación fallará fuera de ventana 24h.
     """
     if not ADVISOR_NUM:
@@ -441,27 +462,29 @@ def notify_advisor(msg: str) -> bool:
             return True
 
         err1 = f"HTTP {r.status_code}: {r.text[:150]}"
-        log.warning(f"⚠️ Texto libre al asesor falló ({err1}). Reintentando con template...")
+        log.warning("asesor_text_fallback_template_attempt: texto libre falló (%s). "
+                    "Reintentando con template...", err1)
 
         if not ADV_TPL:
-            log.warning("⚠️ ADVISOR_TEMPLATE_NAME no configurado. "
+            log.warning("advisor_template_missing: ADVISOR_TEMPLATE_NAME no configurado. "
                         "Define esta variable con el template aprobado en Meta para "
                         "notificaciones fuera de ventana 24h.")
             _log(ADVISOR_NUM, "Asesor", msg, "saliente", "asesor", "error", err1, _mid())
             return False
 
+        tpl_param = _sanitize_template_param(msg)
         r2 = _wa_post({"messaging_product": "whatsapp", "to": ADVISOR_NUM,
                        "type": "template", "template": {
                            "name": ADV_TPL, "language": {"code": ADV_TPL_LANG},
                            "components": [{"type": "body",
-                                           "parameters": [{"type": "text", "text": msg[:1024]}]}]}})
+                                           "parameters": [{"type": "text", "text": tpl_param}]}]}})
         ok = r2.status_code in (200, 201)
         _log(ADVISOR_NUM, "Asesor", msg, "saliente", "asesor",
              "ok" if ok else "error", "" if ok else r2.text[:200], _mid())
         if ok:
-            log.info("✅ Asesor notificado vía template")
+            log.info("asesor_template_ok: Asesor notificado vía template")
         else:
-            log.error(f"❌ Template falló: {r2.text[:200]}")
+            log.error("asesor_template_failed: %s", r2.text[:200])
         return ok
 
     except Exception:
