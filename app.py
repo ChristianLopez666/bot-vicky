@@ -587,6 +587,8 @@ def _campaign_product_hint(msg_obj: dict, n: str) -> str:
     )
     if any(k in f"{fields} {n}" for k in _IMSS_REF_KW | _IMSS_STRONG):
         return "prestamo_imss"
+    if _is_ctc_meta_campaign_referral(msg_obj, n):
+        return "credito_empresarial_sin_garantia"
     return "unknown"
 
 
@@ -941,8 +943,24 @@ def _is_campaign(msg_obj: dict, n: str) -> bool:
 # emp/fp localmente ANTES de Boardroom. El referral IMSS ya lo cubre
 # _is_campaign() y se evalua antes, asi que aqui solo llega lo no-IMSS.
 
-_META_REF_KEYS = ("headline", "body", "source_id", "source_url",
-                  "campaign_id", "ad_id", "ctwa_clid")
+_META_REF_KEYS = (
+    "headline", "body", "source_id", "source_url",
+    "campaign_id", "campaign_name", "ad_id", "ad_name",
+    "ctwa_clid"
+)
+
+# Override CTC por campaña/anuncio Meta.
+# Motivo: el mensaje público "Me interesa crédito empresarial" también es válido
+# para Financiamiento Empresarial Inbursa, pero ESTA campaña/ad de Meta pertenece
+# a Consigue Tu Crédito. Por eso el referral del anuncio tiene prioridad sobre
+# keywords genéricos como "credito empresarial".
+_CTC_META_REFERRAL_IDS = {
+    "6951847773049",  # CTC_Video_WhatsApp_Ad_Julio2026
+}
+_CTC_META_REFERRAL_HINTS = (
+    "ctc_whatsapp_leads_julio2026",
+    "ctc_video_whatsapp_ad_julio2026",
+)
 
 # Los keywords ya estan en forma norm() (sin acentos): "crédito empresarial"
 # y "credito empresarial" colapsan al mismo termino.
@@ -975,11 +993,57 @@ def _campaign_referral_text(msg_obj: dict, text: str) -> str:
     return norm(" ".join(parts))
 
 
+def _env_csv_set(name: str) -> set[str]:
+    raw = os.getenv(name, "") or ""
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _ctc_meta_referral_ids() -> set[str]:
+    # Permite agregar nuevos ad_id/source_id/campaign_id sin tocar código:
+    # CTC_META_REFERRAL_IDS="123,456"
+    return _CTC_META_REFERRAL_IDS | _env_csv_set("CTC_META_REFERRAL_IDS")
+
+
+def _ctc_meta_referral_hints() -> tuple[str, ...]:
+    # Permite agregar nombres/pistas de campaña sin tocar código:
+    # CTC_META_REFERRAL_HINTS="campana_nueva,ad_nuevo"
+    extra = tuple(norm(x) for x in _env_csv_set("CTC_META_REFERRAL_HINTS"))
+    return tuple(_CTC_META_REFERRAL_HINTS) + extra
+
+
+def _is_ctc_meta_campaign_referral(msg_obj: dict, text: str = "") -> bool:
+    """Override estricto para campañas Meta de Consigue Tu Crédito.
+
+    Solo aplica cuando WhatsApp entrega msg_obj["referral"]. No cambia el
+    comportamiento de mensajes directos como "Me interesa crédito empresarial",
+    porque esos no traen referral y siguen entrando al flujo empresarial normal.
+    """
+    ref = msg_obj.get("referral") or {}
+    if not isinstance(ref, dict) or not ref:
+        return False
+
+    allowed_ids = _ctc_meta_referral_ids()
+    for key in ("source_id", "ad_id", "campaign_id"):
+        raw = str(ref.get(key) or "").strip()
+        if not raw:
+            continue
+        raw_digits = re.sub(r"\D", "", raw)
+        if raw in allowed_ids or (raw_digits and raw_digits in allowed_ids):
+            return True
+
+    referral_text = _campaign_referral_text(msg_obj, text)
+    return any(hint and hint in referral_text for hint in _ctc_meta_referral_hints())
+
+
 def _detect_meta_referral_svc(msg_obj: dict, text: str) -> str | None:
     """Detecta el producto (emp/fp) a partir del referral del anuncio Meta.
-    Prioridad: senales fuertes de CTC (ctc/consigue tu credito/sin garantia)
-    ganan sobre las de factoraje/empresarial, y las fuertes de empresarial
-    ganan sobre keywords genericos. Devuelve None si no hay senal clara."""
+    Prioridad: override CTC por campaña/ad -> senales fuertes de CTC
+    (ctc/consigue tu credito/sin garantia) -> senales fuertes empresariales ->
+    keywords genericos. Devuelve None si no hay senal clara."""
+    ref = msg_obj.get("referral") or {}
+    if not isinstance(ref, dict) or not ref:
+        return None
+
     n = _campaign_referral_text(msg_obj, text)
     if not n:
         return None
@@ -988,6 +1052,8 @@ def _detect_meta_referral_svc(msg_obj: dict, text: str) -> str | None:
     def hit(kw: str) -> bool:
         return (kw in toks) if " " not in kw else (kw in n)
 
+    if _is_ctc_meta_campaign_referral(msg_obj, text):
+        return "fp"
     if any(hit(k) for k in _META_REF_FP_STRONG):
         return "fp"
     if any(hit(k) for k in _META_REF_EMP_STRONG):
@@ -2122,6 +2188,8 @@ def handle(msg_obj: dict) -> None:
             if svc:
                 data = _ensure_user(phone)
                 data["origen"] = f"meta_referral_{svc}"
+                if svc == "fp" and _is_ctc_meta_campaign_referral(msg_obj, text_for_boardroom):
+                    data["origen"] = "meta_referral_ctc_campaign_override"
                 data["referral_headline"] = str(referral.get("headline") or "")[:200]
                 data["referral_source_id"] = str(referral.get("source_id") or "")[:100]
                 data["referral_ad_id"] = str(referral.get("ad_id") or "")[:100]
