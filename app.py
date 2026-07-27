@@ -943,6 +943,12 @@ _IMSS_REF_KW = {
 def _is_campaign(msg_obj: dict, n: str) -> bool:
     ref = msg_obj.get("referral") or {}
 
+    # CTC conserva prioridad absoluta: si el referral pertenece a una campaña/ad
+    # de Consigue Tu Credito, IMSS nunca debe reclamarlo, aunque coincida algun
+    # keyword generico.
+    if _is_ctc_meta_campaign_referral(msg_obj, n):
+        return False
+
     if ref:
         st = (ref.get("source_type") or "")
         sid = (ref.get("source_id") or "")
@@ -952,6 +958,8 @@ def _is_campaign(msg_obj: dict, n: str) -> bool:
                  f"headline={hl[:50]!r} body={bd[:50]!r}")
         fields = f"{hl} {bd} {norm(sid)}"
         if any(k in fields for k in _IMSS_REF_KW):
+            return True
+        if _is_imss_meta_campaign_referral(msg_obj, n):
             return True
 
     if any(norm(k) in n for k in _IMSS_STRONG):
@@ -1058,6 +1066,46 @@ def _is_ctc_meta_campaign_referral(msg_obj: dict, text: str = "") -> bool:
     return any(hint and hint in referral_text for hint in _ctc_meta_referral_hints())
 
 
+# Override de campaña/anuncio Meta para Préstamo IMSS Ley 73, mismo patrón que
+# CTC. Vacío a propósito: el ad_id real de la campaña IMSS lo carga Don Chiwy
+# via IMSS_META_REFERRAL_IDS antes de encender la pauta. No se inventa aquí.
+_IMSS_META_REFERRAL_IDS: set[str] = set()
+
+
+def _imss_meta_referral_ids() -> set[str]:
+    # IMSS_META_REFERRAL_IDS="123,456" agrega ad_id/source_id/campaign_id sin
+    # tocar código.
+    return _IMSS_META_REFERRAL_IDS | _env_csv_set("IMSS_META_REFERRAL_IDS")
+
+
+def _imss_meta_referral_hints() -> tuple[str, ...]:
+    # IMSS_META_REFERRAL_HINTS="campana_nueva,ad_nuevo" agrega pistas de
+    # nombre de campaña sin tocar código.
+    return tuple(norm(x) for x in _env_csv_set("IMSS_META_REFERRAL_HINTS"))
+
+
+def _is_imss_meta_campaign_referral(msg_obj: dict, text: str = "") -> bool:
+    """Override por ad_id/campaign_id/source_id o hints de campaña Meta para
+    Préstamo IMSS Ley 73. Evaluado en _is_campaign() DESPUÉS del check CTC,
+    para que CTC conserve prioridad absoluta si un referral coincide con
+    ambos."""
+    ref = msg_obj.get("referral") or {}
+    if not isinstance(ref, dict) or not ref:
+        return False
+
+    allowed_ids = _imss_meta_referral_ids()
+    for key in ("source_id", "ad_id", "campaign_id"):
+        raw = str(ref.get(key) or "").strip()
+        if not raw:
+            continue
+        raw_digits = re.sub(r"\D", "", raw)
+        if raw in allowed_ids or (raw_digits and raw_digits in allowed_ids):
+            return True
+
+    referral_text = _campaign_referral_text(msg_obj, text)
+    return any(hint and hint in referral_text for hint in _imss_meta_referral_hints())
+
+
 def _detect_meta_referral_svc(msg_obj: dict, text: str) -> str | None:
     """Detecta el producto (emp/fp) a partir del referral del anuncio Meta.
     Prioridad: override CTC por campaña/ad -> senales fuertes de CTC
@@ -1102,11 +1150,14 @@ _SYS = (
     "DATOS FINANCIEROS COHIFIS: "
     "IMSS Ley 73: CAT 29.3% Inbursa vs 75.19% competencia. "
     "Monto $40,000 a $650,000. Sin aval. Sin cambio de banco. "
-    "Regalo VRIM Plus en créditos >= $50,000. "
+    "VRIM Plus preelegibilidad preliminar en préstamos IMSS desde $40,000 en adelante, "
+    "sujeta a formalización y a las condiciones de la promoción; nunca afirmar como "
+    "otorgada ni garantizada. "
     "PyME Alta Eficiencia: 18%. PyME Flexible: 36%. "
     "Tolerancia buró hasta $30,000 de mancha. "
     "TPV: desde 1.05% por transacción. Sin mensualidad fija. "
-    "VRIM: membresía médica incluida como regalo con IMSS >= $50k. "
+    "VRIM: membresía médica con elegibilidad preliminar desde IMSS $40,000, nunca "
+    "presentarla como regalo confirmado antes de la formalización. "
     "COMPORTAMIENTO: Si cliente objeta precio comparar con competencia (75.19% vs 29.3%). "
     "Si cliente objeta trámite enfatizar proceso 100% digital. "
     "Si cliente muestra intención de compra dirigir al funnel correcto. "
@@ -1244,6 +1295,32 @@ IMSS_PLAZO_MESES = 60
 IMSS_LIMITE_DESCUENTO = 0.30
 IMSS_MONTO_MINIMO = 40000
 
+# ── Promoción VRIM Plus (campaña IMSS) ─────────────────────────────────────────
+# Preelegibilidad preliminar, nunca "aprobado"/"garantizado". El costo de lista
+# de VRIM es dato interno -- nunca se menciona aquí.
+_IMSS_VRIM_PROMO_MESSAGE = (
+    "Por el monto estimado de tu préstamo, podrías recibir sin costo una membresía "
+    "*VRIM Plus* por 12 meses, sujeta a formalización y a las condiciones de la "
+    "promoción.\n\n"
+    "Incluye asistencia médica y videoconsulta 24/7, orientación emocional y "
+    "nutricional, dos videoconsultas de especialidad, una ambulancia por urgencia "
+    "real, check-up sin costo, y protección por accidente y servicio funerario "
+    "según las condiciones de edad del producto.\n\n"
+    "Christian López te explicará las condiciones completas al contactarte.\n\n"
+    "¿Quieres que Christian revise tu caso?\n"
+    "1. Sí, quiero que me contacte\n"
+    "2. No por ahora"
+)
+
+# CTA de respaldo: si la burbuja VRIM completa falla al enviarse, el
+# prospecto igual debe recibir el CTA 1/2 -- nunca queda sin poder responder.
+_IMSS_REVISION_CTA_FALLBACK = (
+    "¿Quieres que Christian revise tu caso?\n"
+    "1. Sí, quiero que me contacte\n"
+    "2. No por ahora"
+)
+
+
 def _imss_calcular_cuota(monto: float, plazo: int) -> float:
     lo, hi = monto / plazo, monto
     for _ in range(120):
@@ -1380,8 +1457,9 @@ def _imss_extract_monto_plazo(text: str):
     monto = extract_num(texto_sin_plazo)
     return monto, plazo
 
-_IMSS_CORTESIA_KW = {"gracias", "ok", "okay", "perfecto", "sale", "vale", "genial", "excelente"}
-_IMSS_CORTESIA_PHRASES = {"de acuerdo"}
+_IMSS_CORTESIA_KW = {"gracias", "ok", "okay", "perfecto", "sale", "vale", "genial",
+                     "excelente", "listo", "entendido", "va"}
+_IMSS_CORTESIA_PHRASES = {"de acuerdo", "esta bien"}
 _IMSS_CORTESIA_FILLER = {"tambien", "y", "ademas", "porfavor", "por", "favor", "muchas", "muy", "super"}
 
 def _is_pure_courtesy_message(n_msg: str) -> bool:
@@ -1401,15 +1479,150 @@ def _is_pure_courtesy_message(n_msg: str) -> bool:
     remaining = toks - _IMSS_CORTESIA_KW - _IMSS_CORTESIA_FILLER
     return len(remaining) == 0
 
-def _imss_close(phone: str, tipo: str = "generico") -> None:
+def _imss_close(phone: str, tipo: str = "generico", data: dict | None = None) -> None:
     """Cierra un tramo terminal del funnel IMSS pero deja un estado corto
     (imss_post_cierre) para poder responder cortesia ('gracias'/'ok'/etc)
     sin caer en el fallback neutral de Boardroom. 'tipo' distingue el cierre
     exitoso (con notificacion al asesor ya enviada) de los demas, para dar
-    la cortesia correcta sin volver a notificar."""
+    la cortesia correcta sin volver a notificar.
+
+    'data', si se pasa, se conserva integro (nombre, ciudad, pension,
+    propuesta_*, monto_solicitado, origen/referral_*, vrim_*,
+    advisor_notify_ok, horario_contacto) en vez de descartarse -- solo se le
+    agrega/actualiza 'cierre_tipo'. Sin 'data' el comportamiento es identico
+    al de siempre (dict minimo), para no afectar los cierres tempranos que
+    no tienen datos comerciales que conservar."""
     reset(phone)
     user_state[phone] = "imss_post_cierre"
-    user_data[phone] = {"cierre_tipo": tipo}
+    if data is not None:
+        preserved = dict(data)
+        preserved["cierre_tipo"] = tipo
+        user_data[phone] = preserved
+    else:
+        user_data[phone] = {"cierre_tipo": tipo}
+
+
+# ── Cierre comercial determinista (plantilla + datos capturados, sin IA) ──────
+# Nunca menciona para que usara el prospecto el dinero: ese dato no se
+# pregunta, no se infiere y no se persiste en ningun campo del funnel IMSS.
+def _imss_build_closing_statement(data: dict) -> str:
+    nombre = str(data.get("nombre") or "").strip()
+    saludo = f"Listo, {nombre.split()[0]}." if nombre else "Listo."
+    pension = data.get("pension")
+    monto = data.get("propuesta_monto")
+    cuota = data.get("propuesta_cuota")
+    plazo = data.get("propuesta_plazo", IMSS_PLAZO_MESES)
+
+    partes = [saludo]
+    if pension and monto and cuota:
+        frase = (
+            f"Con tu pensión de ${pension:,.0f} al mes, la propuesta estimada queda en "
+            f"${monto:,.0f} con un pago aproximado de ${cuota:,.0f} mensuales a {plazo} meses"
+        )
+        if data.get("vrim_preeligible"):
+            frase += (
+                ", con beneficio vinculado de la membresía VRIM Plus por 12 meses, "
+                "sujeta a formalización."
+            )
+        else:
+            frase += "."
+        partes.append(frase)
+    partes.append("Christian López revisará personalmente tu caso.")
+    return "\n\n".join(partes)
+
+
+def _imss_build_advisor_notification(phone: str, data: dict) -> str:
+    lines = ["📣 PROSPECTO IMSS CALIFICADO — LLAMAR", "",
+             "Producto: Préstamo IMSS pensionados"]
+    if data.get("nombre"):
+        lines.append(f"Nombre: {data['nombre']}")
+    lines.append(f"WhatsApp: {phone}")
+    if data.get("ciudad"):
+        lines.append(f"Ciudad: {data['ciudad']}")
+    if data.get("origen"):
+        lines.append(f"Origen: {data['origen']}")
+    if data.get("referral_headline"):
+        lines.append(f"Headline anuncio: {data['referral_headline']}")
+    if data.get("referral_ad_id"):
+        lines.append(f"Ad ID: {data['referral_ad_id']}")
+    if data.get("referral_campaign_id"):
+        lines.append(f"Campaign ID: {data['referral_campaign_id']}")
+    if data.get("pension"):
+        lines.append(f"Pensión mensual: ${data['pension']:,.0f}")
+    if data.get("propuesta_monto"):
+        lines.append(f"Monto estimado: ${data['propuesta_monto']:,.0f}")
+    if data.get("monto_solicitado"):
+        lines.append(f"Monto solicitado por cliente: ${data['monto_solicitado']:,.0f}")
+    if data.get("propuesta_cuota"):
+        lines.append(f"Cuota estimada: ${data['propuesta_cuota']:,.0f}")
+    if data.get("propuesta_plazo"):
+        lines.append(f"Plazo: {data['propuesta_plazo']} meses")
+
+    basis = data.get("vrim_eligibility_basis")
+    if basis:
+        lines.append(f"Base de elegibilidad VRIM: {basis}")
+    lines.append(f"VRIM preelegible: {'Sí' if data.get('vrim_preeligible') else 'No'}")
+    lines.append(f"Promoción VRIM presentada: {'Sí' if data.get('vrim_offered') else 'No'}")
+    lines.append(f"Interés del cliente en VRIM: {data.get('vrim_interest', 'sin_respuesta')}")
+    lines.append("⚠️ Verificar edad: VRIM Plus limita coberturas de accidente y "
+                 "servicio funerario a 70 años.")
+    lines.append(f"Estado del funnel: {user_state.get(phone, 'ND')}")
+    lines.append("")
+    lines.append("Resumen: Cliente solicitó cálculo de préstamo IMSS. Vicky generó una "
+                 "propuesta estimada usando la calculadora existente. Requiere revisión "
+                 "manual antes de prometer condiciones. Recomendación: llamar.")
+    return "\n".join(lines)
+
+
+def _imss_backup_num(v) -> str:
+    if isinstance(v, (int, float)):
+        return f"{v:,.0f}"
+    return "ND"
+
+
+def _imss_backup_field(v, cap: int) -> str:
+    s = str(v) if v not in (None, "") else "ND"
+    return s[:cap]
+
+
+def _imss_log_lead_backup(phone: str, data: dict, resultado: str = "advisor_notify_failed") -> None:
+    """Respaldo del lead en Google Sheets cuando falla notify_advisor() o
+    cuando el CTA (VRIM + fallback) no pudo entregarse, reutilizando _log()
+    y las columnas existentes (sin crear hoja, columna ni sistema nuevo).
+
+    _log() aplica str(msg)[:500] -- no se depende de ese truncado ciego: el
+    resumen se construye ya acotado. Los campos criticos de negocio
+    (advisor_notify_ok, whatsapp, nombre, pension, propuesta_*,
+    vrim_preeligible, vrim_offered) van PRIMERO y con longitud acotada
+    individualmente, para que sobrevivan aunque nombre/ciudad/origen sean
+    inusualmente largos. ciudad/origen van al final, tambien acotados.
+    Identificable por tipo='respaldo_lead' + 'resultado' (distingue fallo de
+    notificacion al asesor de fallo de entrega del CTA).
+
+    Limitacion documentada: es una fila de texto plano, no columnas
+    estructuradas -- no se puede filtrar/ordenar en Sheets por
+    vrim_preeligible o propuesta_monto sin parsear el texto. Suficiente para
+    recuperar manualmente el lead completo, insuficiente para reportes
+    tabulares automatizados sobre este respaldo especifico.
+    """
+    nombre_corto = _imss_backup_field(data.get("nombre", "ND"), 60)
+    resumen = (
+        "RESPALDO_LEAD_IMSS"
+        f" | advisor_notify_ok={data.get('advisor_notify_ok', 'ND')}"
+        f" | whatsapp={phone}"
+        f" | nombre={nombre_corto}"
+        f" | pension={_imss_backup_num(data.get('pension'))}"
+        f" | propuesta_monto={_imss_backup_num(data.get('propuesta_monto'))}"
+        f" | propuesta_cuota={_imss_backup_num(data.get('propuesta_cuota'))}"
+        f" | propuesta_plazo={_imss_backup_num(data.get('propuesta_plazo'))}"
+        f" | vrim_preeligible={data.get('vrim_preeligible', False)}"
+        f" | vrim_offered={data.get('vrim_offered', False)}"
+        f" | ciudad={_imss_backup_field(data.get('ciudad', 'ND'), 40)}"
+        f" | origen={_imss_backup_field(data.get('origen', 'ND'), 60)}"
+    )[:500]
+    _log(phone, nombre_corto, resumen, "respaldo_lead", "sistema",
+         resultado=resultado, error="", mid=_mid())
+
 
 # ── Flujo IMSS ────────────────────────────────────────────────────────────────
 def funnel_imss(phone: str, msg: str) -> None:
@@ -1505,6 +1718,14 @@ def funnel_imss(phone: str, msg: str) -> None:
         data["propuesta_cuota"] = propuesta["cuota"]
         data["propuesta_plazo"] = propuesta["plazo"]
         data["propuesta_total"] = propuesta["total"]
+        # Preelegibilidad VRIM: una vez establecida en True, nunca se degrada
+        # a False (ver _imss_extract_monto_plazo / reglas de jerarquía en
+        # imss_q_revision). Umbral inclusivo >= IMSS_MONTO_MINIMO, que por
+        # diseño es el mismo mínimo del producto -- toda propuesta que llega
+        # aquí ya califica.
+        if propuesta["monto"] >= IMSS_MONTO_MINIMO and not data.get("vrim_preeligible"):
+            data["vrim_preeligible"] = True
+            data["vrim_eligibility_basis"] = "propuesta_monto"
         user_data[phone] = data
 
         send_msg(phone,
@@ -1514,11 +1735,57 @@ def funnel_imss(phone: str, msg: str) -> None:
             f"• Monto aproximado: *${propuesta['monto']:,.0f}*\n"
             f"• Pago aproximado: *${propuesta['cuota']:,.0f}*/mes\n"
             f"• Plazo: *{propuesta['plazo']} meses*\n\n"
-            "_Esta propuesta es informativa y está sujeta a validación final._\n\n"
-            "¿Quieres que Christian revise tu caso?\n"
-            "1. Sí, quiero que me contacte\n"
-            "2. No por ahora")
-        user_state[phone] = "imss_q_revision"
+            "_Esta propuesta es informativa y está sujeta a validación final._")
+
+        # Burbuja VRIM separada, inmediatamente despues del resultado. El CTA
+        # 1/2 vive aqui (no en el mensaje de propuesta) porque siempre que se
+        # llega a este punto la propuesta ya califica (ver comentario arriba).
+        # El estado solo avanza a imss_q_revision si el prospecto realmente
+        # recibio un CTA (VRIM o el fallback) -- si ambos envios fallan, no
+        # lo dejamos "esperando" una pregunta 1/2 que nunca vio.
+        cta_delivered = True
+        if data.get("vrim_preeligible") and not data.get("vrim_offered"):
+            cta_delivered = False
+            vrim_sent_ok = send_msg(phone, _IMSS_VRIM_PROMO_MESSAGE)
+            if vrim_sent_ok:
+                data["vrim_offered"] = True
+                data["vrim_offer_timestamp"] = datetime.now(timezone.utc).isoformat()
+                user_data[phone] = data
+                cta_delivered = True
+            else:
+                # La burbuja VRIM completa fallo: intentar el CTA de
+                # respaldo. NUNCA se marca vrim_offered=True aqui (para que,
+                # si hay una oportunidad futura, se pueda reintentar la
+                # oferta completa).
+                log.error("imss_vrim_bubble_send_failed phone_last4=%s", phone[-4:])
+                fallback_sent_ok = send_msg(phone, _IMSS_REVISION_CTA_FALLBACK)
+                if fallback_sent_ok:
+                    cta_delivered = True
+                else:
+                    # Doble fallo: ni la burbuja VRIM ni el CTA de respaldo
+                    # llegaron. user_data se conserva intacto; se registra el
+                    # doble fallo en el respaldo existente de Sheets; el
+                    # estado NO avanza a imss_q_revision (no hay CTA que
+                    # responder). Queda en un estado local recuperable que
+                    # reintenta el CTA de respaldo ante el siguiente mensaje
+                    # del prospecto, sin ir a Boardroom ni reiniciar el
+                    # funnel.
+                    log.error("imss_cta_fallback_send_failed phone_last4=%s", phone[-4:])
+                    _imss_log_lead_backup(phone, data, resultado="cta_send_failed")
+
+        user_state[phone] = "imss_q_revision" if cta_delivered else "imss_cta_pendiente"
+        return
+
+    if state == "imss_cta_pendiente":
+        # Estado recuperable: el prospecto nunca recibio el CTA (fallo doble
+        # de VRIM + fallback). Cualquier mensaje suyo reintenta UNA vez el
+        # CTA de respaldo -- reintento acotado por turno del usuario, nunca
+        # un bucle ni reenvios ilimitados. user_data no se toca.
+        retry_ok = send_msg(phone, _IMSS_REVISION_CTA_FALLBACK)
+        if retry_ok:
+            user_state[phone] = "imss_q_revision"
+        else:
+            log.error("imss_cta_fallback_retry_failed phone_last4=%s", phone[-4:])
         return
 
     if state == "imss_pension_baja":
@@ -1539,6 +1806,42 @@ def funnel_imss(phone: str, msg: str) -> None:
         if _is_imss_followup_question(n_msg):
             monto_req, plazo_req = _imss_extract_monto_plazo(msg)
             if monto_req:
+                # H-05: persistir siempre el monto que pide el prospecto,
+                # sea o no viable -- es el dato comercial mas valioso de la
+                # conversacion.
+                data["monto_solicitado"] = monto_req
+                propuesta_monto = data.get("propuesta_monto", 0)
+
+                if monto_req < IMSS_MONTO_MINIMO:
+                    # No viable: el prestamo no existe a ese monto. Nunca se
+                    # degrada vrim_preeligible/basis (ya establecidos en
+                    # propuesta_monto) y no se reenvia la oferta VRIM.
+                    user_data[phone] = data
+                    send_msg(phone,
+                        "El monto mínimo del Préstamo IMSS Ley 73 es de *$40,000*.\n\n"
+                        "¿Te gustaría que revisemos tu caso a partir de esa cifra?")
+                    return
+
+                if propuesta_monto and monto_req > propuesta_monto:
+                    # No viable: excede lo que su pension soporta. Se usa
+                    # propuesta_monto como referencia, sin recalcular VRIM
+                    # a la baja.
+                    data["vrim_eligibility_basis"] = "propuesta_monto"
+                    user_data[phone] = data
+                    send_msg(phone,
+                        f"Con tu pensión de *${pension:,.0f}*, el monto máximo estimado que "
+                        f"podemos ofrecerte es de *${propuesta_monto:,.0f}*, con un pago "
+                        f"aproximado de *${data.get('propuesta_cuota', 0):,.0f}* al mes a "
+                        f"{data.get('propuesta_plazo', IMSS_PLAZO_MESES)} meses.\n\n"
+                        "_Esta información es estimada y está sujeta a validación final._\n\n"
+                        "¿Quieres que Christian revise si podemos avanzar con esta opción?\n"
+                        "1. Sí, quiero que me contacte\n"
+                        "2. No por ahora")
+                    return
+
+                # Viable: IMSS_MONTO_MINIMO <= monto_req <= propuesta_monto.
+                data["vrim_eligibility_basis"] = "monto_solicitado"
+                user_data[phone] = data
                 plazo_calc = plazo_req or data.get("propuesta_plazo", IMSS_PLAZO_MESES)
                 cuota = _imss_calcular_cuota(monto_req, plazo_calc)
                 send_msg(phone,
@@ -1610,28 +1913,39 @@ def funnel_imss(phone: str, msg: str) -> None:
     if state == "imss_q_ciudad_calc":
         data["ciudad"] = msg.strip().title()
         user_data[phone] = data
-        send_msg(phone,
-            "Listo, ya tengo tus datos iniciales.\n\n"
-            "Christian revisará tu caso y te contactará para validar si podemos avanzar "
-            "con una opción de préstamo IMSS.\n\n"
-            "Gracias por contactar a COHIFIS.")
-        notify_advisor(
-            "NUEVO LEAD — PRÉSTAMO IMSS CON PROPUESTA\n\n"
-            "Producto: Préstamo IMSS pensionados\n"
-            "Estado: Pendiente de validación\n\n"
-            f"Nombre: {data.get('nombre', 'ND')}\n"
-            f"WhatsApp: {phone}\n"
-            f"Ciudad: {data.get('ciudad', 'ND')}\n"
-            f"Pensión mensual: ${data.get('pension', 0):,.0f}\n"
-            f"Monto estimado: ${data.get('propuesta_monto', 0):,.0f}\n"
-            f"Pago aproximado: ${data.get('propuesta_cuota', 0):,.0f}\n"
-            f"Plazo: {data.get('propuesta_plazo', 'ND')} meses\n"
-            f"Cliente desea revisión: {data.get('desea_revision', 'Sí')}\n\n"
-            "Resumen: Cliente solicitó cálculo de préstamo IMSS. Vicky generó una propuesta "
-            "estimada usando la calculadora existente. Requiere revisión manual antes de "
-            "prometer condiciones.")
+
+        send_msg(phone, _imss_build_closing_statement(data))
+
+        # Notificar al asesor ANTES de preguntar horario -- el lead ya debe
+        # quedar calificado y registrado aunque el prospecto abandone la
+        # conversacion sin responder la siguiente pregunta (H-06).
+        advisor_notify_ok = notify_advisor(_imss_build_advisor_notification(phone, data))
+        data["advisor_notify_ok"] = advisor_notify_ok
+        user_data[phone] = data
+        if not advisor_notify_ok:
+            _imss_log_lead_backup(phone, data)
         _notify_boardroom_lead_qualified(phone, "prestamo_imss_ley73", _ensure_user(phone))
-        _imss_close(phone, tipo="revision_aceptada")
+
+        send_msg(phone, "¿En qué horario te puede llamar Christian hoy?")
+        user_state[phone] = "imss_q_horario_calc"
+        return
+
+    if state == "imss_q_horario_calc":
+        n_horario = norm(msg).strip()
+        if _is_pure_courtesy_message(n_horario):
+            # Cortesia pura (gracias/ok/listo/etc), no es un horario: no se
+            # guarda horario_contacto ni se manda una actualizacion falsa al
+            # asesor. Se cierra de forma segura (menor friccion) conservando
+            # los datos comerciales ya capturados.
+            send_msg(phone, "¡Con gusto! Christian López te contactará pronto. 😊")
+            _imss_close(phone, tipo="revision_aceptada", data=data)
+            return
+        horario = msg.strip()[:200]
+        data["horario_contacto"] = horario
+        user_data[phone] = data
+        send_msg(phone, "¡Perfecto! Ya quedó registrado. Christian López te contactará pronto. 😊")
+        notify_advisor(f"⏰ HORARIO DE CONTACTO — {data.get('nombre', 'ND')} — {horario}")
+        _imss_close(phone, tipo="revision_aceptada", data=data)
         return
 
 
@@ -2186,7 +2500,19 @@ def handle(msg_obj: dict) -> None:
             _imss_route_free_form(phone, "")
             return
         if _is_campaign(msg_obj, n_local):
-            user_data.setdefault(phone, {})
+            data = _ensure_user(phone)
+            ref = msg_obj.get("referral") or {}
+            if ref:
+                hl = str(ref.get("headline") or "")[:200]
+                sid = str(ref.get("source_id") or "")[:100]
+                data["origen"] = "campana_IMSS" + (f" | {hl or sid}" if (hl or sid) else "")
+                data["referral_headline"] = hl
+                data["referral_source_id"] = sid
+                data["referral_ad_id"] = str(ref.get("ad_id") or "")[:100]
+                data["referral_campaign_id"] = str(ref.get("campaign_id") or "")[:100]
+            else:
+                data["origen"] = "interes_directo_IMSS"
+            user_data[phone] = data
             user_state[phone] = "imss_open"
             funnel_imss(phone, "")
             return

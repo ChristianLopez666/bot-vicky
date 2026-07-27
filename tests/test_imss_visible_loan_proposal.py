@@ -64,15 +64,19 @@ def _base_patches(monkeypatch):
     return sent, advisor_msgs, boardroom_calls
 
 
-def _run_full_imss_flow(monkeypatch, phone="6682222222"):
-    """menu -> 1 (abre calculadora) -> 1 (Ley 73) -> pension -> revision -> nombre -> ciudad"""
+def _run_full_imss_flow(monkeypatch, phone="6682222222", with_horario=True):
+    """menu -> 1 (abre calculadora) -> 1 (Ley 73) -> pension (propuesta + VRIM)
+    -> revision -> nombre -> ciudad (cierre + notificacion + pregunta horario)
+    -> [horario opcional]"""
     sent, advisor_msgs, boardroom_calls = _base_patches(monkeypatch)
     vicky_app.handle(_text_msg(phone, "1", "m1"))                      # menu -> bienvenida + filtro Ley73
     vicky_app.handle(_text_msg(phone, "1", "m2"))                      # Ley73 = si -> pide pension
-    vicky_app.handle(_text_msg(phone, "12000", "m3"))                  # pension -> propuesta
+    vicky_app.handle(_text_msg(phone, "12000", "m3"))                  # pension -> propuesta + VRIM
     vicky_app.handle(_text_msg(phone, "1", "m4"))                      # quiere revision
     vicky_app.handle(_text_msg(phone, "Juan Prueba IMSS", "m5"))       # nombre
-    vicky_app.handle(_text_msg(phone, "Los Mochis", "m6"))             # ciudad -> cierre
+    vicky_app.handle(_text_msg(phone, "Los Mochis", "m6"))             # ciudad -> cierre + notificacion + pregunta horario
+    if with_horario:
+        vicky_app.handle(_text_msg(phone, "10am", "m7"))               # horario -> confirmacion + update breve
     return sent, advisor_msgs, boardroom_calls
 
 
@@ -195,7 +199,8 @@ def test_pension_10000_calculates_proposal(monkeypatch):
     vicky_app.handle(_text_msg("6682222222", "1", "m1"))
     vicky_app.handle(_text_msg("6682222222", "1", "m2"))
     vicky_app.handle(_text_msg("6682222222", "10000", "m3"))
-    msg = sent[-1][1]
+    # sent[-1] es ahora la burbuja VRIM (separada); la propuesta es sent[-2].
+    msg = sent[-2][1]
     assert "10,000" in msg
     assert "Monto aproximado" in msg
     assert "Pago aproximado" in msg
@@ -203,7 +208,29 @@ def test_pension_10000_calculates_proposal(monkeypatch):
     assert "informativa" in msg
     for forbidden in ("aprobado", "autorizado", "ya calificaste", "garantizado", "credito seguro"):
         assert forbidden not in msg.lower()
+    # El CTA 1/2 ya no vive en el mensaje de propuesta -- se movio a la burbuja VRIM.
+    assert "Responde" not in msg
+    assert "1. Sí" not in msg
     assert vicky_app.user_state.get("6682222222") == "imss_q_revision"
+
+
+def test_pension_10000_triggers_vrim_offer_as_separate_bubble(monkeypatch):
+    sent, _, _ = _base_patches(monkeypatch)
+    vicky_app.handle(_text_msg("6682222222", "1", "m1"))
+    vicky_app.handle(_text_msg("6682222222", "1", "m2"))
+    vicky_app.handle(_text_msg("6682222222", "10000", "m3"))
+    vrim_msg = sent[-1][1]
+    assert "VRIM Plus" in vrim_msg
+    assert "sujeta a formalización" in vrim_msg
+    # El CTA queda al final de la ultima burbuja.
+    assert vrim_msg.strip().endswith("2. No por ahora")
+    for forbidden in ("aprobado", "garantizado", "$790", "790 pesos"):
+        assert forbidden not in vrim_msg.lower()
+    data = vicky_app.user_data.get("6682222222", {})
+    assert data.get("vrim_preeligible") is True
+    assert data.get("vrim_offered") is True
+    assert data.get("vrim_eligibility_basis") == "propuesta_monto"
+    assert data.get("vrim_offer_timestamp")
 
 
 # Correccion 2 -- continuidad ante pregunta de seguimiento
@@ -285,11 +312,27 @@ def test_captures_name_then_asks_city(monkeypatch):
 
 
 def test_captures_city_and_closes_with_review_message(monkeypatch):
-    sent, advisor_msgs, _ = _run_full_imss_flow(monkeypatch)
-    closing = sent[-1][1]
+    # Sin horario: el cierre determinista es la penultima burbuja, seguida
+    # por la pregunta de horario (nueva captura opcional).
+    sent, advisor_msgs, _ = _run_full_imss_flow(monkeypatch, with_horario=False)
+    closing = sent[-2][1]
     assert "Christian" in closing
-    assert "revisará" in closing or "validar" in closing
-    for forbidden in ("aprobado", "autorizado", "ya calificaste"):
+    assert "revisará" in closing
+    for forbidden in ("aprobado", "autorizado", "ya calificaste", "garantizado"):
+        assert forbidden not in closing.lower()
+    assert "horario" in sent[-1][1].lower()
+
+
+def test_closing_message_references_real_captured_data(monkeypatch):
+    sent, _, _ = _run_full_imss_flow(monkeypatch, with_horario=False)
+    closing = sent[-2][1]
+    data = vicky_app.user_data.get("6682222222", {})
+    assert f"{data['pension']:,.0f}" in closing
+    assert f"{data['propuesta_monto']:,.0f}" in closing
+    assert "beneficio vinculado" in closing.lower()
+    assert "garantía" not in closing.lower()
+    # No debe existir ningun rastro de motivo/uso del credito en el cierre.
+    for forbidden in ("motivo", "uso del credito", "uso del crédito", "destino"):
         assert forbidden not in closing.lower()
 
 
@@ -332,10 +375,11 @@ def test_other_courtesy_words_after_close_do_not_trigger_fallback(monkeypatch):
 
 
 # 20-23. Notificacion al asesor
-def test_advisor_notification_says_nuevo_lead_imss_propuesta(monkeypatch):
-    sent, advisor_msgs, _ = _run_full_imss_flow(monkeypatch)
+def test_advisor_notification_says_prospecto_imss_calificado(monkeypatch):
+    # Encabezado actualizado por el parche VRIM/campana IMSS.
+    sent, advisor_msgs, _ = _run_full_imss_flow(monkeypatch, with_horario=False)
     assert len(advisor_msgs) == 1
-    assert "NUEVO LEAD — PRÉSTAMO IMSS CON PROPUESTA" in advisor_msgs[0]
+    assert "📣 PROSPECTO IMSS CALIFICADO — LLAMAR" in advisor_msgs[0]
 
 
 def test_advisor_notification_contains_pension_and_estimate(monkeypatch):
@@ -348,8 +392,40 @@ def test_advisor_notification_contains_pension_and_estimate(monkeypatch):
 
 
 def test_advisor_notification_contains_pending_validation(monkeypatch):
-    sent, advisor_msgs, _ = _run_full_imss_flow(monkeypatch)
-    assert "Pendiente de validación" in advisor_msgs[0]
+    sent, advisor_msgs, _ = _run_full_imss_flow(monkeypatch, with_horario=False)
+    assert "Requiere revisión manual" in advisor_msgs[0]
+
+
+def test_advisor_notification_contains_vrim_and_age_warning(monkeypatch):
+    sent, advisor_msgs, _ = _run_full_imss_flow(monkeypatch, with_horario=False)
+    msg = advisor_msgs[0]
+    assert "VRIM preelegible: Sí" in msg
+    assert "Promoción VRIM presentada: Sí" in msg
+    assert "Base de elegibilidad VRIM: propuesta_monto" in msg
+    assert "⚠️ Verificar edad" in msg
+    assert "70 años" in msg
+
+
+def test_advisor_notify_ok_captured_on_success(monkeypatch):
+    sent, advisor_msgs, _ = _run_full_imss_flow(monkeypatch, with_horario=False)
+    # advisor_notify_ok se captura al notificar (ciudad), antes de preguntar
+    # horario y antes de _imss_close().
+    assert vicky_app.user_data.get("6682222222", {}).get("advisor_notify_ok") is True
+    assert vicky_app.user_state.get("6682222222") == "imss_q_horario_calc"
+
+
+def test_advisor_notify_ok_false_on_failure_does_not_break_flow(monkeypatch):
+    sent, advisor_msgs, boardroom_calls = _base_patches(monkeypatch)
+    monkeypatch.setattr(vicky_app, "notify_advisor", lambda msg: False)
+    vicky_app.handle(_text_msg("6682222222", "1", "m1"))
+    vicky_app.handle(_text_msg("6682222222", "1", "m2"))
+    vicky_app.handle(_text_msg("6682222222", "12000", "m3"))
+    vicky_app.handle(_text_msg("6682222222", "1", "m4"))
+    vicky_app.handle(_text_msg("6682222222", "Juan Prueba IMSS", "m5"))
+    vicky_app.handle(_text_msg("6682222222", "Los Mochis", "m6"))
+    # La conversacion continua (se pregunta horario) aunque notify_advisor falle.
+    assert "horario" in sent[-1][1].lower()
+    assert boardroom_calls == []
 
 
 # 9. Estado activo IMSS no llama a Boardroom (incluye imss_post_cierre)
@@ -372,13 +448,14 @@ def test_post_cierre_courtesy_message_never_calls_boardroom(monkeypatch):
 # (acepta revision -> nombre -> ciudad -> notificacion), no solo tras declinar.
 def test_gracias_after_successful_close_gets_courtesy_not_fallback(monkeypatch):
     sent, advisor_msgs, boardroom_calls = _run_full_imss_flow(monkeypatch)
-    assert len(advisor_msgs) == 1  # notificacion ya enviada por el cierre exitoso
-    vicky_app.handle(_text_msg("6682222222", "gracias", "m7"))
+    # notificacion principal (ciudad) + actualizacion breve (horario) ya enviadas
+    assert len(advisor_msgs) == 2
+    vicky_app.handle(_text_msg("6682222222", "gracias", "m8"))
     assert boardroom_calls == []
     assert all(vicky_app.NEUTRAL_FALLBACK_MESSAGE not in s[1] for s in sent)
     assert "Christian" in sent[-1][1]
-    # no se manda una segunda notificacion al asesor
-    assert len(advisor_msgs) == 1
+    # no se manda notificacion adicional al asesor por la cortesia
+    assert len(advisor_msgs) == 2
     assert vicky_app.user_state.get("6682222222") is None
 
 
@@ -431,7 +508,9 @@ def test_no_neutral_fallback_during_imss_flow(monkeypatch):
 # Sin respuestas duplicadas
 def test_no_duplicate_responses_in_imss_flow(monkeypatch):
     sent, advisor_msgs, boardroom_calls = _run_full_imss_flow(monkeypatch)
-    assert len(sent) == 6
+    # bienvenida, ley73->pension, propuesta, VRIM, nombre?, ciudad?, cierre,
+    # pregunta horario, confirmacion horario = 9 burbujas para 7 turnos.
+    assert len(sent) == 9
 
 
 # Contrato tecnico: product_code no cambia
