@@ -189,7 +189,8 @@ def test_imss_referral_still_routes_to_imss(monkeypatch):
     }
     vicky_app.handle(_msg(phone, "Quiero información", "mid-imss", referral=imss_ref))
     assert vicky_app.user_state.get(phone, "").startswith("imss_")
-    assert sent and "Préstamo IMSS" in sent[0][1]
+    # Saludo comercial nuevo: "...préstamo para pensionados IMSS".
+    assert sent and "pensionados IMSS" in sent[0][1]
     assert boardroom_calls == []
 
 
