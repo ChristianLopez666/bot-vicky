@@ -162,7 +162,8 @@ def test_imss_calculator_flow_still_works(monkeypatch):
     vicky_app.handle(_text_msg("6683333333", "1", "m2"))
     vicky_app.handle(_text_msg("6683333333", "10000", "m3"))
     assert boardroom_calls == []
-    assert "Monto aproximado" in sent[-1][1]
+    # sent[-1] es la burbuja VRIM (separada, nueva); la propuesta es sent[-2].
+    assert "Monto aproximado" in sent[-2][1]
 
 
 # 14. Mensaje libre no relacionado sin estado post-cierre sigue yendo a Boardroom
