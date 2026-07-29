@@ -1135,6 +1135,41 @@ def _detect_meta_referral_svc(msg_obj: dict, text: str) -> str | None:
         return "emp"
     return None
 
+# ── Constantes financieras del préstamo IMSS ──────────────────────────────────
+# Este bloque vive ARRIBA de _SYS a proposito: _SYS se construye con
+# IMSS_TASA_ANUAL_SIN_IVA / IMSS_CAT_SIN_IVA y en Python el modulo se evalua de
+# arriba hacia abajo -- dejarlas en la seccion de la calculadora provocaria
+# NameError al importar app. Los valores son exactamente los mismos que tenia
+# la seccion "Calculadora de prestamo IMSS"; no se modifico ninguno.
+#
+# Puerto exacto del modo "Calcular por pension" de cotizador_prestamos_imss.jsx
+# (mismas constantes financieras, misma biseccion). No se inventa formula nueva.
+IMSS_TASA_MENSUAL = 0.018659
+IMSS_IVA_RATE = 0.16
+IMSS_CAT = 29.3          # criterio CON IVA, uso interno. Nunca se muestra al cliente.
+IMSS_PLAZO_MESES = 60
+IMSS_LIMITE_DESCUENTO = 0.30
+IMSS_MONTO_MINIMO = 40000
+
+# Tasa fija anual sin IVA, en puntos porcentuales (misma unidad que IMSS_CAT).
+# Derivada de la tasa mensual vigente: 0.018659 * 12 * 100 = 22.3908 -> 22.39%.
+# Fuente unica: no se hardcodea 22.39 en ninguna plantilla de texto.
+IMSS_TASA_ANUAL_SIN_IVA = IMSS_TASA_MENSUAL * 12 * 100
+
+# Costo Anual Total sin IVA, en puntos porcentuales. Valor OFICIAL, no calculado.
+# Procedencia documental: diez tablas de amortizacion generadas por el cotizador
+# oficial de Banco Inbursa entregadas por el usuario el 28 de julio de 2026
+# (plazos 6, 12, 18, 24, 30, 36, 42, 48, 54 y 60 meses). Las diez reportan
+# "Tasa de interes fija anual sin IVA: 22.39%" y "CAT sin IVA: 24.8%".
+# El control de coherencia ((1+IMSS_TASA_MENSUAL)**12 - 1)*100 = 24.8377 se
+# usa solo para detectar deriva: si deja de coincidir, prevalece este valor
+# oficial y la discrepancia debe hacerse visible (ver pruebas).
+IMSS_CAT_SIN_IVA = 24.8
+
+# Plazos vigentes del cotizador oficial de Inbursa. Fuente unica: la lista no
+# se repite literal en ningun otro punto del modulo.
+IMSS_PLAZOS_DISPONIBLES = (6, 12, 18, 24, 30, 36, 42, 48, 54, 60)
+
 # ── GPT ───────────────────────────────────────────────────────────────────────
 _SYS = (
     "Eres Vicky, asistente comercial de Christian López, asesor financiero de Inbursa. "
@@ -1148,7 +1183,9 @@ _SYS = (
     "Termina con UNA sola pregunta cuando ayude a avanzar. "
     "No inventes tasas, requisitos ni condiciones no confirmadas. "
     "DATOS FINANCIEROS COHIFIS: "
-    "IMSS Ley 73: CAT 29.3% Inbursa vs 75.19% competencia. "
+    f"IMSS Ley 73: tasa fija anual {IMSS_TASA_ANUAL_SIN_IVA:.2f}% sin IVA, "
+    f"CAT informativo {IMSS_CAT_SIN_IVA:.1f}% sin IVA (condiciones oficiales del "
+    "cotizador Inbursa, informativas y sujetas a cambio). "
     "Monto $40,000 a $650,000. Sin aval. Sin cambio de banco. "
     "VRIM Plus preelegibilidad preliminar en préstamos IMSS desde $40,000 en adelante, "
     "sujeta a formalización y a las condiciones de la promoción; nunca afirmar como "
@@ -1158,7 +1195,11 @@ _SYS = (
     "TPV: desde 1.05% por transacción. Sin mensualidad fija. "
     "VRIM: membresía médica con elegibilidad preliminar desde IMSS $40,000, nunca "
     "presentarla como regalo confirmado antes de la formalización. "
-    "COMPORTAMIENTO: Si cliente objeta precio comparar con competencia (75.19% vs 29.3%). "
+    # Se elimino la comparacion "75.19% vs 29.3%": el 29.3% es criterio CON IVA
+    # y no hay evidencia verificable de bajo que criterio esta expresado el
+    # 75.19% de la competencia. No se sustituye por otra cifra.
+    "COMPORTAMIENTO: Si cliente objeta precio, explicar las condiciones oficiales "
+    "vigentes del producto sin compararlas con otras instituciones. "
     "Si cliente objeta trámite enfatizar proceso 100% digital. "
     "Si cliente muestra intención de compra dirigir al funnel correcto. "
     "NUNCA mezclar productos B2C con B2B en misma respuesta. "
@@ -1286,38 +1327,61 @@ def route(phone: str, svc: str) -> None:
         funnel_vrim(phone, "")
 
 # ── Calculadora de préstamo IMSS ───────────────────────────────────────────────
-# Puerto exacto del modo "Calcular por pensión" de cotizador_prestamos_imss.jsx
-# (mismas constantes financieras, misma bisección). No se inventa formula nueva.
-IMSS_TASA_MENSUAL = 0.018659
-IMSS_IVA_RATE = 0.16
-IMSS_CAT = 29.3
-IMSS_PLAZO_MESES = 60
-IMSS_LIMITE_DESCUENTO = 0.30
-IMSS_MONTO_MINIMO = 40000
+# Las constantes financieras (IMSS_TASA_MENSUAL, IMSS_IVA_RATE, IMSS_CAT,
+# IMSS_PLAZO_MESES, IMSS_LIMITE_DESCUENTO, IMSS_MONTO_MINIMO,
+# IMSS_TASA_ANUAL_SIN_IVA, IMSS_CAT_SIN_IVA, IMSS_PLAZOS_DISPONIBLES) se
+# definen arriba, antes de _SYS, por orden de evaluacion del modulo.
 
 # ── Promoción VRIM Plus (campaña IMSS) ─────────────────────────────────────────
 # Preelegibilidad preliminar, nunca "aprobado"/"garantizado". El costo de lista
 # de VRIM es dato interno -- nunca se menciona aquí.
 _IMSS_VRIM_PROMO_MESSAGE = (
-    "Por el monto estimado de tu préstamo, podrías recibir sin costo una membresía "
-    "*VRIM Plus* por 12 meses, sujeta a formalización y a las condiciones de la "
-    "promoción.\n\n"
-    "Incluye asistencia médica y videoconsulta 24/7, orientación emocional y "
-    "nutricional, dos videoconsultas de especialidad, una ambulancia por urgencia "
-    "real, check-up sin costo, y protección por accidente y servicio funerario "
-    "según las condiciones de edad del producto.\n\n"
-    "Christian López te explicará las condiciones completas al contactarte.\n\n"
+    "🎁 *¡Tu propuesta puede darte mucho más que un préstamo!*\n\n"
+    "Por el monto estimado, podrías recibir *sin costo una membresía VRIM Plus "
+    "durante 12 meses*, sujeta a la formalización del préstamo y a las condiciones "
+    "de la promoción.\n\n"
+    "Con ella tendrías acceso a beneficios pensados para cuidar tu salud, proteger "
+    "tu economía y dar tranquilidad a tu familia:\n\n"
+    "🩺 *Atención de emergencias y asistencia médica por teléfono o videoconsulta, "
+    "las 24 horas, los 365 días del año.*\n\n"
+    "🧠 *Orientación emocional y nutricional por teléfono o videoconsulta.*\n\n"
+    "👨‍⚕️ *Dos videoconsultas de especialidad sin costo*, a elegir entre medicina "
+    "interna, ginecología o pediatría.\n\n"
+    "🚑 *Una ambulancia sin costo al año*, en caso de urgencia real.\n\n"
+    "🧪 *Un check-up sin costo*, que incluye química sanguínea de 6 elementos, "
+    "biometría hemática y examen general de orina, coordinado en laboratorios "
+    "participantes de la red VRIM.\n\n"
+    "🛡️ *Reembolso de gastos médicos por accidente de hasta $20,000*, sin deducible "
+    "y sin límite de eventos, para personas de *0 a 70 años*.\n\n"
+    "⚱️ *Servicio funerario completo, incluyendo cremación*, por fallecimiento "
+    "accidental o por enfermedad, para personas de *0 a 70 años cumplidos*. En "
+    "enfermedades preexistentes aplica un periodo de espera de 90 días; por "
+    "accidente, la cobertura es inmediata.\n\n"
+    "*Porque resolver una necesidad económica es importante, pero tener atención "
+    "médica disponible, respaldo frente a un accidente y apoyo para tu familia "
+    "puede darte tranquilidad durante todo un año.*\n\n"
+    "Christian López revisará personalmente tu propuesta y te explicará claramente "
+    "cómo funciona cada beneficio.\n\n"
+    "*¿Quieres que Christian revise tu caso?*\n\n"
+    "1️⃣ Sí, quiero que me contacte\n"
+    "2️⃣ No por ahora"
+)
+
+# CTA de respaldo: si la burbuja VRIM completa falla al enviarse, el
+# prospecto igual debe recibir el CTA 1/2 -- nunca queda sin poder responder.
+# Texto conservado tal cual del parche anterior a proposito.
+_IMSS_REVISION_CTA_FALLBACK = (
     "¿Quieres que Christian revise tu caso?\n"
     "1. Sí, quiero que me contacte\n"
     "2. No por ahora"
 )
 
-# CTA de respaldo: si la burbuja VRIM completa falla al enviarse, el
-# prospecto igual debe recibir el CTA 1/2 -- nunca queda sin poder responder.
-_IMSS_REVISION_CTA_FALLBACK = (
-    "¿Quieres que Christian revise tu caso?\n"
-    "1. Sí, quiero que me contacte\n"
-    "2. No por ahora"
+# CTA que cierra los mensajes de revision (monto/plazo alternativo). Misma
+# semantica 1/2 de siempre; fuente unica para no repetirlo en cada rama.
+_IMSS_REVISION_CTA = (
+    "¿Quieres que Christian revise si podemos avanzar con esta opción?\n"
+    "1️⃣ Sí, quiero que me contacte\n"
+    "2️⃣ No por ahora"
 )
 
 
@@ -1361,6 +1425,54 @@ def calcular_propuesta_imss(pension: float, plazo: int = IMSS_PLAZO_MESES) -> di
         "plazo": plazo,
         "cuota_max": cuota_max,
     }
+
+
+def _imss_plazos_texto() -> str:
+    """'6, 12, ... 54 y 60 meses' derivado de IMSS_PLAZOS_DISPONIBLES -- la
+    lista nunca se escribe literal en una plantilla."""
+    plazos = [str(p) for p in IMSS_PLAZOS_DISPONIBLES]
+    return f"{', '.join(plazos[:-1])} y {plazos[-1]} meses"
+
+
+def _imss_primer_plazo_para_monto(pension: float, monto_objetivo: float):
+    """Plazo mas corto de IMSS_PLAZOS_DISPONIBLES cuyo monto maximo estimado
+    alcanza `monto_objetivo` con esa pension. Usa la calculadora vigente; no
+    hay tabla hardcodeada de montos. Devuelve (plazo, propuesta) o None si
+    ningun plazo disponible lo alcanza."""
+    for p in sorted(IMSS_PLAZOS_DISPONIBLES):
+        propuesta = calcular_propuesta_imss(pension, p)
+        if propuesta["monto"] >= monto_objetivo:
+            return p, propuesta
+    return None
+
+
+def _imss_primer_plazo_viable(pension: float):
+    """Plazo mas corto que alcanza el minimo del producto ($40,000)."""
+    return _imss_primer_plazo_para_monto(pension, IMSS_MONTO_MINIMO)
+
+
+# ── Propuesta activa: la ULTIMA propuesta valida que el cliente vio ────────────
+# Fuente unica para el cierre, la notificacion principal al asesor y cualquier
+# resumen posterior. Los campos propuesta_* originales se conservan intactos
+# para trazabilidad (base de elegibilidad VRIM, tope de monto solicitado).
+# Solo se registra con cifras validas: nunca con un monto bajo el minimo ni con
+# un plazo fuera de IMSS_PLAZOS_DISPONIBLES.
+def _imss_set_propuesta_activa(data: dict, monto: float, cuota: float,
+                               plazo: int, origen: str) -> None:
+    data["propuesta_activa_monto"] = monto
+    data["propuesta_activa_cuota"] = cuota
+    data["propuesta_activa_plazo"] = plazo
+    data["propuesta_activa_origen"] = origen
+
+
+def _imss_get_propuesta_activa(data: dict):
+    """(monto, cuota, plazo) de la propuesta activa. Cae a propuesta_* solo si
+    nunca se registro una activa (compatibilidad con datos previos)."""
+    monto = data.get("propuesta_activa_monto") or data.get("propuesta_monto")
+    cuota = data.get("propuesta_activa_cuota") or data.get("propuesta_cuota")
+    plazo = (data.get("propuesta_activa_plazo")
+             or data.get("propuesta_plazo") or IMSS_PLAZO_MESES)
+    return monto, cuota, plazo
 
 # ── Deteccion de intent de propuesta de prestamo IMSS (fuera de estado activo) ─
 _IMSS_PROPOSAL_KW = {
@@ -1441,21 +1553,78 @@ def _is_imss_followup_question(n: str) -> bool:
         return True
     return False
 
+
+# Respuestas escuetas que SOLO cuentan como consulta de seguimiento dentro del
+# estado imss_q_revision (nunca de forma global: no afectan nombre, ciudad,
+# pension, horario ni ningun otro estado). Toda la heuristica exige digitos,
+# para no tragarse mensajes de texto ajenos ("tal vez", "no gracias", etc).
+_IMSS_BARE_MONTO_RE = re.compile(r"^\d{1,7}(?:\.\d{1,2})?$")
 _IMSS_PLAZO_RE = re.compile(r"(\d{1,3})\s*(?:meses|mes)\b", re.IGNORECASE)
 
+# Notacion coloquial mexicana: "80 mil", "80mil", "80 mil pesos", "80.5 mil".
+# \b tras "mil" evita capturar "millones"/"milagro". El multiplicador se acota
+# a 4 digitos: "80 mil" es $80,000, pero un numero de 5+ digitos pegado a
+# "mil" no es una cantidad plausible del producto.
+_IMSS_MIL_RE = re.compile(r"(\d{1,4}(?:\.\d{1,3})?)\s*mil\b", re.IGNORECASE)
+
+
+def _imss_extract_monto(text: str):
+    """extract_num() + notacion coloquial 'N mil'. DELIBERADAMENTE separada de
+    extract_num(): esa es global (Auto, Vida, VRIM, Empresarial, CTC) y no se
+    toca. Esta solo se usa dentro del funnel IMSS, donde "80 mil" significa
+    $80,000 y nunca se extraen telefonos ni horarios."""
+    if not text:
+        return None
+    m = _IMSS_MIL_RE.search(re.sub(r"[$,]", "", text))
+    if m:
+        try:
+            return float(m.group(1)) * 1000
+        except Exception:
+            pass
+    return extract_num(text)
+
+
+def _is_imss_revision_followup(msg: str) -> bool:
+    """Consulta de seguimiento dentro de imss_q_revision. '1' y '2' NUNCA se
+    capturan: conservan su significado de aceptar/rechazar la revision de
+    Christian."""
+    n = norm(msg).strip()
+    if n in ("1", "2"):
+        return False
+    if _IMSS_PLAZO_RE.search(msg):          # 'N mes' / 'N meses' (con o sin monto)
+        return True
+    if _IMSS_MIL_RE.search(msg):            # '80 mil', '80mil', '80 mil pesos'
+        return True
+    compacto = re.sub(r"[\s,$]", "", n)     # '$80,000' -> '80000'
+    if compacto not in ("1", "2") and _IMSS_BARE_MONTO_RE.match(compacto):
+        return True
+    return _is_imss_followup_question(n)
+
+
 def _imss_extract_monto_plazo(text: str):
+    """(monto, plazo, plazo_fuera_de_catalogo).
+
+    Un numero seguido de 'mes'/'meses' es SIEMPRE plazo y nunca puede caer en
+    la extraccion de monto -- incluso si el plazo esta fuera del catalogo
+    ('40 meses' no vale $40). Un numero sin esa palabra es monto ('24' es
+    $24, no 24 meses)."""
     plazo = None
+    plazo_invalido = None
     m_plazo = _IMSS_PLAZO_RE.search(text)
     if m_plazo:
         try:
             p = int(m_plazo.group(1))
         except Exception:
             p = None
-        if p in (24, 36, 48, 60):
+        if p in IMSS_PLAZOS_DISPONIBLES:
             plazo = p
-    texto_sin_plazo = _IMSS_PLAZO_RE.sub(" ", text) if plazo is not None else text
-    monto = extract_num(texto_sin_plazo)
-    return monto, plazo
+        elif p is not None:
+            plazo_invalido = p
+    # Se limpia la expresion de plazo del texto SIEMPRE que exista, valida o
+    # no, para que ese numero nunca llegue a la validacion de monto minimo.
+    texto_sin_plazo = _IMSS_PLAZO_RE.sub(" ", text) if m_plazo else text
+    monto = _imss_extract_monto(texto_sin_plazo)
+    return monto, plazo, plazo_invalido
 
 _IMSS_CORTESIA_KW = {"gracias", "ok", "okay", "perfecto", "sale", "vale", "genial",
                      "excelente", "listo", "entendido", "va"}
@@ -1478,6 +1647,93 @@ def _is_pure_courtesy_message(n_msg: str) -> bool:
         return False
     remaining = toks - _IMSS_CORTESIA_KW - _IMSS_CORTESIA_FILLER
     return len(remaining) == 0
+
+# ── Horario de contacto (funnel IMSS) ─────────────────────────────────────────
+# Horario comercial real: lunes a sabado, 9:00 a 18:00, hora de Sinaloa.
+# Zona horaria PROPIA de este bloque: _TZ / now_mx() siguen en
+# America/Mexico_City para los timestamps generales del sistema (logs, Sheets)
+# y NO se tocan aqui. Lo unico que se evalua en America/Mazatlan es que
+# opciones de horario se le muestran al cliente en el cierre IMSS.
+try:
+    _IMSS_TZ_COMERCIAL = pytz.timezone("America/Mazatlan")
+except Exception:
+    # Sinaloa opera en UTC-7 todo el año (sin horario de verano desde 2022).
+    _IMSS_TZ_COMERCIAL = timezone(timedelta(hours=-7))
+
+_IMSS_CIERRE_COMERCIAL_HORA = 18          # a partir de las 6:00 p.m. ya no hay "hoy"
+_IMSS_SABADO = 5                          # datetime.weekday(): 0=lunes ... 6=domingo
+_IMSS_DOMINGO = 6
+_IMSS_OTRO_HORARIO_LABEL = "Otro día y horario específico"
+
+
+def _imss_ahora_comercial() -> datetime:
+    return datetime.now(_IMSS_TZ_COMERCIAL)
+
+
+def _imss_build_horario_opciones(ahora: datetime | None = None) -> dict:
+    """Las TRES etiquetas que se le muestran al cliente, calculadas contra el
+    horario comercial real (lunes a sabado 9:00-18:00, America/Mazatlan).
+
+    A) lunes a sabado antes de las 18:00 -> hoy por la tarde + siguiente dia habil.
+    B) lunes a viernes desde las 18:00   -> mañana (mañana/tarde) + otro horario.
+    C) sabado desde las 18:00 y domingo  -> lunes (mañana/tarde) + otro horario.
+
+    El domingo nunca es opcion, y el lunes nunca se llama "Mañana" cuando el
+    mensaje llega en fin de semana."""
+    ahora = ahora or _imss_ahora_comercial()
+    dia = ahora.weekday()
+    antes_del_cierre = ahora.hour < _IMSS_CIERRE_COMERCIAL_HORA
+
+    # C) Fin de semana cerrado: sabado ya sin tarde util, o domingo completo.
+    if dia == _IMSS_DOMINGO or (dia == _IMSS_SABADO and not antes_del_cierre):
+        return {"1": "Lunes por la mañana",
+                "2": "Lunes por la tarde",
+                "3": _IMSS_OTRO_HORARIO_LABEL}
+
+    # B) Entre semana ya cerrado: mañana (martes..sabado) si es habil.
+    if not antes_del_cierre:
+        return {"1": "Mañana por la mañana",
+                "2": "Mañana por la tarde",
+                "3": _IMSS_OTRO_HORARIO_LABEL}
+
+    # A) Dentro del horario comercial. El sabado, "mañana" seria domingo:
+    # el siguiente dia habil real es lunes y se nombra explicitamente.
+    siguiente = "Lunes" if dia == _IMSS_SABADO else "Mañana"
+    return {"1": "Hoy por la tarde",
+            "2": f"{siguiente} por la mañana",
+            "3": f"{siguiente} por la tarde"}
+
+
+def _imss_horarios_ofrecidos(data: dict) -> dict:
+    """Las etiquetas REALMENTE mostradas en el cierre de esta conversacion.
+    Nunca se recalculan al interpretar la respuesta: si el cliente contesta
+    horas despues, se resuelve contra lo que vio. El fallback solo cubre datos
+    previos al parche o llamadas directas al constructor del cierre."""
+    ofrecidos = data.get("imss_horarios_ofrecidos")
+    if isinstance(ofrecidos, dict) and {"1", "2", "3"} <= set(ofrecidos):
+        return ofrecidos
+    return _imss_build_horario_opciones()
+
+
+def _imss_normalize_horario(msg: str, opciones: dict):
+    """Resuelve la respuesta contra las etiquetas persistidas de ESE turno,
+    nunca contra un mapeo global fijo.
+
+    Devuelve la etiqueta elegida, `None` si el cliente escogio "otro dia y
+    horario especifico" (hay que pedirle el texto libre), o el texto tal cual
+    si escribio un horario libre."""
+    n = norm(msg).strip()
+    if n in opciones:
+        etiqueta = opciones[n]
+        return None if etiqueta == _IMSS_OTRO_HORARIO_LABEL else etiqueta
+    for opcion, etiqueta in opciones.items():
+        if etiqueta == _IMSS_OTRO_HORARIO_LABEL:
+            continue
+        n_etiqueta = norm(etiqueta)
+        if n in (n_etiqueta, f"{opcion} {n_etiqueta}") or n_etiqueta in n:
+            return etiqueta
+    return msg.strip()[:200]
+
 
 def _imss_close(phone: str, tipo: str = "generico", data: dict | None = None) -> None:
     """Cierra un tramo terminal del funnel IMSS pero deja un estado corto
@@ -1506,28 +1762,56 @@ def _imss_close(phone: str, tipo: str = "generico", data: dict | None = None) ->
 # Nunca menciona para que usara el prospecto el dinero: ese dato no se
 # pregunta, no se infiere y no se persiste en ningun campo del funnel IMSS.
 def _imss_build_closing_statement(data: dict) -> str:
-    nombre = str(data.get("nombre") or "").strip()
-    saludo = f"Listo, {nombre.split()[0]}." if nombre else "Listo."
-    pension = data.get("pension")
-    monto = data.get("propuesta_monto")
-    cuota = data.get("propuesta_cuota")
-    plazo = data.get("propuesta_plazo", IMSS_PLAZO_MESES)
+    """Cierre comercial + pregunta de horario en UNA sola burbuja. Fuente
+    unica del cierre determinista: no existe otra construccion del mismo
+    mensaje ni una version anterior viva en otra ruta.
 
-    partes = [saludo]
+    Usa SIEMPRE la propuesta activa (la ultima propuesta valida que el cliente
+    vio), nunca la propuesta inicial por defecto."""
+    nombre = str(data.get("nombre") or "").strip()
+    primer_nombre = nombre.split()[0] if nombre else ""
+    pension = data.get("pension")
+    monto, cuota, plazo = _imss_get_propuesta_activa(data)
+
+    encabezado = (f"✅ *Listo, {primer_nombre}. Ya tenemos una propuesta estimada para ti.*"
+                  if primer_nombre else
+                  "✅ *Listo. Ya tenemos una propuesta estimada para ti.*")
+    partes = [encabezado]
+
     if pension and monto and cuota:
-        frase = (
-            f"Con tu pensión de ${pension:,.0f} al mes, la propuesta estimada queda en "
-            f"${monto:,.0f} con un pago aproximado de ${cuota:,.0f} mensuales a {plazo} meses"
+        partes.append(
+            f"Con una pensión aproximada de *${pension:,.0f} al mes*, podrías obtener "
+            f"alrededor de *${monto:,.0f}*, con un pago estimado de *${cuota:,.0f} "
+            f"mensuales durante {plazo} meses*."
         )
-        if data.get("vrim_preeligible"):
-            frase += (
-                ", con beneficio vinculado de la membresía VRIM Plus por 12 meses, "
-                "sujeta a formalización."
-            )
-        else:
-            frase += "."
-        partes.append(frase)
-    partes.append("Christian López revisará personalmente tu caso.")
+
+    # Referencia BREVE a VRIM: no repite coberturas ni vuelve a pedir la
+    # aceptacion de la promocion. Se omite por completo (sin dejar huecos ni
+    # saltos de linea sobrantes) cuando no hay preelegibilidad.
+    if data.get("vrim_preeligible"):
+        partes.append(
+            "Además, por el monto de tu propuesta, podrías recibir *sin costo una "
+            "membresía VRIM Plus por 12 meses*, sujeta a formalización y a las "
+            "condiciones de la promoción."
+        )
+
+    partes.append(
+        "*Christian López revisará personalmente tu caso*, validará las opciones "
+        "disponibles y te explicará cuál puede ajustarse mejor a lo que necesitas."
+    )
+    # Las tres opciones salen del horario comercial vigente y ya quedaron
+    # persistidas en user_data: lo que se pinta aqui es lo mismo que despues
+    # interpreta la respuesta 1/2/3.
+    opciones = _imss_horarios_ofrecidos(data)
+    bloque_horario = ("📞 *¿Cuándo prefieres que te llame Christian?*\n\n"
+                      f"1️⃣ {opciones['1']}\n"
+                      f"2️⃣ {opciones['2']}\n"
+                      f"3️⃣ {opciones['3']}")
+    # Cuando la opcion 3 ya es "otro dia y horario", no se repite la invitacion.
+    if opciones["3"] != _IMSS_OTRO_HORARIO_LABEL:
+        bloque_horario += ("\n\nTambién puedes indicar *otro día y horario específico*, "
+                           "por ejemplo:\n“El jueves a las 10:00 a. m.”")
+    partes.append(bloque_horario)
     return "\n\n".join(partes)
 
 
@@ -1549,14 +1833,23 @@ def _imss_build_advisor_notification(phone: str, data: dict) -> str:
         lines.append(f"Campaign ID: {data['referral_campaign_id']}")
     if data.get("pension"):
         lines.append(f"Pensión mensual: ${data['pension']:,.0f}")
-    if data.get("propuesta_monto"):
-        lines.append(f"Monto estimado: ${data['propuesta_monto']:,.0f}")
+    # Propuesta ACTIVA: exactamente la misma que vio el cliente en el cierre.
+    monto_activo, cuota_activa, plazo_activo = _imss_get_propuesta_activa(data)
+    if monto_activo:
+        lines.append(f"Monto estimado: ${monto_activo:,.0f}")
     if data.get("monto_solicitado"):
         lines.append(f"Monto solicitado por cliente: ${data['monto_solicitado']:,.0f}")
-    if data.get("propuesta_cuota"):
-        lines.append(f"Cuota estimada: ${data['propuesta_cuota']:,.0f}")
-    if data.get("propuesta_plazo"):
-        lines.append(f"Plazo: {data['propuesta_plazo']} meses")
+    if cuota_activa:
+        lines.append(f"Cuota estimada: ${cuota_activa:,.0f}")
+    if plazo_activo:
+        lines.append(f"Plazo: {plazo_activo} meses")
+    if data.get("propuesta_activa_origen"):
+        lines.append(f"Origen de la propuesta activa: {data['propuesta_activa_origen']}")
+    # Trazabilidad: la propuesta inicial se conserva y solo se reporta cuando
+    # difiere de la activa, para que el asesor vea de donde partio el caso.
+    if data.get("propuesta_monto") and monto_activo and data["propuesta_monto"] != monto_activo:
+        lines.append(f"Propuesta inicial (referencia): ${data['propuesta_monto']:,.0f} "
+                     f"a {data.get('propuesta_plazo', IMSS_PLAZO_MESES)} meses")
 
     basis = data.get("vrim_eligibility_basis")
     if basis:
@@ -1564,8 +1857,8 @@ def _imss_build_advisor_notification(phone: str, data: dict) -> str:
     lines.append(f"VRIM preelegible: {'Sí' if data.get('vrim_preeligible') else 'No'}")
     lines.append(f"Promoción VRIM presentada: {'Sí' if data.get('vrim_offered') else 'No'}")
     lines.append(f"Interés del cliente en VRIM: {data.get('vrim_interest', 'sin_respuesta')}")
-    lines.append("⚠️ Verificar edad: VRIM Plus limita coberturas de accidente y "
-                 "servicio funerario a 70 años.")
+    lines.append("⚠️ Verificar edad: las coberturas de reembolso de gastos médicos "
+                 "por accidente y servicio funerario aplican hasta los 70 años.")
     lines.append(f"Estado del funnel: {user_state.get(phone, 'ND')}")
     lines.append("")
     lines.append("Resumen: Cliente solicitó cálculo de préstamo IMSS. Vicky generó una "
@@ -1606,15 +1899,18 @@ def _imss_log_lead_backup(phone: str, data: dict, resultado: str = "advisor_noti
     tabulares automatizados sobre este respaldo especifico.
     """
     nombre_corto = _imss_backup_field(data.get("nombre", "ND"), 60)
+    # Mismas columnas y mismo orden de siempre, pero con la propuesta ACTIVA:
+    # el lead recuperado a mano debe coincidir con lo que el cliente vio.
+    monto_activo, cuota_activa, plazo_activo = _imss_get_propuesta_activa(data)
     resumen = (
         "RESPALDO_LEAD_IMSS"
         f" | advisor_notify_ok={data.get('advisor_notify_ok', 'ND')}"
         f" | whatsapp={phone}"
         f" | nombre={nombre_corto}"
         f" | pension={_imss_backup_num(data.get('pension'))}"
-        f" | propuesta_monto={_imss_backup_num(data.get('propuesta_monto'))}"
-        f" | propuesta_cuota={_imss_backup_num(data.get('propuesta_cuota'))}"
-        f" | propuesta_plazo={_imss_backup_num(data.get('propuesta_plazo'))}"
+        f" | propuesta_monto={_imss_backup_num(monto_activo)}"
+        f" | propuesta_cuota={_imss_backup_num(cuota_activa)}"
+        f" | propuesta_plazo={_imss_backup_num(plazo_activo)}"
         f" | vrim_preeligible={data.get('vrim_preeligible', False)}"
         f" | vrim_offered={data.get('vrim_offered', False)}"
         f" | ciudad={_imss_backup_field(data.get('ciudad', 'ND'), 40)}"
@@ -1647,16 +1943,17 @@ def funnel_imss(phone: str, msg: str) -> None:
 
     if state == "imss_open":
         send_msg(phone,
-            "💰 *Préstamo IMSS — COHIFIS*\n\n"
-            "Hola, soy Vicky.\n\n"
-            "Te ayudo a calcular una propuesta estimada para préstamo a pensionados IMSS.\n\n"
-            "Antes de calcular, necesito confirmar algo:\n\n"
-            "¿Ya estás pensionado por IMSS Ley 73?\n\n"
-            "Responde:\n"
-            "1. Sí, ya estoy pensionado por Ley 73\n"
-            "2. Estoy pensionado, pero no sé si soy Ley 73\n"
-            "3. Estoy por pensionarme\n"
-            "4. Estoy ayudando a un familiar")
+            "👋 *¡Hola! Soy Vicky, asistente de Christian López.*\n\n"
+            "Estoy aquí para ayudarte a conocer, de manera rápida y sencilla, cuánto "
+            "podrías obtener con un *préstamo para pensionados IMSS*. 💰\n\n"
+            "Prepararé una propuesta estimada de acuerdo con tu pensión y también "
+            "podemos revisar más opciones por si tienes en mente algún monto o plazo "
+            "específico.\n\n"
+            "Para comenzar, selecciona cuál opción corresponde a tu caso:\n\n"
+            "1️⃣ Ya estoy pensionado por IMSS Ley 73\n"
+            "2️⃣ Estoy pensionado, pero no sé si soy Ley 73\n"
+            "3️⃣ Estoy por pensionarme\n"
+            "4️⃣ Estoy ayudando a un familiar")
         user_state[phone] = "imss_q_ley73"
         return
 
@@ -1699,7 +1996,10 @@ def funnel_imss(phone: str, msg: str) -> None:
         return
 
     if state == "imss_q_pension_calc":
-        m = extract_num(msg)
+        # Mismo reconocimiento de "mil" que en la revision: "7 mil" es una
+        # pension de $7,000, no de $7. Usa el helper acotado al funnel IMSS;
+        # extract_num() global sigue intacto para los demas productos.
+        m = _imss_extract_monto(msg)
         if m is None or m <= 0 or m > 200000:
             send_msg(phone, "Para calcularlo bien, dime cuánto recibes al mes de pensión IMSS. Ejemplo: 12000")
             return
@@ -1718,6 +2018,9 @@ def funnel_imss(phone: str, msg: str) -> None:
         data["propuesta_cuota"] = propuesta["cuota"]
         data["propuesta_plazo"] = propuesta["plazo"]
         data["propuesta_total"] = propuesta["total"]
+        # La propuesta inicial valida es, desde este momento, la propuesta activa.
+        _imss_set_propuesta_activa(data, propuesta["monto"], propuesta["cuota"],
+                                   propuesta["plazo"], "propuesta_inicial")
         # Preelegibilidad VRIM: una vez establecida en True, nunca se degrada
         # a False (ver _imss_extract_monto_plazo / reglas de jerarquía en
         # imss_q_revision). Umbral inclusivo >= IMSS_MONTO_MINIMO, que por
@@ -1728,14 +2031,21 @@ def funnel_imss(phone: str, msg: str) -> None:
             data["vrim_eligibility_basis"] = "propuesta_monto"
         user_data[phone] = data
 
+        # Solo condiciones SIN IVA en este mensaje (nunca IMSS_CAT, que es el
+        # criterio con IVA de uso interno). Ambas cifras salen de las
+        # constantes -- no se hardcodean en la plantilla.
         send_msg(phone,
-            f"Con una pensión mensual aproximada de *${m:,.0f}*, podemos revisar una propuesta "
-            "estimada de préstamo IMSS.\n\n"
-            "📊 *Resultado estimado*\n"
-            f"• Monto aproximado: *${propuesta['monto']:,.0f}*\n"
-            f"• Pago aproximado: *${propuesta['cuota']:,.0f}*/mes\n"
-            f"• Plazo: *{propuesta['plazo']} meses*\n\n"
-            "_Esta propuesta es informativa y está sujeta a validación final._")
+            "🎉 *¡Tenemos una propuesta para ti!*\n\n"
+            f"Con una pensión mensual aproximada de *${m:,.0f}*, podrías obtener una "
+            "propuesta estimada como esta:\n\n"
+            f"💰 *Monto aproximado:* *${propuesta['monto']:,.0f}*\n"
+            f"💳 *Pago aproximado:* *${propuesta['cuota']:,.0f} al mes*\n"
+            f"📆 *Plazo:* *{propuesta['plazo']} meses*\n"
+            f"📈 *Tasa fija anual:* *{IMSS_TASA_ANUAL_SIN_IVA:.2f}% sin IVA*\n"
+            f"📊 *CAT informativo:* *{IMSS_CAT_SIN_IVA:.1f}% sin IVA*\n\n"
+            "_Esta propuesta es informativa y está sujeta a validación final._\n\n"
+            "También podemos revisar *otras opciones de monto o plazo* para encontrar "
+            "una alternativa que se adapte mejor a lo que necesitas.")
 
         # Burbuja VRIM separada, inmediatamente despues del resultado. El CTA
         # 1/2 vive aqui (no en el mensaje de propuesta) porque siempre que se
@@ -1800,11 +2110,21 @@ def funnel_imss(phone: str, msg: str) -> None:
         return
 
     if state == "imss_q_revision":
-        n_msg = norm(msg)
         pension = data.get("pension", 0)
 
-        if _is_imss_followup_question(n_msg):
-            monto_req, plazo_req = _imss_extract_monto_plazo(msg)
+        if _is_imss_revision_followup(msg):
+            monto_req, plazo_req, plazo_invalido = _imss_extract_monto_plazo(msg)
+            if plazo_invalido is not None and plazo_req is None:
+                # Plazo fuera del catalogo del cotizador ("40 meses", "72
+                # meses"): se listan los plazos vigentes. Ese numero NUNCA
+                # llega a la validacion de monto minimo y la propuesta activa
+                # no se toca. El estado sigue siendo imss_q_revision, asi que
+                # 1/2 conservan su significado.
+                send_msg(phone,
+                    f"Por ahora manejamos estos plazos para el Préstamo IMSS Ley 73:\n\n"
+                    f"*{_imss_plazos_texto()}*\n\n"
+                    "Escríbeme el que quieras revisar, por ejemplo: *36 meses*.")
+                return
             if monto_req:
                 # H-05: persistir siempre el monto que pide el prospecto,
                 # sea o no viable -- es el dato comercial mas valioso de la
@@ -1822,11 +2142,47 @@ def funnel_imss(phone: str, msg: str) -> None:
                         "¿Te gustaría que revisemos tu caso a partir de esa cifra?")
                     return
 
-                if propuesta_monto and monto_req > propuesta_monto:
-                    # No viable: excede lo que su pension soporta. Se usa
-                    # propuesta_monto como referencia, sin recalcular VRIM
-                    # a la baja.
+                # El tope se evalua SIEMPRE contra el plazo que se va a
+                # cotizar, no contra el maximo a 60 meses: un monto que cabe a
+                # 60 meses puede no caber a 24 y produciria una cuota por
+                # encima del limite de descuento del 30%.
+                plazo_calc = plazo_req or _imss_get_propuesta_activa(data)[2]
+                monto_max_plazo = calcular_propuesta_imss(pension, plazo_calc)["monto"]
+
+                if monto_req > monto_max_plazo:
+                    # No cabe en ese plazo. Se conserva el monto que pidio el
+                    # cliente y se busca el plazo mas corto donde SI cabe,
+                    # igual que en la ruta de plazo no viable.
+                    alternativa = _imss_primer_plazo_para_monto(pension, monto_req)
+                    if alternativa is not None:
+                        plazo_alt, _propuesta_alt = alternativa
+                        cuota_alt = _imss_calcular_cuota(monto_req, plazo_alt)
+                        data["vrim_eligibility_basis"] = "monto_solicitado"
+                        _imss_set_propuesta_activa(
+                            data, monto_req, cuota_alt, plazo_alt,
+                            "monto_solicitado_plazo_ajustado")
+                        user_data[phone] = data
+                        send_msg(phone,
+                            f"Con tu pensión de *${pension:,.0f}*, un préstamo de "
+                            f"*${monto_req:,.0f}* a *{plazo_calc} meses* dejaría un pago "
+                            "mensual por encima del descuento máximo permitido "
+                            f"(*${pension * IMSS_LIMITE_DESCUENTO:,.0f}* al mes).\n\n"
+                            f"Ese mismo monto sí es viable a *{plazo_alt} meses*:\n\n"
+                            f"💰 *Monto aproximado:* *${monto_req:,.0f}*\n"
+                            f"💳 *Pago aproximado:* *${cuota_alt:,.0f} al mes*\n"
+                            f"📆 *Plazo:* *{plazo_alt} meses*\n\n"
+                            "_Esta propuesta es informativa y está sujeta a validación final._\n\n"
+                            + _IMSS_REVISION_CTA)
+                        return
+
+                    # No cabe en ningun plazo del catalogo: se muestra el
+                    # maximo global (60 meses) como referencia, sin recalcular
+                    # VRIM a la baja. Esa cifra SI es una propuesta valida,
+                    # asi que pasa a ser la activa.
                     data["vrim_eligibility_basis"] = "propuesta_monto"
+                    _imss_set_propuesta_activa(
+                        data, propuesta_monto, data.get("propuesta_cuota", 0),
+                        data.get("propuesta_plazo", IMSS_PLAZO_MESES), "propuesta_maxima")
                     user_data[phone] = data
                     send_msg(phone,
                         f"Con tu pensión de *${pension:,.0f}*, el monto máximo estimado que "
@@ -1834,44 +2190,77 @@ def funnel_imss(phone: str, msg: str) -> None:
                         f"aproximado de *${data.get('propuesta_cuota', 0):,.0f}* al mes a "
                         f"{data.get('propuesta_plazo', IMSS_PLAZO_MESES)} meses.\n\n"
                         "_Esta información es estimada y está sujeta a validación final._\n\n"
-                        "¿Quieres que Christian revise si podemos avanzar con esta opción?\n"
-                        "1. Sí, quiero que me contacte\n"
-                        "2. No por ahora")
+                        + _IMSS_REVISION_CTA)
                     return
 
-                # Viable: IMSS_MONTO_MINIMO <= monto_req <= propuesta_monto.
+                # Viable: IMSS_MONTO_MINIMO <= monto_req <= monto_max_plazo.
                 data["vrim_eligibility_basis"] = "monto_solicitado"
-                user_data[phone] = data
-                plazo_calc = plazo_req or data.get("propuesta_plazo", IMSS_PLAZO_MESES)
                 cuota = _imss_calcular_cuota(monto_req, plazo_calc)
+                _imss_set_propuesta_activa(
+                    data, monto_req, cuota, plazo_calc,
+                    "monto_y_plazo_solicitados" if plazo_req else "monto_solicitado")
+                user_data[phone] = data
                 send_msg(phone,
                     f"Con una pensión mensual de *${pension:,.0f}*, el descuento máximo estimado "
                     f"sería de *${pension * IMSS_LIMITE_DESCUENTO:,.0f}* al mes.\n\n"
                     f"Para un préstamo de *${monto_req:,.0f}* a *{plazo_calc} meses*, el pago "
                     f"aproximado sería de *${cuota:,.0f}* al mes.\n\n"
                     "_Esta información es estimada y está sujeta a validación final._\n\n"
-                    "¿Quieres que Christian revise si podemos avanzar con esta opción?\n"
-                    "1. Sí, quiero que me contacte\n"
-                    "2. No por ahora")
+                    + _IMSS_REVISION_CTA)
             elif plazo_req:
                 propuesta = calcular_propuesta_imss(pension, plazo_req)
+                if propuesta["monto"] < IMSS_MONTO_MINIMO:
+                    # El plazo pedido no alcanza el minimo del producto: nunca
+                    # se muestra la cifra invalida ni se ofrece un prestamo
+                    # menor a $40,000. Se calcula y se muestra DIRECTAMENTE la
+                    # alternativa viable mas corta, sin abrir estado
+                    # intermedio y sin una pregunta previa que "1"/"2" pudieran
+                    # confundir con el CTA.
+                    viable = _imss_primer_plazo_viable(pension)
+                    if viable is None:
+                        # Ningun plazo disponible llega al minimo: salida
+                        # segura de pension baja. No se inventa propuesta ni se
+                        # sobrescribe la propuesta activa vigente.
+                        send_msg(phone,
+                            "Gracias 🙏 Con esa pensión, el monto estimado queda por debajo de "
+                            "nuestro mínimo de *$40,000* en todos los plazos disponibles.\n\n"
+                            "¿Deseas que un asesor te contacte para explorar otras opciones?")
+                        user_state[phone] = "imss_pension_baja"
+                        return
+                    plazo_viable, propuesta_viable = viable
+                    _imss_set_propuesta_activa(
+                        data, propuesta_viable["monto"], propuesta_viable["cuota"],
+                        plazo_viable, "plazo_viable_automatico")
+                    user_data[phone] = data
+                    send_msg(phone,
+                        f"Con tu pensión, a *{plazo_req} meses* el monto estimado quedaría por "
+                        "debajo del mínimo de *$40,000*.\n\n"
+                        "La opción disponible con el plazo más corto sería:\n\n"
+                        f"💰 *Monto aproximado:* *${propuesta_viable['monto']:,.0f}*\n"
+                        f"💳 *Pago aproximado:* *${propuesta_viable['cuota']:,.0f} al mes*\n"
+                        f"📆 *Plazo:* *{plazo_viable} meses*\n\n"
+                        "_Esta propuesta es informativa y está sujeta a validación final._\n\n"
+                        + _IMSS_REVISION_CTA)
+                    return
+                _imss_set_propuesta_activa(
+                    data, propuesta["monto"], propuesta["cuota"], plazo_req,
+                    "plazo_solicitado")
+                user_data[phone] = data
                 send_msg(phone,
                     f"A *{plazo_req} meses*, con tu pensión de *${pension:,.0f}*, el monto "
                     f"aproximado sería de *${propuesta['monto']:,.0f}* con un pago aproximado "
                     f"de *${propuesta['cuota']:,.0f}* al mes.\n\n"
                     "_Esta información es estimada y está sujeta a validación final._\n\n"
-                    "¿Quieres que Christian revise si podemos avanzar con esta opción?\n"
-                    "1. Sí, quiero que me contacte\n"
-                    "2. No por ahora")
+                    + _IMSS_REVISION_CTA)
             else:
+                # Resumen sin cifras nuevas: repite la propuesta ACTIVA, no la
+                # inicial -- no puede contradecir el ultimo mensaje visible.
+                monto_act, cuota_act, plazo_act = _imss_get_propuesta_activa(data)
                 send_msg(phone,
                     f"Con tu pensión de *${pension:,.0f}*, el monto aproximado sigue siendo "
-                    f"*${data.get('propuesta_monto', 0):,.0f}* con un pago aproximado de "
-                    f"*${data.get('propuesta_cuota', 0):,.0f}* al mes a "
-                    f"{data.get('propuesta_plazo', IMSS_PLAZO_MESES)} meses.\n\n"
-                    "¿Quieres que Christian revise si podemos avanzar con esta opción?\n"
-                    "1. Sí, quiero que me contacte\n"
-                    "2. No por ahora")
+                    f"*${monto_act or 0:,.0f}* con un pago aproximado de "
+                    f"*${cuota_act or 0:,.0f}* al mes a {plazo_act} meses.\n\n"
+                    + _IMSS_REVISION_CTA)
             return
 
         r = _imss_revision_choice(msg)
@@ -1912,13 +2301,19 @@ def funnel_imss(phone: str, msg: str) -> None:
 
     if state == "imss_q_ciudad_calc":
         data["ciudad"] = msg.strip().title()
+        # Se calculan UNA sola vez, al construir el cierre, y se persisten:
+        # la respuesta 1/2/3 se resolvera contra estas mismas etiquetas aunque
+        # el cliente conteste horas despues. Un cierre nuevo las reemplaza.
+        data["imss_horarios_ofrecidos"] = _imss_build_horario_opciones()
         user_data[phone] = data
 
+        # Cierre + pregunta de horario en UNA sola burbuja (ya no se manda una
+        # segunda pregunta suelta de horario).
         send_msg(phone, _imss_build_closing_statement(data))
 
-        # Notificar al asesor ANTES de preguntar horario -- el lead ya debe
-        # quedar calificado y registrado aunque el prospecto abandone la
-        # conversacion sin responder la siguiente pregunta (H-06).
+        # Notificar al asesor ANTES de quedar a la espera del horario -- el
+        # lead ya debe quedar calificado y registrado aunque el prospecto
+        # abandone la conversacion sin responder (H-06).
         advisor_notify_ok = notify_advisor(_imss_build_advisor_notification(phone, data))
         data["advisor_notify_ok"] = advisor_notify_ok
         user_data[phone] = data
@@ -1926,7 +2321,6 @@ def funnel_imss(phone: str, msg: str) -> None:
             _imss_log_lead_backup(phone, data)
         _notify_boardroom_lead_qualified(phone, "prestamo_imss_ley73", _ensure_user(phone))
 
-        send_msg(phone, "¿En qué horario te puede llamar Christian hoy?")
         user_state[phone] = "imss_q_horario_calc"
         return
 
@@ -1940,10 +2334,22 @@ def funnel_imss(phone: str, msg: str) -> None:
             send_msg(phone, "¡Con gusto! Christian López te contactará pronto. 😊")
             _imss_close(phone, tipo="revision_aceptada", data=data)
             return
-        horario = msg.strip()[:200]
+        # 1/2/3 se resuelven contra las etiquetas que el cliente realmente vio;
+        # cualquier otro texto valido se conserva como horario libre con el
+        # limite existente.
+        horario = _imss_normalize_horario(msg, _imss_horarios_ofrecidos(data))
+        if horario is None:
+            # Eligio "Otro día y horario específico": no se guarda "3" como
+            # horario ni se notifica nada al asesor. Se sigue esperando el
+            # texto libre en el mismo estado.
+            send_msg(phone,
+                "Claro 😊 Escríbeme el *día y el horario* que prefieras, por ejemplo:\n"
+                "“El jueves a las 10:00 a. m.”")
+            return
         data["horario_contacto"] = horario
         user_data[phone] = data
-        send_msg(phone, "¡Perfecto! Ya quedó registrado. Christian López te contactará pronto. 😊")
+        send_msg(phone, "¡Perfecto! Ya quedó registrado. *Christian López te contactará "
+                        "en el horario indicado.* 😊")
         notify_advisor(f"⏰ HORARIO DE CONTACTO — {data.get('nombre', 'ND')} — {horario}")
         _imss_close(phone, tipo="revision_aceptada", data=data)
         return

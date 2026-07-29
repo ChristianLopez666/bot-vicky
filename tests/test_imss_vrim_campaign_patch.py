@@ -516,7 +516,7 @@ def test_cta_scenario_a_vrim_sent_ok(monkeypatch):
 
     vrim_msgs = [s for s in sent if "VRIM Plus" in s[1]]
     assert len(vrim_msgs) == 1
-    assert vrim_msgs[0][1].strip().endswith("2. No por ahora")
+    assert vrim_msgs[0][1].strip().endswith("No por ahora")
     fallback_msgs = [s for s in sent if s[1] == vicky_app._IMSS_REVISION_CTA_FALLBACK]
     assert fallback_msgs == []
 

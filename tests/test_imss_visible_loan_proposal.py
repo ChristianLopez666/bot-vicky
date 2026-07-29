@@ -99,8 +99,8 @@ def test_option_1_shows_welcome(monkeypatch):
     sent, _, _ = _base_patches(monkeypatch)
     vicky_app.handle(_text_msg("6682222222", "1", "mid-1"))
     msg = sent[0][1]
-    assert "Préstamo IMSS" in msg
-    assert "soy Vicky" in msg
+    assert "pensionados IMSS" in msg
+    assert "Soy Vicky" in msg
 
 
 def test_option_1_asks_ley73_before_pension(monkeypatch):
@@ -221,9 +221,9 @@ def test_pension_10000_triggers_vrim_offer_as_separate_bubble(monkeypatch):
     vicky_app.handle(_text_msg("6682222222", "10000", "m3"))
     vrim_msg = sent[-1][1]
     assert "VRIM Plus" in vrim_msg
-    assert "sujeta a formalización" in vrim_msg
-    # El CTA queda al final de la ultima burbuja.
-    assert vrim_msg.strip().endswith("2. No por ahora")
+    assert "sujeta a la formalización del préstamo" in vrim_msg
+    # El CTA queda al final de la ultima burbuja (ahora con vinetas 1️⃣/2️⃣).
+    assert vrim_msg.strip().endswith("No por ahora")
     for forbidden in ("aprobado", "garantizado", "$790", "790 pesos"):
         assert forbidden not in vrim_msg.lower()
     data = vicky_app.user_data.get("6682222222", {})
@@ -312,24 +312,24 @@ def test_captures_name_then_asks_city(monkeypatch):
 
 
 def test_captures_city_and_closes_with_review_message(monkeypatch):
-    # Sin horario: el cierre determinista es la penultima burbuja, seguida
-    # por la pregunta de horario (nueva captura opcional).
+    # Sin horario: el cierre determinista es la ULTIMA burbuja -- ahora
+    # incluye la pregunta de horario en el mismo mensaje.
     sent, advisor_msgs, _ = _run_full_imss_flow(monkeypatch, with_horario=False)
-    closing = sent[-2][1]
+    closing = sent[-1][1]
     assert "Christian" in closing
     assert "revisará" in closing
     for forbidden in ("aprobado", "autorizado", "ya calificaste", "garantizado"):
         assert forbidden not in closing.lower()
-    assert "horario" in sent[-1][1].lower()
+    assert "horario" in closing.lower()
 
 
 def test_closing_message_references_real_captured_data(monkeypatch):
     sent, _, _ = _run_full_imss_flow(monkeypatch, with_horario=False)
-    closing = sent[-2][1]
+    closing = sent[-1][1]
     data = vicky_app.user_data.get("6682222222", {})
     assert f"{data['pension']:,.0f}" in closing
     assert f"{data['propuesta_monto']:,.0f}" in closing
-    assert "beneficio vinculado" in closing.lower()
+    assert "membresía vrim plus por 12 meses" in closing.lower()
     assert "garantía" not in closing.lower()
     # No debe existir ningun rastro de motivo/uso del credito en el cierre.
     for forbidden in ("motivo", "uso del credito", "uso del crédito", "destino"):
@@ -508,9 +508,11 @@ def test_no_neutral_fallback_during_imss_flow(monkeypatch):
 # Sin respuestas duplicadas
 def test_no_duplicate_responses_in_imss_flow(monkeypatch):
     sent, advisor_msgs, boardroom_calls = _run_full_imss_flow(monkeypatch)
-    # bienvenida, ley73->pension, propuesta, VRIM, nombre?, ciudad?, cierre,
-    # pregunta horario, confirmacion horario = 9 burbujas para 7 turnos.
-    assert len(sent) == 9
+    # bienvenida, ley73->pension, propuesta, VRIM, nombre?, ciudad?,
+    # cierre+horario (una sola burbuja), confirmacion horario = 8 burbujas
+    # para 7 turnos. Antes eran 9: el cierre y la pregunta de horario se
+    # unificaron en un solo mensaje.
+    assert len(sent) == 8
 
 
 # Contrato tecnico: product_code no cambia
