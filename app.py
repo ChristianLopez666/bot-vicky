@@ -79,6 +79,7 @@ class StateStore:
         self._redis = None
         self._state_mem = {}
         self._data_mem = {}
+        self._aux_mem = {}
         redis_url = (os.getenv("KV_URL", "").strip() or os.getenv("REDIS_URL", "").strip())
         if redis_url and _redis_libs:
             try:
@@ -158,6 +159,50 @@ class StateStore:
             except Exception:
                 return default
         return self._data_mem.pop(str(phone), default)
+
+    # ── Almacen auxiliar con TTL propio ───────────────────────────────────────
+    # Usado por la instrumentacion de alertas al asesor: ventana de 24h y
+    # correlacion por wamid. Cada clave lleva su propio TTL, independiente de
+    # STATE_TTL, y no comparte espacio con el estado de los funnels.
+    #
+    # Es best-effort por diseño: si Redis/Valkey no esta disponible o falla,
+    # degrada a memoria del proceso y NUNCA propaga la excepcion. La entrega de
+    # un mensaje jamas debe depender de que este almacen funcione.
+    def aux_set(self, key: str, value: str, ttl: int) -> bool:
+        try:
+            if self._redis:
+                self._redis.setex(f"vicky:{key}", max(int(ttl), 1), value)
+                return True
+            self._aux_prune()
+            self._aux_mem[key] = (time.time() + ttl, value)
+            return True
+        except Exception:
+            return False
+
+    def aux_get(self, key: str):
+        try:
+            if self._redis:
+                return self._redis.get(f"vicky:{key}")
+            item = self._aux_mem.get(key)
+            if not item:
+                return None
+            expires_at, value = item
+            if expires_at <= time.time():
+                self._aux_mem.pop(key, None)
+                return None
+            return value
+        except Exception:
+            return None
+
+    def _aux_prune(self) -> None:
+        # Solo en modo memoria: acota el diccionario cuando Redis no esta
+        # disponible, para que un proceso de larga vida no acumule claves
+        # vencidas indefinidamente.
+        if len(self._aux_mem) < 500:
+            return
+        now = time.time()
+        for k in [k for k, (exp, _) in self._aux_mem.items() if exp <= now]:
+            self._aux_mem.pop(k, None)
 
 class _StateMap:
     def __init__(self, store: StateStore):
@@ -426,6 +471,160 @@ def _is_internal_request(req) -> bool:
 
 _TPL_PARAM_FALLBACK = "Nuevo lead recibido. Revisar conversación en WhatsApp."
 
+# El cuerpo de la plantilla aprobada lleva texto literal ademas de {{1}}, y el
+# limite de Meta aplica al mensaje ya renderizado. Se deja holgura frente a los
+# 1024 del limite para que literal + parametro nunca lo rebasen.
+_TPL_PARAM_LIMIT = 900
+
+# ── Ventana de 24h del asesor ─────────────────────────────────────────────────
+# WhatsApp solo entrega texto libre dentro de las 24h posteriores al ultimo
+# mensaje que el destinatario le envio al negocio. Fuera de esa ventana Meta
+# ACEPTA el envio con HTTP 200/201 y lo descarta despues, sin error sincrono: por
+# eso `✅ Asesor notificado` podia registrarse sin que la alerta llegara nunca.
+#
+# El asesor es un numero unico y conocido, asi que Vicky puede llevar su propia
+# contabilidad de la ventana en vez de depender de que Meta avise.
+_ADV_WINDOW_KEY = "adv_window"
+_ADV_WINDOW_SECONDS = 24 * 60 * 60
+# El registro sobrevive mucho mas que la ventana a proposito: guardar el timestamp
+# permite distinguir "cerrada" (hay registro y es viejo) de "desconocida" (nunca
+# se ha visto escribir al asesor). Son casos con decisiones distintas.
+_ADV_WINDOW_RECORD_TTL = 30 * 24 * 60 * 60
+# Correlacion ligera para observabilidad: sin PII, vive lo suficiente para cubrir
+# estados tardios de Meta (`read` puede llegar mucho despues de `delivered`).
+_ADV_WAMID_TTL = 48 * 60 * 60
+# El cuerpo de la alerta solo se retiene lo necesario para poder reenviarla si
+# Meta reporta `failed`. TTL corto y deliberadamente separado de la correlacion.
+_ADV_RETRY_TTL = 2 * 60 * 60
+
+
+def _digits(value) -> str:
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def _mask_phone(value) -> str:
+    d = _digits(value)
+    return ("*" * 8 + d[-4:]) if len(d) >= 4 else "****"
+
+
+def _is_advisor_phone(phone) -> bool:
+    adv = _digits(ADVISOR_NUM)
+    return bool(adv) and _digits(phone) == adv
+
+
+def _advisor_window_touch() -> None:
+    """El asesor escribio: la ventana de 24h queda abierta desde ahora."""
+    _state_store.aux_set(_ADV_WINDOW_KEY, str(time.time()), _ADV_WINDOW_RECORD_TTL)
+
+
+def _advisor_window_expire() -> None:
+    """Marca la ventana como cerrada conservando registro.
+
+    Se usa cuando Meta confirma un `failed`: su veredicto manda sobre la
+    contabilidad local. Guardar `0` deja el estado en `closed` y no en
+    `unknown`, que llevaria a reintentar texto libre.
+    """
+    _state_store.aux_set(_ADV_WINDOW_KEY, "0", _ADV_WINDOW_RECORD_TTL)
+
+
+def _advisor_window_state() -> str:
+    """`open` | `closed` | `unknown`.
+
+    `unknown` es un tercer estado real, no un detalle: tras un despliegue nuevo
+    o un Redis vacio no hay registro, y ahi se conserva el comportamiento
+    historico (texto libre primero) en vez de gastar un template a ciegas. El
+    reenvio reactivo por `statuses[].failed` cubre ese hueco.
+    """
+    raw = _state_store.aux_get(_ADV_WINDOW_KEY)
+    if raw is None:
+        return "unknown"
+    try:
+        ts = float(raw)
+    except (TypeError, ValueError):
+        return "unknown"
+    return "open" if (time.time() - ts) < _ADV_WINDOW_SECONDS else "closed"
+
+
+def _advisor_wamid_remember(wamid: str, level: str, msg: str) -> None:
+    _state_store.aux_set(
+        f"adv_wamid:{wamid}",
+        json.dumps({"ts": time.time(), "level": level}, ensure_ascii=False),
+        _ADV_WAMID_TTL,
+    )
+    _state_store.aux_set(f"adv_retry:{wamid}", str(msg or "")[:2000], _ADV_RETRY_TTL)
+
+
+def _advisor_wamid_lookup(wamid: str):
+    raw = _state_store.aux_get(f"adv_wamid:{wamid}")
+    if raw is None:
+        return None
+    try:
+        val = json.loads(raw)
+        return val if isinstance(val, dict) else None
+    except Exception:
+        return None
+
+
+def _advisor_record_send(resp, level: str, msg: str) -> str:
+    """Instrumentacion del envio al asesor. Best-effort y sin excepciones.
+
+    Registra lo que antes se perdia por completo: status HTTP real, si el cuerpo
+    era JSON valido y el `wamid`. Sin el `wamid` no hay forma de correlacionar el
+    intento con el estado asincrono que Meta manda despues, que es exactamente la
+    evidencia que faltaba para diagnosticar este defecto.
+    """
+    status = getattr(resp, "status_code", 0)
+    wamid = ""
+    json_valid = False
+    try:
+        body = resp.json()
+        if isinstance(body, dict):
+            json_valid = True
+            msgs = body.get("messages") or []
+            if msgs and isinstance(msgs[0], dict):
+                wamid = str(msgs[0].get("id") or "")
+    except Exception:
+        json_valid = False
+    log.info(
+        "asesor_envio: nivel=%s http=%s json_valido=%s wamid=%s destino=%s",
+        level, status, json_valid, (wamid[:24] or "ninguno"), _mask_phone(ADVISOR_NUM),
+    )
+    if wamid:
+        try:
+            _advisor_wamid_remember(wamid, level, msg)
+        except Exception:
+            log.warning("asesor_correlacion_no_persistida: wamid=%s", wamid[:24])
+    return wamid
+
+
+def _notify_advisor_via_template(msg: str, motivo: str) -> bool:
+    """Nivel 2 — template aprobada.
+
+    Unico formato que Meta entrega fuera de la ventana de 24h. Sin
+    ADVISOR_TEMPLATE_NAME configurado no existe ninguna ruta de entrega.
+    """
+    if not ADV_TPL:
+        log.warning("advisor_template_missing: ADVISOR_TEMPLATE_NAME no configurado. "
+                    "Define esta variable con el template aprobado en Meta para "
+                    "notificaciones fuera de ventana 24h.")
+        return False
+    tpl_param = _sanitize_template_param(msg, limit=_TPL_PARAM_LIMIT)
+    r2 = _wa_post({"messaging_product": "whatsapp", "to": ADVISOR_NUM,
+                   "type": "template", "template": {
+                       "name": ADV_TPL, "language": {"code": ADV_TPL_LANG},
+                       "components": [{"type": "body",
+                                       "parameters": [{"type": "text", "text": tpl_param}]}]}})
+    ok = r2.status_code in (200, 201)
+    if ok:
+        _advisor_record_send(r2, "template", msg)
+    _log(ADVISOR_NUM, "Asesor", msg, "saliente", "asesor",
+         "ok" if ok else "error", "" if ok else r2.text[:200], _mid())
+    if ok:
+        log.info("asesor_template_ok: Asesor notificado vía template (%s)", motivo)
+    else:
+        log.error("asesor_template_failed: %s", r2.text[:200])
+    return ok
+
 
 def _sanitize_template_param(text: str, limit: int = 1024) -> str:
     """Meta rechaza parámetros de template con saltos de línea, tabs o más de
@@ -446,17 +645,36 @@ def _sanitize_template_param(text: str, limit: int = 1024) -> str:
 
 def notify_advisor(msg: str) -> bool:
     """
-    Nivel 1 — texto libre (funciona dentro de ventana 24h del asesor).
-    Nivel 2 — template aprobada (ADVISOR_TEMPLATE_NAME) si el texto libre falla,
-    con el parámetro sanitizado (_sanitize_template_param), nunca msg crudo.
-    Sin template, la notificación fallará fuera de ventana 24h.
+    Nivel 1 — texto libre (solo se entrega dentro de la ventana 24h del asesor).
+    Nivel 2 — template aprobada (ADVISOR_TEMPLATE_NAME), con el parámetro
+    sanitizado (_sanitize_template_param), nunca msg crudo.
+
+    Cuando consta que la ventana está cerrada se salta el nivel 1: Meta lo
+    aceptaría con HTTP 200 y lo descartaría después sin avisar de forma síncrona,
+    así que intentarlo solo produce un log de éxito falso. Si el estado de la
+    ventana se desconoce se conserva el comportamiento histórico (texto libre
+    primero) y el reenvío reactivo por `statuses[].failed` cubre ese caso.
+
+    El contrato booleano no cambia: un 200/201 sin `wamid` sigue devolviendo
+    True. Devolver False ahí rompería /ext/lead, que responde HTTP 502 al
+    formulario de cohifis.com cuando esta función falla.
     """
     if not ADVISOR_NUM:
         return False
     try:
+        if _advisor_window_state() == "closed" and ADV_TPL:
+            log.info("asesor_ventana_cerrada: envío directo por template "
+                     "(texto libre no se entregaría)")
+            return _notify_advisor_via_template(msg, motivo="ventana_cerrada")
+    except Exception:
+        # La contabilidad de la ventana nunca puede impedir un envío: ante
+        # cualquier fallo se sigue por el camino histórico.
+        log.exception("💥 notify_advisor ventana")
+    try:
         r = _wa_post({"messaging_product": "whatsapp", "to": ADVISOR_NUM,
                       "type": "text", "text": {"body": msg}})
         if r.status_code in (200, 201):
+            _advisor_record_send(r, "texto_libre", msg)
             log.info("✅ Asesor notificado (texto libre)")
             _log(ADVISOR_NUM, "Asesor", msg, "saliente", "asesor", "ok", "", _mid())
             return True
@@ -472,20 +690,7 @@ def notify_advisor(msg: str) -> bool:
             _log(ADVISOR_NUM, "Asesor", msg, "saliente", "asesor", "error", err1, _mid())
             return False
 
-        tpl_param = _sanitize_template_param(msg)
-        r2 = _wa_post({"messaging_product": "whatsapp", "to": ADVISOR_NUM,
-                       "type": "template", "template": {
-                           "name": ADV_TPL, "language": {"code": ADV_TPL_LANG},
-                           "components": [{"type": "body",
-                                           "parameters": [{"type": "text", "text": tpl_param}]}]}})
-        ok = r2.status_code in (200, 201)
-        _log(ADVISOR_NUM, "Asesor", msg, "saliente", "asesor",
-             "ok" if ok else "error", "" if ok else r2.text[:200], _mid())
-        if ok:
-            log.info("asesor_template_ok: Asesor notificado vía template")
-        else:
-            log.error("asesor_template_failed: %s", r2.text[:200])
-        return ok
+        return _notify_advisor_via_template(msg, motivo="texto_libre_falló")
 
     except Exception:
         log.exception("💥 notify_advisor")
@@ -2824,6 +3029,12 @@ def handle(msg_obj: dict) -> None:
             _seen_ids.add(mid)
     _tl.mid = mid
 
+    # Cualquier mensaje del asesor reabre su ventana de 24h en WhatsApp. Se
+    # registra aqui, antes de cualquier ruteo, para que valga aunque el mensaje
+    # termine en un funnel, en el menu o descartado. No altera el ruteo.
+    if _is_advisor_phone(phone):
+        _advisor_window_touch()
+
     mtype = msg_obj.get("type", "")
     text_for_boardroom = _message_text(msg_obj, mtype)
     if BOARDROOM_IS_AUTHORITY:
@@ -3110,6 +3321,94 @@ def handle(msg_obj: dict) -> None:
 
     show_menu(phone)
 
+# ── Estados asíncronos de Meta (value.statuses[]) ─────────────────────────────
+# Meta reporta aquí lo que la respuesta síncrona nunca dice: si el mensaje se
+# entregó de verdad (`sent`/`delivered`/`read`) o falló después de haber sido
+# aceptado con HTTP 200 (`failed` + `errors[]`). Antes se descartaba en silencio,
+# que es la razón de fondo por la que una alerta podía perderse sin dejar rastro.
+_ADV_STATUS_SEEN: deque = deque(maxlen=2000)
+_ADV_STATUS_SET: set = set()
+
+
+def _format_status_errors(errors) -> str:
+    if not errors:
+        return ""
+    parts = []
+    for e in errors[:3]:
+        if not isinstance(e, dict):
+            continue
+        details = ""
+        ed = e.get("error_data")
+        if isinstance(ed, dict):
+            details = str(ed.get("details") or "")[:160]
+        parts.append("code=%s title=%s message=%s details=%s" % (
+            e.get("code"),
+            str(e.get("title") or "")[:80],
+            str(e.get("message") or "")[:120],
+            details,
+        ))
+    return (" errors=[" + " | ".join(parts) + "]") if parts else ""
+
+
+def _advisor_handle_failed(wamid: str, tracked: dict, err_txt: str) -> None:
+    """Meta confirma que una alerta al asesor NO se entregó: reenvía por template."""
+    log.error("asesor_alerta_no_entregada: wamid=%s nivel=%s%s",
+              wamid[:24], tracked.get("level") or "?", err_txt)
+    # El veredicto de Meta manda sobre la contabilidad local: si creíamos la
+    # ventana abierta, estábamos equivocados.
+    _advisor_window_expire()
+    if tracked.get("level") == "template":
+        log.error("asesor_reenvio_omitido: el template también falló, no hay nivel superior")
+        return
+    if not ADV_TPL:
+        log.error("asesor_reenvio_omitido: ADVISOR_TEMPLATE_NAME no configurado")
+        return
+    body = _state_store.aux_get(f"adv_retry:{wamid}")
+    if not body:
+        log.error("asesor_reenvio_omitido: sin cuerpo correlacionado para wamid=%s", wamid[:24])
+        return
+    _notify_advisor_via_template(body, motivo="status_failed")
+
+
+def _handle_statuses(statuses) -> None:
+    """Procesa value.statuses[] de Meta.
+
+    Solo observabilidad y reenvío reactivo de la alerta al asesor: no toca
+    user_state, user_data ni ningún funnel. Un webhook de estados jamás debe
+    producir efectos comerciales ni mensajes al prospecto.
+    """
+    if not statuses:
+        return
+    for st in statuses:
+        try:
+            if not isinstance(st, dict):
+                continue
+            wamid = str(st.get("id") or "")
+            status = str(st.get("status") or "")
+            if not wamid or not status:
+                continue
+            # Dedup propio por (wamid, status), separado del de messages[]:
+            # Meta puede reentregar el mismo estado y el reenvío reactivo no
+            # debe dispararse dos veces por el mismo `failed`.
+            with _id_lock:
+                seen_key = f"{wamid}:{status}"
+                if seen_key in _ADV_STATUS_SET:
+                    continue
+                if len(_ADV_STATUS_SEEN) >= _ADV_STATUS_SEEN.maxlen:
+                    _ADV_STATUS_SET.discard(_ADV_STATUS_SEEN[0])
+                _ADV_STATUS_SEEN.append(seen_key)
+                _ADV_STATUS_SET.add(seen_key)
+            tracked = _advisor_wamid_lookup(wamid)
+            err_txt = _format_status_errors(st.get("errors"))
+            log.info("wa_status: estado=%s wamid=%s destino=%s alerta_asesor=%s%s",
+                     status, wamid[:24], _mask_phone(st.get("recipient_id")),
+                     bool(tracked), err_txt)
+            if status == "failed" and tracked:
+                _advisor_handle_failed(wamid, tracked, err_txt)
+        except Exception:
+            log.exception("💥 _handle_statuses")
+
+
 # ── Verificación de firma Meta (HMAC-SHA256) ──────────────────────────────────
 _WARNED_NO_APP_SECRET = False
 
@@ -3147,8 +3446,13 @@ def webhook():
         data = request.get_json(force=True, silent=True) or {}
         for entry in data.get("entry", []):
             for chg in entry.get("changes", []):
-                for msg in (chg.get("value") or {}).get("messages", []):
+                value = chg.get("value") or {}
+                for msg in value.get("messages", []):
                     handle(msg)
+                # Bucle hermano, no alternativo: un webhook mixto trae messages[]
+                # y statuses[] a la vez y ambos deben procesarse. Hasta ahora la
+                # clave `statuses` simplemente no se leia nunca.
+                _handle_statuses(value.get("statuses", []))
         return jsonify({"status": "ok"}), 200
     except Exception:
         log.exception("❌ webhook POST")
