@@ -343,7 +343,10 @@ def test_decline_review_closes_politely(monkeypatch):
     vicky_app.handle(_text_msg("6682222222", "1", "m2"))
     vicky_app.handle(_text_msg("6682222222", "12000", "m3"))
     vicky_app.handle(_text_msg("6682222222", "2", "m4"))
-    assert advisor_msgs == []
+    # La alerta temprana (propuesta calculada) ya se mando al llegar aqui;
+    # declinar no debe generar la notificacion de calificacion completa.
+    assert len(advisor_msgs) == 1
+    assert "CALIFICADO" not in advisor_msgs[0]
     assert "Préstamo IMSS" in sent[-1][1] or "cuánto me prestan" in sent[-1][1]
     assert vicky_app.user_state.get("6682222222") == "imss_post_cierre"
 
@@ -377,14 +380,17 @@ def test_other_courtesy_words_after_close_do_not_trigger_fallback(monkeypatch):
 # 20-23. Notificacion al asesor
 def test_advisor_notification_says_prospecto_imss_calificado(monkeypatch):
     # Encabezado actualizado por el parche VRIM/campana IMSS.
+    # advisor_msgs[0] es ahora la alerta temprana (propuesta calculada,
+    # ver test_imss_early_proposal_alert.py); la calificacion completa es
+    # siempre la ultima antes del brief de horario.
     sent, advisor_msgs, _ = _run_full_imss_flow(monkeypatch, with_horario=False)
-    assert len(advisor_msgs) == 1
-    assert "📣 PROSPECTO IMSS CALIFICADO — LLAMAR" in advisor_msgs[0]
+    assert len(advisor_msgs) == 2
+    assert "📣 PROSPECTO IMSS CALIFICADO — LLAMAR" in advisor_msgs[-1]
 
 
 def test_advisor_notification_contains_pension_and_estimate(monkeypatch):
     sent, advisor_msgs, _ = _run_full_imss_flow(monkeypatch)
-    msg = advisor_msgs[0]
+    msg = advisor_msgs[1]
     assert "12,000" in msg
     assert "Monto estimado" in msg
     assert "Juan Prueba Imss" in msg
@@ -393,12 +399,12 @@ def test_advisor_notification_contains_pension_and_estimate(monkeypatch):
 
 def test_advisor_notification_contains_pending_validation(monkeypatch):
     sent, advisor_msgs, _ = _run_full_imss_flow(monkeypatch, with_horario=False)
-    assert "Requiere revisión manual" in advisor_msgs[0]
+    assert "Requiere revisión manual" in advisor_msgs[-1]
 
 
 def test_advisor_notification_contains_vrim_and_age_warning(monkeypatch):
     sent, advisor_msgs, _ = _run_full_imss_flow(monkeypatch, with_horario=False)
-    msg = advisor_msgs[0]
+    msg = advisor_msgs[-1]
     assert "VRIM preelegible: Sí" in msg
     assert "Promoción VRIM presentada: Sí" in msg
     assert "Base de elegibilidad VRIM: propuesta_monto" in msg
@@ -448,14 +454,15 @@ def test_post_cierre_courtesy_message_never_calls_boardroom(monkeypatch):
 # (acepta revision -> nombre -> ciudad -> notificacion), no solo tras declinar.
 def test_gracias_after_successful_close_gets_courtesy_not_fallback(monkeypatch):
     sent, advisor_msgs, boardroom_calls = _run_full_imss_flow(monkeypatch)
-    # notificacion principal (ciudad) + actualizacion breve (horario) ya enviadas
-    assert len(advisor_msgs) == 2
+    # alerta temprana (propuesta) + notificacion principal (ciudad) +
+    # actualizacion breve (horario) ya enviadas
+    assert len(advisor_msgs) == 3
     vicky_app.handle(_text_msg("6682222222", "gracias", "m8"))
     assert boardroom_calls == []
     assert all(vicky_app.NEUTRAL_FALLBACK_MESSAGE not in s[1] for s in sent)
     assert "Christian" in sent[-1][1]
     # no se manda notificacion adicional al asesor por la cortesia
-    assert len(advisor_msgs) == 2
+    assert len(advisor_msgs) == 3
     assert vicky_app.user_state.get("6682222222") is None
 
 

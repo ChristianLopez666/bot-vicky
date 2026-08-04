@@ -419,7 +419,10 @@ def test_2_still_means_decline_review(monkeypatch):
     sent, advisor_msgs, _, _ = _to_proposal(monkeypatch)
     vicky_app.handle(_text_msg(PHONE, "2", "m4"))
     assert vicky_app.user_state.get(PHONE) == "imss_post_cierre"
-    assert advisor_msgs == []
+    # La alerta temprana (propuesta calculada) ya se mando en _to_proposal;
+    # declinar no debe generar la notificacion de calificacion completa.
+    assert len(advisor_msgs) == 1
+    assert "CALIFICADO" not in advisor_msgs[0]
 
 
 def test_monto_and_plazo_together_still_work(monkeypatch):
@@ -490,7 +493,10 @@ def test_answer_2_after_viable_alternative_still_declines(monkeypatch):
     vicky_app.handle(_text_msg(PHONE, "6 meses", "m4"))
     vicky_app.handle(_text_msg(PHONE, "2", "m5"))
     assert vicky_app.user_state.get(PHONE) == "imss_post_cierre"
-    assert advisor_msgs == []
+    # La alerta temprana (propuesta calculada) ya se mando en _to_proposal;
+    # declinar no debe generar la notificacion de calificacion completa.
+    assert len(advisor_msgs) == 1
+    assert "CALIFICADO" not in advisor_msgs[0]
 
 
 def test_no_plazo_reaches_minimum_uses_safe_low_pension_exit(monkeypatch):
@@ -742,7 +748,9 @@ def test_advisor_notification_matches_active_proposal(monkeypatch):
     vicky_app.handle(_text_msg(PHONE, "30 meses", "m4"))
     _accept_and_close()
     esperado = vicky_app.calcular_propuesta_imss(12000, 30)
-    aviso = advisor_msgs[0]
+    # advisor_msgs[0] es la alerta temprana de propuesta; la notificacion de
+    # calificacion completa (con estas cifras) es siempre la ultima.
+    aviso = advisor_msgs[-1]
     assert f"Monto estimado: ${esperado['monto']:,.0f}" in aviso
     assert f"Cuota estimada: ${esperado['cuota']:,.0f}" in aviso
     assert "Plazo: 30 meses" in aviso
@@ -757,7 +765,7 @@ def test_closing_and_advisor_notification_share_the_same_figures(monkeypatch):
         vicky_app.handle(_text_msg(PHONE, seguimiento, "m4"))
         _accept_and_close()
         cierre = sent[-1][1]
-        aviso = advisor_msgs[0]
+        aviso = advisor_msgs[-1]
         monto, cuota, plazo = vicky_app._imss_get_propuesta_activa(_data())
         assert f"${monto:,.0f}" in cierre and f"${monto:,.0f}" in aviso, seguimiento
         assert f"${cuota:,.0f}" in cierre and f"${cuota:,.0f}" in aviso, seguimiento
@@ -771,7 +779,7 @@ def test_never_silently_reverts_to_original_proposal(monkeypatch):
     _accept_and_close()
     cierre = sent[-1][1]
     assert f"${original_monto:,.0f}" not in cierre
-    assert f"Monto estimado: ${original_monto:,.0f}" not in advisor_msgs[0]
+    assert f"Monto estimado: ${original_monto:,.0f}" not in advisor_msgs[-1]
 
 
 def test_backup_row_uses_active_proposal(monkeypatch):
@@ -1018,7 +1026,8 @@ def test_horario_option_1_normalizes(monkeypatch):
     _accept_and_close()
     vicky_app.handle(_text_msg(PHONE, "1", "h1"))
     assert _data()["horario_contacto"] == "Hoy por la tarde"
-    assert "Hoy por la tarde" in advisor_msgs[1]
+    # [0]=alerta temprana, [1]=calificacion completa, [2]=brief de horario.
+    assert "Hoy por la tarde" in advisor_msgs[2]
 
 
 def test_horario_option_2_normalizes(monkeypatch):
@@ -1076,11 +1085,12 @@ def test_pure_courtesy_is_not_stored_as_horario(monkeypatch):
                      "excelente", "entendido"):
         sent, advisor_msgs, boardroom_calls, _ = _to_proposal(monkeypatch)
         _accept_and_close()
-        assert len(advisor_msgs) == 1
+        # alerta temprana + calificacion completa.
+        assert len(advisor_msgs) == 2
         vicky_app.handle(_text_msg(PHONE, cortesia, "h1"))
         data = _data()
         assert "horario_contacto" not in data, cortesia
-        assert len(advisor_msgs) == 1, cortesia          # sin notificacion falsa
+        assert len(advisor_msgs) == 2, cortesia          # sin notificacion falsa
         assert data.get("nombre") == "Juan Perez"        # no se borran los datos
         assert data.get("propuesta_activa_monto")
         assert boardroom_calls == []
@@ -1090,8 +1100,9 @@ def test_pure_courtesy_is_not_stored_as_horario(monkeypatch):
 def test_main_advisor_notification_happens_before_waiting_for_horario(monkeypatch):
     sent, advisor_msgs, _, _ = _to_proposal(monkeypatch)
     _accept_and_close()
-    assert len(advisor_msgs) == 1
-    assert "📣 PROSPECTO IMSS CALIFICADO — LLAMAR" in advisor_msgs[0]
+    # alerta temprana + calificacion completa.
+    assert len(advisor_msgs) == 2
+    assert "📣 PROSPECTO IMSS CALIFICADO — LLAMAR" in advisor_msgs[-1]
     assert vicky_app.user_state.get(PHONE) == "imss_q_horario_calc"
 
 
@@ -1104,7 +1115,7 @@ def test_abandoning_without_horario_does_not_lose_the_lead(monkeypatch):
     assert data["nombre"] == "Juan Perez"
     assert data["ciudad"] == "Los Mochis"
     assert data["propuesta_activa_plazo"] == 30
-    assert len(advisor_msgs) == 1
+    assert len(advisor_msgs) == 2
 
 
 def test_user_data_survives_the_close(monkeypatch):
@@ -1125,7 +1136,7 @@ def test_user_data_survives_the_close(monkeypatch):
 def test_advisor_notification_age_warning_is_scoped(monkeypatch):
     sent, advisor_msgs, _, _ = _to_proposal(monkeypatch)
     _accept_and_close()
-    aviso = advisor_msgs[0]
+    aviso = advisor_msgs[-1]
     assert ("⚠️ Verificar edad: las coberturas de reembolso de gastos médicos por "
             "accidente y servicio funerario aplican hasta los 70 años.") in aviso
     assert "VRIM Plus limita" not in aviso
@@ -1135,7 +1146,7 @@ def test_advisor_notification_keeps_required_fields(monkeypatch):
     sent, advisor_msgs, _, _ = _to_proposal(monkeypatch)
     vicky_app.handle(_text_msg(PHONE, "y si quiero 80000", "m4"))
     _accept_and_close()
-    aviso = advisor_msgs[0]
+    aviso = advisor_msgs[-1]
     for campo in ("Nombre: Juan Perez", "WhatsApp: ", "Ciudad: Los Mochis",
                   "Pensión mensual: ", "Monto estimado: ", "Monto solicitado por cliente: ",
                   "Cuota estimada: ", "Plazo: ", "Origen de la propuesta activa: ",
@@ -1156,7 +1167,7 @@ def test_advisor_notification_keeps_origin_and_referral_when_present(monkeypatch
     vicky_app.handle(_text_msg(phone, "1", "r2"))
     vicky_app.handle(_text_msg(phone, "12000", "r3"))
     _accept_and_close(phone=phone)
-    aviso = advisor_msgs[0]
+    aviso = advisor_msgs[-1]
     assert "Origen: campana_IMSS" in aviso
     assert "Headline anuncio: Prestamo para pensionados" in aviso
 
@@ -1393,7 +1404,7 @@ def test_answer_resolved_against_persisted_labels_not_current_clock(monkeypatch)
     _freeze_horario(monkeypatch, MARTES_10AM)
     vicky_app.handle(_text_msg(PHONE, "2", "h1"))
     assert _data()["horario_contacto"] == ofrecidos["2"] == "Lunes por la mañana"
-    assert "Lunes por la mañana" in advisor_msgs[1]
+    assert "Lunes por la mañana" in advisor_msgs[2]
     assert _data()["imss_horarios_ofrecidos"] == ofrecidos   # no se recalculo
 
 
@@ -1403,7 +1414,7 @@ def test_option_3_in_scenario_a_resolves_with_third_persisted_label(monkeypatch)
     _accept_and_close()
     vicky_app.handle(_text_msg(PHONE, "3", "h1"))
     assert _data()["horario_contacto"] == "Lunes por la tarde"
-    assert "Lunes por la tarde" in advisor_msgs[1]
+    assert "Lunes por la tarde" in advisor_msgs[2]
     assert vicky_app.user_state.get(PHONE) == "imss_post_cierre"
 
 
@@ -1412,20 +1423,20 @@ def test_option_3_in_scenario_b_and_c_asks_for_free_text(monkeypatch):
         sent, advisor_msgs, boardroom_calls, _ = _to_proposal(monkeypatch)
         _freeze_horario(monkeypatch, momento)
         _accept_and_close()
-        assert len(advisor_msgs) == 1
+        assert len(advisor_msgs) == 2
         vicky_app.handle(_text_msg(PHONE, "3", "h1"))
         data = _data()
         # No se guarda "3" ni ninguna etiqueta falsa.
         assert "horario_contacto" not in data, momento
-        assert len(advisor_msgs) == 1, momento           # sin notificacion falsa
+        assert len(advisor_msgs) == 2, momento           # sin notificacion falsa
         assert vicky_app.user_state.get(PHONE) == "imss_q_horario_calc", momento
         assert "día y el horario" in sent[-1][1]
         assert boardroom_calls == []
         # Al escribir el horario libre, se captura con el comportamiento normal.
         vicky_app.handle(_text_msg(PHONE, "El miércoles a las 11:00 a. m.", "h2"))
         assert _data()["horario_contacto"] == "El miércoles a las 11:00 a. m."
-        assert len(advisor_msgs) == 2
-        assert "El miércoles a las 11:00 a. m." in advisor_msgs[1]
+        assert len(advisor_msgs) == 3
+        assert "El miércoles a las 11:00 a. m." in advisor_msgs[2]
 
 
 def test_advisor_label_equals_the_label_shown_to_the_client(monkeypatch):
@@ -1438,7 +1449,7 @@ def test_advisor_label_equals_the_label_shown_to_the_client(monkeypatch):
             vicky_app.handle(_text_msg(PHONE, opcion, "h1"))
             etiqueta = _data()["horario_contacto"]
             assert f"{opcion}️⃣ {etiqueta}" in cierre, (momento, opcion)
-            assert etiqueta in advisor_msgs[1], (momento, opcion)
+            assert etiqueta in advisor_msgs[2], (momento, opcion)
 
 
 def test_new_closing_replaces_previously_persisted_options(monkeypatch):
@@ -1475,7 +1486,7 @@ def test_courtesy_after_closing_still_works_in_every_scenario(monkeypatch):
         _accept_and_close()
         vicky_app.handle(_text_msg(PHONE, "gracias", "h1"))
         assert "horario_contacto" not in _data(), momento
-        assert len(advisor_msgs) == 1, momento
+        assert len(advisor_msgs) == 2, momento
         assert vicky_app.user_state.get(PHONE) == "imss_post_cierre"
         assert boardroom_calls == []
 

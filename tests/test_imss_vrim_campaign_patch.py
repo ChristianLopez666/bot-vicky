@@ -344,8 +344,10 @@ def test_advisor_notified_before_horario_question_and_lead_not_lost_on_abandon(m
     vicky_app.handle(_text_msg("6684440000", "Juan Perez", "m5"))
     vicky_app.handle(_text_msg("6684440000", "Los Mochis", "m6"))
     # Ya se notifico al asesor ANTES de que exista respuesta de horario.
-    assert len(advisor_msgs) == 1
-    assert "📣 PROSPECTO IMSS CALIFICADO — LLAMAR" in advisor_msgs[0]
+    # advisor_msgs[0] es la alerta temprana de propuesta calculada (ver
+    # test_imss_early_proposal_alert.py); la calificacion completa es [-1].
+    assert len(advisor_msgs) == 2
+    assert "📣 PROSPECTO IMSS CALIFICADO — LLAMAR" in advisor_msgs[-1]
     data = vicky_app.user_data.get("6684440000", {})
     assert data.get("advisor_notify_ok") is True
     assert data.get("nombre") == "Juan Perez"
@@ -360,14 +362,14 @@ def test_horario_captured_sends_brief_advisor_update_and_closes(monkeypatch):
     vicky_app.handle(_text_msg("6684440000", "1", "m4"))
     vicky_app.handle(_text_msg("6684440000", "Juan Perez", "m5"))
     vicky_app.handle(_text_msg("6684440000", "Los Mochis", "m6"))
-    assert len(advisor_msgs) == 1
-    vicky_app.handle(_text_msg("6684440000", "10am", "m7"))
     assert len(advisor_msgs) == 2
-    assert "⏰ HORARIO DE CONTACTO" in advisor_msgs[1]
-    assert "Juan Perez" in advisor_msgs[1]
-    assert "10am" in advisor_msgs[1]
+    vicky_app.handle(_text_msg("6684440000", "10am", "m7"))
+    assert len(advisor_msgs) == 3
+    assert "⏰ HORARIO DE CONTACTO" in advisor_msgs[2]
+    assert "Juan Perez" in advisor_msgs[2]
+    assert "10am" in advisor_msgs[2]
     # La actualizacion es breve: no repite toda la notificacion principal.
-    assert "📣 PROSPECTO IMSS CALIFICADO" not in advisor_msgs[1]
+    assert "📣 PROSPECTO IMSS CALIFICADO" not in advisor_msgs[2]
     assert vicky_app.user_state.get("6684440000") == "imss_post_cierre"
     # Correccion bloqueante 1: _imss_close() ya NO descarta los datos
     # comerciales -- deben seguir disponibles despues de cerrar.
@@ -390,10 +392,10 @@ def test_courtesy_reply_to_horario_question_does_not_save_as_horario(monkeypatch
     vicky_app.handle(_text_msg("6684440000", "1", "m4"))
     vicky_app.handle(_text_msg("6684440000", "Juan Perez", "m5"))
     vicky_app.handle(_text_msg("6684440000", "Los Mochis", "m6"))
-    assert len(advisor_msgs) == 1
+    assert len(advisor_msgs) == 2
     vicky_app.handle(_text_msg("6684440000", "gracias", "m7"))
     # No se manda actualizacion de horario (falsa) al asesor.
-    assert len(advisor_msgs) == 1
+    assert len(advisor_msgs) == 2
     data = vicky_app.user_data.get("6684440000", {})
     assert "horario_contacto" not in data
     # Se cierra de forma segura, sin quedar atrapado, y sin llamar a Boardroom.
@@ -411,8 +413,8 @@ def test_valid_time_expressions_are_saved_as_horario(monkeypatch):
         vicky_app.handle(_text_msg("6684440000", "Juan Perez", "m5"))
         vicky_app.handle(_text_msg("6684440000", "Los Mochis", "m6"))
         vicky_app.handle(_text_msg("6684440000", horario_text, "m7"))
-        assert len(advisor_msgs) == 2
-        assert "⏰ HORARIO DE CONTACTO" in advisor_msgs[1]
+        assert len(advisor_msgs) == 3
+        assert "⏰ HORARIO DE CONTACTO" in advisor_msgs[2]
         data = vicky_app.user_data.get("6684440000", {})
         assert data.get("horario_contacto") == horario_text
 

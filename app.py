@@ -2273,6 +2273,21 @@ def funnel_imss(phone: str, msg: str) -> None:
             data["vrim_eligibility_basis"] = "propuesta_monto"
         user_data[phone] = data
 
+        # Alerta temprana: el asesor se enteraba de un lead calificado solo
+        # hasta que aceptaba la revision y daba nombre+ciudad (mas abajo,
+        # imss_q_ciudad_calc). Un lead con propuesta real (ej. $90,226) que
+        # nunca contesta esa pregunta quedaba invisible -- hallazgo real
+        # 2026-08-04, lead 5216681693152. Esta alerta es adicional, no
+        # sustituye a la de calificacion completa.
+        notify_advisor(
+            "📊 PROPUESTA CALCULADA – IMSS Ley 73 (pendiente de confirmar)\n"
+            f"WhatsApp: {phone}\n"
+            f"Pensión: ${m:,.0f}\n"
+            f"Propuesta: ${propuesta['monto']:,.0f} / ${propuesta['cuota']:,.0f} al mes / "
+            f"{propuesta['plazo']} meses\n"
+            "Aún no confirma revisión — puede requerir seguimiento si no responde."
+        )
+
         # Solo condiciones SIN IVA en este mensaje (nunca IMSS_CAT, que es el
         # criterio con IVA de uso interno). Ambas cifras salen de las
         # constantes -- no se hardcodean en la plantilla.
