@@ -2163,26 +2163,63 @@ def funnel_imss(phone: str, msg: str) -> None:
         return
 
     if state == "imss_q_ley73":
+        n_ley73 = norm(msg)
+        if any(k in n_ley73 for k in ("asesor", "humano", "persona real")):
+            notify_advisor(
+                f"📣 SOLICITA ASESOR – IMSS Ley 73 (menú no resuelto)\n"
+                f"WhatsApp: {phone}\n"
+                f"Último mensaje: {msg[:200]}"
+            )
+            send_msg(phone, "Claro 🙌 Le aviso a *Christian López* para que te contacte directamente.")
+            _imss_close(phone)
+            return
         r = _imss_ley73_choice(msg)
         if r in ("1", "2"):
+            data.pop("ley73_intentos_invalidos", None)
             data["ley73_estatus"] = "pensionado_ley73" if r == "1" else "pensionado_sin_confirmar_ley73"
             data["relacion"] = "titular"
             user_data[phone] = data
             send_msg(phone, "Perfecto 👏\n*¿Cuánto recibes al mes por concepto de pensión?* _(ej. 7500)_")
             user_state[phone] = "imss_q_pension_calc"
         elif r == "3":
+            data.pop("ley73_intentos_invalidos", None)
             notify_advisor(f"📣 INTERÉS FUTURO – IMSS (por pensionarse)\nWhatsApp: {phone}")
             send_msg(phone,
                 "Entendido 🙏 Para calcular una propuesta necesitamos que la pensión ya esté activa.\n\n"
                 "Aun así, si gustas, *Christian* puede revisar tu caso para cuando te pensiones.")
             _imss_close(phone)
         elif r == "4":
+            data.pop("ley73_intentos_invalidos", None)
             data["relacion"] = "familiar"
             user_data[phone] = data
             send_msg(phone, "Entendido 👍\n*¿Cuánto recibe al mes de pensión tu familiar?* _(ej. 7500)_")
             user_state[phone] = "imss_q_pension_calc"
         else:
-            send_msg(phone, "Por favor responde *1*, *2*, *3* o *4*.")
+            # Sin esto, un prospecto que no entiende el menu numerado se queda
+            # atrapado indefinidamente en el mismo mensaje (hallazgo real
+            # 2026-08-04, lead 5214521126115: 8 intentos sin salida ni aviso
+            # al asesor). Al segundo intento invalido, se aclara la pregunta
+            # con ejemplos y se avisa una sola vez al asesor -- no en cada
+            # intento repetido, para no saturarlo.
+            intentos = int(data.get("ley73_intentos_invalidos", 0)) + 1
+            data["ley73_intentos_invalidos"] = intentos
+            user_data[phone] = data
+            if intentos == 2:
+                notify_advisor(
+                    f"⚠️ PROSPECTO ATASCADO – IMSS Ley 73\n"
+                    f"WhatsApp: {phone}\n"
+                    f"No entiende el menú numérico. Último mensaje: {msg[:200]}"
+                )
+            if intentos >= 2:
+                send_msg(phone,
+                    "Escribe solo el número de tu opción, sin palabras:\n\n"
+                    "Escribe *1* si ya recibes tu pensión del IMSS.\n"
+                    "Escribe *2* si estás pensionado pero no sabes si es Ley 73.\n"
+                    "Escribe *3* si todavía no te pensionas.\n"
+                    "Escribe *4* si estás preguntando por un familiar.\n\n"
+                    "Si prefieres, dime *asesor* y Christian López te contacta directamente.")
+            else:
+                send_msg(phone, "Por favor responde *1*, *2*, *3* o *4*.")
         return
 
     if state == "imss_no_califica":
