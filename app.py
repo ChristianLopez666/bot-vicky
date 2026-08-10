@@ -16,6 +16,8 @@ import openai
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
+import whatsapp_interactive as wai
+
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO,
@@ -463,6 +465,61 @@ def send_msg(to: str, text: str) -> bool:
         _log(to, _nombre(to), text, "saliente", "bot", "error", str(e)[:200], _mid())
         return False
 
+
+# WA-1: senders de Interactive Messages. Mismo contrato que send_msg (bool,
+# mismo patron de _log/_wa_post) -- no se crea un segundo cliente HTTP para
+# Meta, se reutiliza _wa_post. Los builders (wai.build_*) son puros y viven en
+# whatsapp_interactive.py para poder probarse sin HTTP.
+def send_interactive_buttons(to: str, body_text: str, buttons: list[tuple[str, str]]) -> bool:
+    if not META_TOKEN or not WABA_ID:
+        log.error("❌ META_TOKEN o WABA_PHONE_ID no configurados")
+        return False
+    try:
+        payload = wai.build_reply_buttons_payload(str(to), body_text, buttons)
+    except ValueError as e:
+        log.error(f"❌ payload de reply buttons invalido: {e}")
+        return False
+    try:
+        r = _wa_post(payload)
+        ok = r.status_code in (200, 201)
+        if not ok:
+            log.error(f"❌ WA interactive-buttons {r.status_code}: {r.text[:200]}")
+        _log(to, _nombre(to), f"[interactive_buttons x{len(buttons)}] {body_text}",
+             "saliente", "bot", "ok" if ok else "error", "" if ok else r.text[:200], _mid())
+        return ok
+    except Exception as e:
+        log.exception(f"💥 send_interactive_buttons {to}")
+        _log(to, _nombre(to), "[interactive_buttons]", "saliente", "bot",
+             "error", str(e)[:200], _mid())
+        return False
+
+
+def send_interactive_list(
+    to: str, body_text: str, button_text: str, sections: list[dict]
+) -> bool:
+    if not META_TOKEN or not WABA_ID:
+        log.error("❌ META_TOKEN o WABA_PHONE_ID no configurados")
+        return False
+    try:
+        payload = wai.build_list_message_payload(str(to), body_text, button_text, sections)
+    except ValueError as e:
+        log.error(f"❌ payload de list message invalido: {e}")
+        return False
+    try:
+        r = _wa_post(payload)
+        ok = r.status_code in (200, 201)
+        if not ok:
+            log.error(f"❌ WA interactive-list {r.status_code}: {r.text[:200]}")
+        _log(to, _nombre(to), f"[interactive_list] {body_text}",
+             "saliente", "bot", "ok" if ok else "error", "" if ok else r.text[:200], _mid())
+        return ok
+    except Exception as e:
+        log.exception(f"💥 send_interactive_list {to}")
+        _log(to, _nombre(to), "[interactive_list]", "saliente", "bot",
+             "error", str(e)[:200], _mid())
+        return False
+
+
 def _is_internal_request(req) -> bool:
     if not INTERNAL_TOKEN:
         return False
@@ -708,6 +765,27 @@ _BUS_ACTIVE = os.getenv("BUS_ENABLED", "true").strip().lower() \
               in {"1", "true", "yes", "on"}
 BOARDROOM_IS_AUTHORITY = True
 NEUTRAL_FALLBACK_MESSAGE = "Recibí tu mensaje. En un momento te atiendo."
+
+# WA-1: feature flag del menu principal como Interactive List Message.
+# Default false (LEGACY_TEXT_MENU) -- show_menu() no cambia de comportamiento
+# hasta que se active explicitamente. Mismo patron booleano que BUS_ENABLED.
+WHATSAPP_INTERACTIVE_MENU_ENABLED, _wa_interactive_menu_flag_invalid = wai.parse_bool_flag(
+    os.getenv("WHATSAPP_INTERACTIVE_MENU_ENABLED")
+)
+if _wa_interactive_menu_flag_invalid:
+    log.warning("⚠️ WHATSAPP_INTERACTIVE_MENU_ENABLED valor no reconocido; usando false")
+
+# Botones/list del embudo IMSS de TEXTO (perfil Ley73, CTA de revision,
+# preguntas si/no) sobre la infraestructura de WA-1 -- SIN WhatsApp Flow.
+# SEPARADO de WHATSAPP_INTERACTIVE_MENU_ENABLED a proposito: puede activarse
+# solo esto, sin tocar el menu principal, para rollback granular. Default
+# false: el funnel de texto sigue siendo exactamente el de hoy.
+WHATSAPP_IMSS_BUTTONS_ENABLED, _wa_imss_buttons_flag_invalid = wai.parse_bool_flag(
+    os.getenv("WHATSAPP_IMSS_BUTTONS_ENABLED")
+)
+if _wa_imss_buttons_flag_invalid:
+    log.warning("⚠️ WHATSAPP_IMSS_BUTTONS_ENABLED valor no reconocido; usando false")
+
 _BOARDROOM_ALLOWED_INSTRUCTIONS = {
     "send_message",
     "ask_question",
@@ -1129,6 +1207,57 @@ _MENU = (
 def show_menu(phone: str):
     send_msg(phone, _MENU)
 
+
+# WA-1: menu principal como Interactive List Message (WA1-E / Fase 10).
+# Mismas 6 opciones y mismos codigos de servicio que _MENU/_EXACT/route() de
+# arriba -- ninguna fuente de verdad nueva, solo una presentacion alterna.
+# Construida y disponible, pero NO activada por defecto: show_menu() sigue
+# siendo lo que se llama en todo el pre-router mientras
+# WHATSAPP_INTERACTIVE_MENU_ENABLED sea false.
+_MENU_INTERACTIVE_BODY = (
+    "🏦 *Servicios Financieros Inbursa*\n\nElige el servicio que te interesa:"
+)
+_MENU_INTERACTIVE_BUTTON_TEXT = "Ver opciones"
+_MENU_INTERACTIVE_ROWS = [
+    ("menu_imss", "Préstamo IMSS", "Calcula tu propuesta con tu pensión"),
+    ("menu_auto", "Seguro de Auto", "Cobertura amplia · Asistencia 24/7"),
+    ("menu_vida", "Seguro de Vida y Salud", "Vida · GMM · Hospitalización"),
+    ("menu_vrim", "Tarjeta Médica VRIM", "Consultas ilimitadas · Labs"),
+    ("menu_emp", "Financiamiento PYME", "$100K–$100M · PYMES y empresas"),
+    ("menu_fp", "Consigue Tu Crédito", "CTC · Crédito sin garantía"),
+]
+
+
+def _menu_interactive_sections() -> list[dict]:
+    rows = [
+        {"id": rid, "title": title, "description": desc}
+        for rid, title, desc in _MENU_INTERACTIVE_ROWS
+    ]
+    return [{"title": "Servicios", "rows": rows}]
+
+
+def build_main_menu_interactive_payload(to: str) -> dict:
+    """Payload crudo (dict) del menu principal como Interactive List Message.
+    No envia nada -- solo construye, para poder probarse sin HTTP."""
+    return wai.build_list_message_payload(
+        to=str(to),
+        body_text=_MENU_INTERACTIVE_BODY,
+        button_text=_MENU_INTERACTIVE_BUTTON_TEXT,
+        sections=_menu_interactive_sections(),
+    )
+
+
+def show_menu_interactive(phone: str) -> bool:
+    """Envia el menu principal como Interactive List Message. No se invoca
+    desde el pre-router salvo que WHATSAPP_INTERACTIVE_MENU_ENABLED sea true
+    (ver handle())."""
+    return send_interactive_list(
+        phone,
+        _MENU_INTERACTIVE_BODY,
+        _MENU_INTERACTIVE_BUTTON_TEXT,
+        _menu_interactive_sections(),
+    )
+
 # ── Detección de campaña IMSS ─────────────────────────────────────────────────
 _IMSS_STRONG = {
     "prestamo imss", "credito imss",
@@ -1540,7 +1669,12 @@ def route(phone: str, svc: str) -> None:
 # ── Promoción VRIM Plus (campaña IMSS) ─────────────────────────────────────────
 # Preelegibilidad preliminar, nunca "aprobado"/"garantizado". El costo de lista
 # de VRIM es dato interno -- nunca se menciona aquí.
-_IMSS_VRIM_PROMO_MESSAGE = (
+# Cuerpo de la burbuja VRIM SIN el CTA final -- separado a proposito para que,
+# con WHATSAPP_IMSS_BUTTONS_ENABLED activo, el CTA pueda enviarse aparte como
+# Reply Buttons (ver _imss_send_revision_cta). _IMSS_VRIM_PROMO_MESSAGE se
+# reconstruye a partir de este cuerpo + el mismo texto de CTA de siempre, asi
+# que el texto legacy (flag apagado) queda byte-identico al de antes.
+_IMSS_VRIM_PROMO_BODY = (
     "🎁 *¡Tu propuesta puede darte mucho más que un préstamo!*\n\n"
     "Por el monto estimado, podrías recibir *sin costo una membresía VRIM Plus "
     "durante 12 meses*, sujeta a la formalización del préstamo y a las condiciones "
@@ -1566,23 +1700,41 @@ _IMSS_VRIM_PROMO_MESSAGE = (
     "médica disponible, respaldo frente a un accidente y apoyo para tu familia "
     "puede darte tranquilidad durante todo un año.*\n\n"
     "Christian López revisará personalmente tu propuesta y te explicará claramente "
-    "cómo funciona cada beneficio.\n\n"
-    "*¿Quieres que Christian revise tu caso?*\n\n"
+    "cómo funciona cada beneficio."
+)
+
+# Pregunta del CTA inicial de revision (justo despues de la propuesta/VRIM).
+# Mismo texto que ya se mostraba embebido en _IMSS_VRIM_PROMO_MESSAGE.
+_IMSS_REVISION_CTA_QUESTION = "¿Quieres que Christian revise tu caso?"
+
+_IMSS_VRIM_PROMO_MESSAGE = (
+    _IMSS_VRIM_PROMO_BODY + "\n\n"
+    "*" + _IMSS_REVISION_CTA_QUESTION + "*\n\n"
     "1️⃣ Sí, quiero que me contacte\n"
     "2️⃣ No por ahora"
 )
 
-# CTA de respaldo: si la burbuja VRIM completa falla al enviarse, el
-# prospecto igual debe recibir el CTA 1/2 -- nunca queda sin poder responder.
-# Texto conservado tal cual del parche anterior a proposito.
+# CTA de respaldo: si la burbuja VRIM completa falla al enviarse (o, con
+# WHATSAPP_IMSS_BUTTONS_ENABLED activo, si el envio de Reply Buttons falla),
+# el prospecto igual debe recibir el CTA 1/2 en texto plano -- nunca queda
+# sin poder responder. Texto conservado tal cual del parche anterior.
 _IMSS_REVISION_CTA_FALLBACK = (
     "¿Quieres que Christian revise tu caso?\n"
     "1. Sí, quiero que me contacte\n"
     "2. No por ahora"
 )
 
+# Botones del CTA de revision (id "1"/"2" -- los mismos tokens que
+# _imss_revision_choice() ya interpreta nativamente, sin tocar ese parser).
+_IMSS_REVISION_CTA_BUTTONS = [("1", "Sí, contáctenme"), ("2", "No por ahora")]
+
 # CTA que cierra los mensajes de revision (monto/plazo alternativo). Misma
 # semantica 1/2 de siempre; fuente unica para no repetirlo en cada rama.
+# NOTA DE ALCANCE: estas repeticiones del CTA (dentro de los sub-flujos de
+# "otro monto"/"otro plazo" en imss_q_revision) se dejan en texto plano en
+# esta primera entrega de botones/list -- ver WHATSAPP_IMSS_BUTTONS_ENABLED
+# arriba. Solo se convirtieron a interactive los puntos de mayor volumen
+# (menu inicial Ley73 y el primer CTA de revision).
 _IMSS_REVISION_CTA = (
     "¿Quieres que Christian revise si podemos avanzar con esta opción?\n"
     "1️⃣ Sí, quiero que me contacte\n"
@@ -2125,6 +2277,52 @@ def _imss_log_lead_backup(phone: str, data: dict, resultado: str = "advisor_noti
          resultado=resultado, error="", mid=_mid())
 
 
+# Botones/list del embudo IMSS de texto (WHATSAPP_IMSS_BUTTONS_ENABLED),
+# construidos sobre la infraestructura de WA-1 (send_interactive_buttons/
+# send_interactive_list) -- SIN WhatsApp Flow. No se toca ningun parser de
+# negocio (_imss_ley73_choice, _imss_revision_choice, yes_no): los ids de
+# los botones/rows son exactamente los mismos tokens cortos ("1".."4",
+# "si"/"no") que esos parsers ya interpretan de forma nativa, y el puente
+# id->texto vive en handle() (ver el bloque de estado activo imss_).
+_IMSS_LEY73_LIST_ROWS = [
+    ("1", "Ya soy Ley 73", "Ya estoy pensionado por IMSS Ley 73"),
+    ("2", "No sé si es Ley 73", "Estoy pensionado, pero no sé si soy Ley 73"),
+    ("3", "Estoy por pensionarme", "Aún no tengo pensión activa del IMSS"),
+    ("4", "Pregunto por familiar", "Estoy ayudando a un familiar pensionado"),
+]
+
+
+def _imss_send_ley73_menu(phone: str) -> bool:
+    rows = [{"id": rid, "title": title, "description": desc}
+            for rid, title, desc in _IMSS_LEY73_LIST_ROWS]
+    return send_interactive_list(
+        phone,
+        "Selecciona la opción que corresponda a tu caso:",
+        "Elegir opción",
+        [{"title": "Préstamo IMSS", "rows": rows}],
+    )
+
+
+def _imss_send_revision_cta(phone: str) -> bool:
+    """CTA 1/2 de revision (pantalla inicial, justo despues de la propuesta/
+    VRIM). Intenta Reply Buttons primero; si el envio interactivo falla,
+    cae al mismo texto _IMSS_REVISION_CTA_FALLBACK que ya se usaba como
+    respaldo antes de que existiera esta funcion -- nunca deja al prospecto
+    sin un CTA que responder."""
+    if send_interactive_buttons(phone, _IMSS_REVISION_CTA_QUESTION, _IMSS_REVISION_CTA_BUTTONS):
+        return True
+    return send_msg(phone, _IMSS_REVISION_CTA_FALLBACK)
+
+
+def _imss_send_si_no(phone: str, body_text: str) -> bool:
+    """Pregunta cerrada sí/no del funnel IMSS. Los ids "si"/"no" son los
+    mismos tokens que yes_no() ya reconoce nativamente. Con fallback a
+    texto plano si el envio interactivo falla."""
+    if send_interactive_buttons(phone, body_text, [("si", "Sí"), ("no", "No")]):
+        return True
+    return send_msg(phone, body_text)
+
+
 # ── Flujo IMSS ────────────────────────────────────────────────────────────────
 def funnel_imss(phone: str, msg: str) -> None:
     state = user_state.get(phone, "imss_open")
@@ -2147,18 +2345,27 @@ def funnel_imss(phone: str, msg: str) -> None:
         return
 
     if state == "imss_open":
-        send_msg(phone,
+        welcome_base = (
             "👋 *¡Hola! Soy Vicky, asistente de Christian López.*\n\n"
             "Estoy aquí para ayudarte a conocer, de manera rápida y sencilla, cuánto "
             "podrías obtener con un *préstamo para pensionados IMSS*. 💰\n\n"
             "Prepararé una propuesta estimada de acuerdo con tu pensión y también "
             "podemos revisar más opciones por si tienes en mente algún monto o plazo "
-            "específico.\n\n"
+            "específico."
+        )
+        ley73_prompt_text = (
             "Para comenzar, selecciona cuál opción corresponde a tu caso:\n\n"
             "1️⃣ Ya estoy pensionado por IMSS Ley 73\n"
             "2️⃣ Estoy pensionado, pero no sé si soy Ley 73\n"
             "3️⃣ Estoy por pensionarme\n"
-            "4️⃣ Estoy ayudando a un familiar")
+            "4️⃣ Estoy ayudando a un familiar"
+        )
+        if WHATSAPP_IMSS_BUTTONS_ENABLED:
+            send_msg(phone, welcome_base)
+            if not _imss_send_ley73_menu(phone):
+                send_msg(phone, ley73_prompt_text)
+        else:
+            send_msg(phone, welcome_base + "\n\n" + ley73_prompt_text)
         user_state[phone] = "imss_q_ley73"
         return
 
@@ -2250,9 +2457,14 @@ def funnel_imss(phone: str, msg: str) -> None:
 
         propuesta = calcular_propuesta_imss(m)
         if propuesta["monto"] < IMSS_MONTO_MINIMO:
-            send_msg(phone,
+            pension_baja_texto = (
                 "Gracias 🙏 Con esa pensión, el monto estimado queda por debajo de nuestro mínimo "
-                "de *$40,000*.\n\n¿Deseas que un asesor te contacte para explorar otras opciones?")
+                "de *$40,000*.\n\n¿Deseas que un asesor te contacte para explorar otras opciones?"
+            )
+            if WHATSAPP_IMSS_BUTTONS_ENABLED:
+                _imss_send_si_no(phone, pension_baja_texto)
+            else:
+                send_msg(phone, pension_baja_texto)
             user_state[phone] = "imss_pension_baja"
             return
 
@@ -2313,19 +2525,35 @@ def funnel_imss(phone: str, msg: str) -> None:
         cta_delivered = True
         if data.get("vrim_preeligible") and not data.get("vrim_offered"):
             cta_delivered = False
-            vrim_sent_ok = send_msg(phone, _IMSS_VRIM_PROMO_MESSAGE)
+            # Con el flag de botones IMSS activo, el cuerpo VRIM se manda SIN
+            # el CTA embebido (_IMSS_VRIM_PROMO_BODY) y el CTA 1/2 se envia
+            # aparte como Reply Buttons (_imss_send_revision_cta), que ya
+            # trae su propio fallback a texto plano. Con el flag apagado,
+            # _IMSS_VRIM_PROMO_MESSAGE sigue siendo el mismo texto de
+            # siempre, con el CTA embebido -- comportamiento legacy intacto.
+            vrim_body = _IMSS_VRIM_PROMO_BODY if WHATSAPP_IMSS_BUTTONS_ENABLED else _IMSS_VRIM_PROMO_MESSAGE
+            vrim_sent_ok = send_msg(phone, vrim_body)
             if vrim_sent_ok:
                 data["vrim_offered"] = True
                 data["vrim_offer_timestamp"] = datetime.now(timezone.utc).isoformat()
                 user_data[phone] = data
-                cta_delivered = True
+                if WHATSAPP_IMSS_BUTTONS_ENABLED:
+                    cta_delivered = _imss_send_revision_cta(phone)
+                    if not cta_delivered:
+                        log.error("imss_cta_fallback_send_failed phone_last4=%s", phone[-4:])
+                        _imss_log_lead_backup(phone, data, resultado="cta_send_failed")
+                else:
+                    cta_delivered = True
             else:
                 # La burbuja VRIM completa fallo: intentar el CTA de
                 # respaldo. NUNCA se marca vrim_offered=True aqui (para que,
                 # si hay una oportunidad futura, se pueda reintentar la
                 # oferta completa).
                 log.error("imss_vrim_bubble_send_failed phone_last4=%s", phone[-4:])
-                fallback_sent_ok = send_msg(phone, _IMSS_REVISION_CTA_FALLBACK)
+                fallback_sent_ok = (
+                    _imss_send_revision_cta(phone) if WHATSAPP_IMSS_BUTTONS_ENABLED
+                    else send_msg(phone, _IMSS_REVISION_CTA_FALLBACK)
+                )
                 if fallback_sent_ok:
                     cta_delivered = True
                 else:
@@ -2348,7 +2576,10 @@ def funnel_imss(phone: str, msg: str) -> None:
         # de VRIM + fallback). Cualquier mensaje suyo reintenta UNA vez el
         # CTA de respaldo -- reintento acotado por turno del usuario, nunca
         # un bucle ni reenvios ilimitados. user_data no se toca.
-        retry_ok = send_msg(phone, _IMSS_REVISION_CTA_FALLBACK)
+        retry_ok = (
+            _imss_send_revision_cta(phone) if WHATSAPP_IMSS_BUTTONS_ENABLED
+            else send_msg(phone, _IMSS_REVISION_CTA_FALLBACK)
+        )
         if retry_ok:
             user_state[phone] = "imss_q_revision"
         else:
@@ -3088,7 +3319,33 @@ def handle(msg_obj: dict) -> None:
         _advisor_window_touch()
 
     mtype = msg_obj.get("type", "")
-    text_for_boardroom = _message_text(msg_obj, mtype)
+
+    # WA-1: mensajes type:"interactive" (button_reply/list_reply/nfm_reply) no
+    # los reconocia _message_text/_canonical_message_type -- se descartaban en
+    # silencio (ver GAP-WA-002 de la auditoria previa). Se normalizan aqui
+    # sin tocar el camino de text/button legacy, que sigue igual.
+    interactive_event = wai.normalize_incoming_message(msg_obj) if mtype == "interactive" else None
+    if interactive_event is not None:
+        # nfm_reply (WhatsApp Flows) queda fuera de alcance de esta entrega
+        # (sin Flow): se reconoce y se registra, pero no se procesa ni se
+        # responde nada -- corta aqui, antes de tocar Boardroom o cualquier
+        # funnel.
+        if interactive_event["kind"] == wai.KIND_NFM_REPLY:
+            log.info(f"🧩 nfm_reply recibido de {phone} (no procesado, fuera de alcance)")
+            _log(phone, _nombre(phone), "[nfm_reply]", "entrante", "cliente",
+                 "nfm_reply_unprocessed", "", mid)
+            return
+        text_for_boardroom = interactive_event["text"]
+    else:
+        text_for_boardroom = _message_text(msg_obj, mtype)
+
+    if interactive_event is not None:
+        log.info(
+            "🧩 whatsapp_message_kind=%s interactive_type=%s interactive_id=%s",
+            interactive_event["kind"], interactive_event["raw_type"],
+            interactive_event["interactive_id"],
+        )
+
     if BOARDROOM_IS_AUTHORITY:
         logged_text = text_for_boardroom if text_for_boardroom else f"[{_canonical_message_type(mtype)}]"
         log.info(f"📱 {phone}: {logged_text[:80]}")
@@ -3125,7 +3382,21 @@ def handle(msg_obj: dict) -> None:
             reset(phone)
             active_state = ""
         elif active_state.startswith("imss_"):
-            funnel_imss(phone, text_for_boardroom)
+            # Botones/list de IMSS (WHATSAPP_IMSS_BUTTONS_ENABLED): el id del
+            # boton/row es el mismo token corto que _imss_ley73_choice()/
+            # _imss_revision_choice()/yes_no() ya interpretan de forma nativa
+            # ("1".."4", "si"/"no") -- se prefiere el id sobre el titulo
+            # visible para no depender de que el texto del boton contenga las
+            # palabras clave que esos parsers usan para texto libre. Ningun
+            # parser de negocio se modifica; solo se elige que valor pasarle.
+            imss_input = text_for_boardroom
+            if (
+                interactive_event is not None
+                and interactive_event["kind"] in (wai.KIND_BUTTON_REPLY, wai.KIND_LIST_REPLY)
+                and interactive_event["interactive_id"]
+            ):
+                imss_input = interactive_event["interactive_id"]
+            funnel_imss(phone, imss_input)
             return
         if active_state.startswith("auto_"):
             funnel_auto(phone, text_for_boardroom)
@@ -3143,6 +3414,23 @@ def handle(msg_obj: dict) -> None:
             funnel_fp(phone, text_for_boardroom)
             return
 
+        # WA-1: puente interactive_id -> servicio canonico existente (Fase 9).
+        # La identidad de routing es el id (ej. "menu_imss"), nunca el titulo
+        # visible -- permite cambiar el copy del boton/list sin romper el
+        # routing. Solo aplica a button_reply/list_reply; si el id no esta en
+        # el mapa (ID desconocido), NO es un error: se cae al pre-router de
+        # texto de abajo usando el titulo como si el usuario lo hubiera
+        # escrito (fallback seguro, Fase 11).
+        if interactive_event is not None and interactive_event["kind"] in (
+            wai.KIND_BUTTON_REPLY, wai.KIND_LIST_REPLY,
+        ):
+            svc_from_id = wai.resolve_service_from_interactive_id(
+                interactive_event["interactive_id"]
+            )
+            if svc_from_id:
+                route(phone, svc_from_id)
+                return
+
         # Pre-router local: comandos de UX (menu, opciones 1-6) se resuelven
         # aqui mismo, sin pasar por Boardroom. Antes de este fix, TODO mensaje
         # -- incluido "menu" -- caia directo en _handle_boardroom_authority()
@@ -3152,7 +3440,10 @@ def handle(msg_obj: dict) -> None:
         n_local = norm(text_for_boardroom) if text_for_boardroom else ""
         if n_local in _MENU_EXACT or any(p in n_local for p in _MENU_CONTAINS):
             reset(phone)
-            show_menu(phone)
+            if WHATSAPP_INTERACTIVE_MENU_ENABLED:
+                show_menu_interactive(phone)
+            else:
+                show_menu(phone)
             return
         if n_local in _LOCAL_NUMERIC_OPTIONS:
             svc = detect_svc(text_for_boardroom)
