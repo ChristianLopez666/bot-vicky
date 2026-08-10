@@ -285,6 +285,38 @@ def test_failed_de_un_template_no_vuelve_a_reenviar(monkeypatch):
     assert len(calls) == 2  # no hay nivel superior al template
 
 
+def test_failed_de_un_template_deja_registro_en_sheets(monkeypatch):
+    """Bug real de produccion (2026-08-09/10, wamid con error 131049 'healthy
+    ecosystem engagement'): Meta acepta el template (200+wamid), asi que el
+    registro sincrono en Sheets ya quedo escrito como "ok" -- fue lo unico
+    que se sabia en ese momento. Cuando el status asincrono confirma
+    `failed` y no hay nivel superior (_advisor_handle_failed corta con
+    "no hay nivel superior"), esa correccion nunca se escribe a ningun
+    lado salvo el log de Python: la alerta se pierde sin dejar ningun
+    rastro revisable en Sheets de que en realidad NUNCA llego al asesor.
+    """
+    registros = []
+    monkeypatch.setattr(vicky_app, "_log", lambda *a, **k: registros.append(a))
+    calls = cola_wa(monkeypatch, [FakeResp(400), resp_with_wamid()])
+    vicky_app.notify_advisor(LEAD_MSG)
+    assert len(calls) == 2  # escalo a template, como siempre
+    registros.clear()  # solo interesa lo que pasa DESPUES del status failed
+
+    vicky_app._handle_statuses([_status("failed", errors=[{
+        "code": 131049,
+        "title": "This message was not delivered to maintain healthy ecosystem engagement.",
+        "message": "This message was not delivered to maintain healthy ecosystem engagement.",
+    }])])
+
+    assert len(calls) == 2  # sigue sin haber un tercer intento (no hay nivel superior)
+    assert len(registros) == 1, (
+        "la falla definitiva del template debe dejar un registro en Sheets, "
+        "no solo un log de Python (ver _advisor_handle_failed)"
+    )
+    resultado = registros[0][5]  # _log(phone, nombre, msg, tipo, origen, resultado, error, mid)
+    assert resultado == "error"
+
+
 def test_failed_duplicado_reenvia_una_sola_vez(monkeypatch):
     calls = cola_wa(monkeypatch, [resp_with_wamid()])
     vicky_app.notify_advisor(LEAD_MSG)
