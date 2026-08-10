@@ -3403,7 +3403,19 @@ def _format_status_errors(errors) -> str:
 
 
 def _advisor_handle_failed(wamid: str, tracked: dict, err_txt: str) -> None:
-    """Meta confirma que una alerta al asesor NO se entregó: reenvía por template."""
+    """Meta confirma que una alerta al asesor NO se entregó: reenvía por
+    template si hay un nivel superior disponible.
+
+    Si no lo hay (el template también falló), la alerta no debe desaparecer
+    sin dejar rastro revisable: el registro síncrono en Sheets ya quedó
+    escrito como "ok" cuando Meta aceptó el envío (200/wamid), que es lo
+    único que se sabía en ese momento (ver CONTRATO notify_advisor —
+    ACCEPTED_BY_META no equivale a DELIVERY_STATUS). Sin este segundo
+    registro, un lead real podía quedar sin notificación al asesor y sin
+    ninguna evidencia de ello salvo el log de Python (defecto real de
+    producción, 2026-08-09/10, Meta error 131049 "healthy ecosystem
+    engagement").
+    """
     log.error("asesor_alerta_no_entregada: wamid=%s nivel=%s%s",
               wamid[:24], tracked.get("level") or "?", err_txt)
     # El veredicto de Meta manda sobre la contabilidad local: si creíamos la
@@ -3411,6 +3423,9 @@ def _advisor_handle_failed(wamid: str, tracked: dict, err_txt: str) -> None:
     _advisor_window_expire()
     if tracked.get("level") == "template":
         log.error("asesor_reenvio_omitido: el template también falló, no hay nivel superior")
+        body = _state_store.aux_get(f"adv_retry:{wamid}") or "(cuerpo no disponible, TTL vencido)"
+        _log(ADVISOR_NUM, "Asesor", body, "saliente", "asesor", "error",
+             f"status_failed{err_txt}"[:300], wamid)
         return
     if not ADV_TPL:
         log.error("asesor_reenvio_omitido: ADVISOR_TEMPLATE_NAME no configurado")
