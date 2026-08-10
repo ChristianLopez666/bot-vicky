@@ -17,6 +17,7 @@ from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
 import whatsapp_interactive as wai
+import imss_flow
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -520,6 +521,73 @@ def send_interactive_list(
         return False
 
 
+# Desenlaces del envio del Flow. Son parte del contrato de
+# send_imss_dynamic_flow(), no configuracion: el envio de un Flow tiene tres
+# resultados posibles y route() necesita distinguirlos para decidir si el
+# fallback al funnel legacy es seguro o duplicaria la experiencia.
+IMSS_FLOW_ENVIADO = "enviado"
+IMSS_FLOW_AMBIGUO = "ambiguo"
+IMSS_FLOW_FALLIDO = "fallido"
+
+
+def send_imss_dynamic_flow(phone: str) -> str:
+    """Envia el Flow dinamico de IMSS. Reutiliza _wa_post y nunca lanza.
+
+    A DIFERENCIA de send_interactive_*, no devuelve bool sino uno de
+    IMSS_FLOW_ENVIADO / IMSS_FLOW_AMBIGUO / IMSS_FLOW_FALLIDO. El envio de un
+    Flow tiene tres desenlaces, no dos, y comprimirlos en un bool obliga a
+    pasar el tercero por un canal lateral -- exactamente lo que produjo un
+    defecto real: el marcador auxiliar podia no persistirse y route() volvia
+    a duplicar la experiencia. El estado viaja en el valor de retorno, dentro
+    de la misma pila de llamadas, donde no puede perderse.
+
+      ENVIADO  Meta confirmo (200/201).
+      FALLIDO  Fallo LIMPIO: nada salio hacia Meta, o Meta lo rechazo
+               explicitamente. route() DEBE caer al funnel legacy.
+      AMBIGUO  La peticion salio y nunca hubo respuesta. Meta pudo haberla
+               entregado, asi que route() NO debe caer al legacy: apilar el
+               menu de texto sobre un Flow abierto es justo la experiencia
+               que este trabajo viene a corregir.
+
+    La correlacion flow_token -> telefono se persiste ANTES de enviar: el
+    endpoint /ext/flow/imss no puede resolver a que conversacion pertenece un
+    data_exchange sin ella, asi que un Flow entregado sin correlacion seria un
+    Flow muerto ("tu sesion expiro" en la primera pantalla). Si el store no
+    la garantiza, no se envia nada y el desenlace es FALLIDO, no AMBIGUO."""
+    if not WHATSAPP_IMSS_FLOW_ID:
+        log.error("flow_send_failed reason=flow_id_missing")
+        return IMSS_FLOW_FALLIDO
+    if not META_TOKEN or not WABA_ID:
+        log.error("flow_send_failed reason=meta_credentials_missing")
+        return IMSS_FLOW_FALLIDO
+    token = imss_flow.generate_flow_token()
+    try:
+        payload = imss_flow.build_flow_message_payload(str(phone), WHATSAPP_IMSS_FLOW_ID, token)
+    except ValueError as e:
+        log.error(f"flow_send_failed reason=invalid_payload detail={e}")
+        return IMSS_FLOW_FALLIDO
+
+    if not _state_store.aux_set(f"imss_flow_token:{token}", _digits(phone), _IMSS_FLOW_TOKEN_TTL):
+        log.error("flow_send_failed reason=correlation_write_failed")
+        return IMSS_FLOW_FALLIDO
+
+    try:
+        r = _wa_post(payload)
+    except Exception as e:
+        log.exception(f"💥 send_imss_dynamic_flow {phone} (entrega ambigua)")
+        _log(phone, _nombre(phone), "[whatsapp_flow_imss_dynamic]", "saliente", "bot",
+             "error", str(e)[:200], _mid())
+        return IMSS_FLOW_AMBIGUO
+
+    if r.status_code not in (200, 201):
+        log.error(f"flow_send_failed reason=http_{r.status_code} detail={r.text[:200]}")
+        _log(phone, _nombre(phone), "[whatsapp_flow_imss_dynamic]", "saliente", "bot",
+             "error", r.text[:200], _mid())
+        return IMSS_FLOW_FALLIDO
+    _log(phone, _nombre(phone), "[whatsapp_flow_imss_dynamic]", "saliente", "bot", "ok", "", _mid())
+    return IMSS_FLOW_ENVIADO
+
+
 def _is_internal_request(req) -> bool:
     if not INTERNAL_TOKEN:
         return False
@@ -785,6 +853,29 @@ WHATSAPP_IMSS_BUTTONS_ENABLED, _wa_imss_buttons_flag_invalid = wai.parse_bool_fl
 )
 if _wa_imss_buttons_flag_invalid:
     log.warning("⚠️ WHATSAPP_IMSS_BUTTONS_ENABLED valor no reconocido; usando false")
+
+# Flow dinamico real de IMSS (perfil -> pension -> propuesta -> datos de
+# contacto, calculado por el backend a mitad del Flow via data_exchange).
+# SEPARADO de WHATSAPP_IMSS_BUTTONS_ENABLED a proposito -- pueden convivir o
+# activarse por separado. Default false: "menu_imss"/el intent de texto IMSS
+# siguen cayendo en el funnel legacy.
+WHATSAPP_IMSS_DYNAMIC_FLOW_ENABLED, _wa_imss_dynamic_flow_flag_invalid = wai.parse_bool_flag(
+    os.getenv("WHATSAPP_IMSS_DYNAMIC_FLOW_ENABLED")
+)
+if _wa_imss_dynamic_flow_flag_invalid:
+    log.warning("⚠️ WHATSAPP_IMSS_DYNAMIC_FLOW_ENABLED valor no reconocido; usando false")
+# Flow ID real de Meta -- vacio hasta que se cree y publique el Flow. Con el
+# flag en true pero esto vacio, send_imss_dynamic_flow() falla de forma
+# segura y route() cae al funnel IMSS legacy.
+WHATSAPP_IMSS_FLOW_ID = os.getenv("WHATSAPP_IMSS_FLOW_ID", "").strip()
+# Llave privada RSA (PEM) para descifrar las solicitudes del endpoint del
+# Flow. NUNCA se commitea -- vive solo como variable de entorno en Render.
+# Sin ella, el endpoint /ext/flow/imss no puede procesar nada y responde 421
+# a cualquier solicitud real de Meta (ver _flow_imss_endpoint).
+IMSS_FLOW_PRIVATE_KEY = os.getenv("IMSS_FLOW_PRIVATE_KEY", "").strip()
+# TTL de correlacion flow_token -> telefono / dedupe de pasos ya procesados.
+# 1h alcanza de sobra para completar un formulario de 4 pantallas.
+_IMSS_FLOW_TOKEN_TTL = 60 * 60
 
 _BOARDROOM_ALLOWED_INSTRUCTIONS = {
     "send_message",
@@ -1099,11 +1190,20 @@ def _notify_boardroom_document(phone: str, media_id: str, doc_type: str) -> None
         log.error("boardroom_doc_notify_failed: phone=%s error=%s", phone, e)
 
 
-def _notify_boardroom_lead_qualified(phone: str, product_code: str, data: dict) -> None:
-    """Notifica a Boardroom cuando Vicky Redes completa calificación."""
+def _notify_boardroom_lead_qualified(phone: str, product_code: str, data: dict) -> bool:
+    """Notifica a Boardroom cuando Vicky Redes completa calificación.
+
+    Devuelve True SOLO si Boardroom confirmó la recepción (2xx). Sin
+    configurar, con excepción o con HTTP no exitoso devuelve False. El
+    comportamiento observable (envío, logs, absorción de excepciones) es
+    idéntico al de antes: los call-sites del funnel de texto siguen
+    ignorando el retorno sin cambio alguno. El valor existe porque el Flow
+    dinámico necesita saber si el efecto realmente ocurrió antes de marcarlo
+    como no-repetible (una notificación fallida marcada como hecha se
+    perdería para siempre en el reintento)."""
     if not BOARDROOM_URL or not BOARDROOM_API_TOKEN:
         log.warning("boardroom_not_configured: lead no notificado")
-        return
+        return False
     try:
         from uuid import uuid4
         resp = requests.post(
@@ -1141,8 +1241,10 @@ def _notify_boardroom_lead_qualified(phone: str, product_code: str, data: dict) 
         )
         log.info("boardroom_lead_notified: phone=%s product=%s status=%s",
                  phone, product_code, resp.status_code)
+        return 200 <= resp.status_code < 300
     except Exception as e:
         log.error("boardroom_lead_notify_failed: phone=%s error=%s", phone, e)
+        return False
 
 # ── Utilidades ────────────────────────────────────────────────────────────────
 def norm(text: str) -> str:
@@ -1636,6 +1738,17 @@ def detect_svc(text: str) -> str | None:
 # ── Enrutamiento a servicio ───────────────────────────────────────────────────
 def route(phone: str, svc: str) -> None:
     if svc == "imss":
+        # Flow dinamico real: si esta activo, se intenta primero. Solo un
+        # desenlace LIMPIO (nada salio hacia Meta, o Meta lo rechazo) cae al
+        # funnel de texto legacy de abajo, como si el flag estuviera apagado.
+        if WHATSAPP_IMSS_DYNAMIC_FLOW_ENABLED:
+            estado_flow = send_imss_dynamic_flow(phone)
+            if estado_flow == IMSS_FLOW_ENVIADO:
+                return
+            if estado_flow == IMSS_FLOW_AMBIGUO:
+                log.warning("imss_flow_entrega_ambigua: se omite fallback legacy phone_last4=%s",
+                            _digits(phone)[-4:])
+                return
         user_state[phone] = "imss_open"
         user_data.setdefault(phone, {})
         funnel_imss(phone, "")
@@ -2321,6 +2434,223 @@ def _imss_send_si_no(phone: str, body_text: str) -> bool:
     if send_interactive_buttons(phone, body_text, [("si", "Sí"), ("no", "No")]):
         return True
     return send_msg(phone, body_text)
+
+
+# ── Handlers de negocio del Flow dinamico IMSS (endpoint /ext/flow/imss) ──────
+# Cada handler recibe (phone, data_del_paso, flow_token) y devuelve el dict de
+# respuesta YA CONSTRUIDO (imss_flow.build_next_screen_response/
+# build_success_response), SIN cifrar -- el cifrado ocurre una sola vez, en el
+# route de Flask. Ninguno de estos handlers calcula la propuesta: siempre
+# delegan a calcular_propuesta_imss(), la misma funcion que usa el funnel de
+# texto.
+#
+# IDEMPOTENCIA: Meta puede reintentar cualquier data_exchange (timeout de su
+# lado, doble tap). Las mutaciones de user_data/user_state son idempotentes
+# por naturaleza (escriben el mismo valor), pero los mensajes salientes NO lo
+# son. Por eso TODA notificacion al asesor pasa por _imss_flow_notify_once(),
+# no solo la del paso final.
+def _imss_flow_marcar(clave: str) -> bool:
+    """Marca una clave de control del Flow y REPORTA si el store la acepto.
+
+    Existe para que ningun guardrail vuelva a ignorar el bool de aux_set():
+    ese descuido ya produjo dos defectos reales en este mismo modulo. Aqui el
+    efecto asociado (notificar, dar de alta, cerrar) YA ocurrio y no se puede
+    deshacer, asi que un write fallido no se puede "arreglar" -- pero si se
+    deja registrado con un motivo propio, para que un reintento duplicado en
+    produccion sea diagnosticable en vez de inexplicable. La deduplicacion es
+    best-effort mientras el store este caido; el log lo dice explicitamente."""
+    if _state_store.aux_set(clave, "1", _IMSS_FLOW_TOKEN_TTL):
+        return True
+    log.error("imss_flow_marca_no_persistida clave=%s "
+              "(dedupe degradado: un reintento de Meta podria duplicar este efecto)",
+              clave.rsplit(":", 1)[-1])
+    return False
+
+
+def _imss_flow_notify_once(dedupe_key: str, message: str) -> bool:
+    """notify_advisor() deduplicado por clave. Solo marca la clave si el
+    envio tuvo exito: si fallo, un reintento posterior de Meta si debe volver
+    a intentarlo. Devuelve True si el asesor ya tiene el dato (ahora o
+    porque ya se le habia notificado antes)."""
+    if _state_store.aux_get(dedupe_key):
+        return True
+    ok = notify_advisor(message)
+    if ok:
+        _imss_flow_marcar(dedupe_key)
+    return ok
+
+
+def _imss_flow_handle_profile(phone: str, step_data: dict, flow_token: str) -> dict:
+    profile = imss_flow.validate_profile(step_data.get("profile"))
+    if profile is None:
+        return imss_flow.build_next_screen_response(
+            imss_flow.SCREEN_PROFILE, {}, error_message="Selecciona una opción válida.")
+
+    data = _ensure_user(phone)
+    data.setdefault("origen", "whatsapp_flow_IMSS_dinamico")
+
+    if profile == "3":
+        _imss_flow_notify_once(
+            f"imss_flow_notif:{flow_token}:perfil3",
+            f"📣 INTERÉS FUTURO – IMSS (por pensionarse)\nWhatsApp: {phone}")
+        user_data[phone] = data
+        user_state[phone] = "imss_q_ley73"
+        return imss_flow.build_next_screen_response(imss_flow.SCREEN_REJECTED, {})
+
+    data["relacion"] = "familiar" if profile == "4" else "titular"
+    if profile in ("1", "2"):
+        data["ley73_estatus"] = "pensionado_ley73" if profile == "1" else "pensionado_sin_confirmar_ley73"
+    user_data[phone] = data
+    user_state[phone] = "imss_q_pension_calc"
+    return imss_flow.build_next_screen_response(imss_flow.SCREEN_PENSION, {"profile": profile})
+
+
+def _imss_flow_handle_pension(phone: str, step_data: dict, flow_token: str) -> dict:
+    pension = imss_flow.validate_pension(step_data.get("pension"))
+    if pension is None:
+        return imss_flow.build_next_screen_response(
+            imss_flow.SCREEN_PENSION,
+            {"profile": step_data.get("profile", "")},
+            error_message="Indica tu pensión mensual, por ejemplo: 12000.",
+        )
+
+    propuesta = calcular_propuesta_imss(pension)
+    data = _ensure_user(phone)
+    data["pension"] = pension
+
+    if propuesta["monto"] < IMSS_MONTO_MINIMO:
+        user_data[phone] = data
+        return imss_flow.build_next_screen_response(
+            imss_flow.SCREEN_PENSION,
+            {"profile": step_data.get("profile", "")},
+            error_message="Con esa pensión, el monto estimado queda por debajo de nuestro "
+                           "mínimo de $40,000. Verifica la cifra o escribe otra.",
+        )
+
+    data["propuesta_monto"] = propuesta["monto"]
+    data["propuesta_cuota"] = propuesta["cuota"]
+    data["propuesta_plazo"] = propuesta["plazo"]
+    data["propuesta_total"] = propuesta["total"]
+    _imss_set_propuesta_activa(data, propuesta["monto"], propuesta["cuota"],
+                               propuesta["plazo"], "propuesta_inicial")
+    data["vrim_preeligible"] = True
+    data["vrim_eligibility_basis"] = "propuesta_monto"
+    user_data[phone] = data
+    user_state[phone] = "imss_q_revision"
+
+    # Misma alerta temprana que ya existe en el funnel de texto
+    # (imss_q_pension_calc): el asesor se entera del lead calificado aunque
+    # el prospecto abandone el Flow antes de la pantalla de contacto.
+    #
+    # La clave de dedupe incluye la pension: un reintento de Meta con la
+    # MISMA cifra no debe volver a notificar, pero si el prospecto regresa a
+    # la pantalla de pension y escribe otra cantidad (routing_model permite
+    # IMSS_HANDOFF -> IMSS_PENSION), esa si es una propuesta distinta y el
+    # asesor tiene que enterarse.
+    _imss_flow_notify_once(
+        f"imss_flow_notif:{flow_token}:pension:{pension:.0f}",
+        "📊 PROPUESTA CALCULADA – IMSS Ley 73 (pendiente de confirmar, Flow dinámico)\n"
+        f"WhatsApp: {phone}\n"
+        f"Pensión: ${pension:,.0f}\n"
+        f"Propuesta: ${propuesta['monto']:,.0f} / ${propuesta['cuota']:,.0f} al mes / "
+        f"{propuesta['plazo']} meses\n"
+        "Aún no confirma contacto — puede requerir seguimiento si abandona el Flow."
+    )
+
+    vrim_teaser = (
+        f"🎁 Si tu propuesta es de ${IMSS_MONTO_MINIMO:,.0f} o más, te enviaremos por "
+        "WhatsApp información de VRIM Plus. 12 meses sin costo."
+    )
+    return imss_flow.build_next_screen_response(imss_flow.SCREEN_PROPOSAL, {
+        "profile": step_data.get("profile", ""),
+        "pension": str(pension),
+        "monto": f"${propuesta['monto']:,.0f}",
+        "pago": f"${propuesta['cuota']:,.0f}",
+        "plazo": f"{propuesta['plazo']} meses",
+        "tasa": f"{IMSS_TASA_ANUAL_SIN_IVA:.2f}%",
+        "cat": f"{IMSS_CAT_SIN_IVA:.1f}%",
+        "vrim_teaser": vrim_teaser,
+    })
+
+
+def _imss_flow_handle_handoff(phone: str, step_data: dict, flow_token: str) -> dict:
+    nombre = imss_flow.validate_nonempty_text(step_data.get("nombre"), max_len=100)
+    ciudad = imss_flow.validate_nonempty_text(step_data.get("ciudad"), max_len=100)
+    if not nombre or not ciudad:
+        return imss_flow.build_next_screen_response(
+            imss_flow.SCREEN_HANDOFF,
+            {k: step_data.get(k, "") for k in ("profile", "pension", "monto", "pago", "plazo")},
+            error_message="Indica tu nombre completo y tu ciudad para continuar.",
+        )
+
+    # Idempotencia del paso final. La clave se escribe al TERMINAR, no al
+    # empezar: marcarla antes significaria "empece a procesar", no "termine",
+    # y un reintento tras un fallo a mitad de camino devolveria "duplicado"
+    # dejando al prospecto sin el mensaje de cierre que nunca recibio.
+    completado_key = f"imss_flow_handoff_completado:{flow_token}"
+    if _state_store.aux_get(completado_key):
+        return imss_flow.build_success_response(flow_token, {"resultado": "duplicado"})
+
+    data = _ensure_user(phone)
+    data["nombre"] = nombre
+    data["ciudad"] = ciudad
+    data["desea_revision"] = "Sí"
+    # Mismo patrón que imss_q_ciudad_calc: las etiquetas se calculan UNA sola
+    # vez aquí y se persisten, para que la respuesta 1/2/3 posterior se
+    # resuelva contra lo que el cliente realmente vio, no contra un horario
+    # recalculado en el momento de responder.
+    data["imss_horarios_ofrecidos"] = _imss_build_horario_opciones()
+    user_data[phone] = data
+
+    # Mismo orden que imss_q_ciudad_calc: primero el cierre + pregunta de
+    # horario (reutilizado tal cual), despues la notificacion al asesor.
+    # El cierre es el efecto que decide si el prospecto queda o no colgado:
+    # sin el, queda en imss_q_horario_calc esperando una pregunta que nunca
+    # vio. Por eso su resultado gobierna si el paso se marca completado.
+    cierre_entregado = send_msg(phone, _imss_build_closing_statement(data))
+    if data.get("vrim_preeligible") and not data.get("vrim_offered"):
+        if send_msg(phone, _IMSS_VRIM_PROMO_MESSAGE):
+            data["vrim_offered"] = True
+            data["vrim_offer_timestamp"] = datetime.now(timezone.utc).isoformat()
+            user_data[phone] = data
+
+    # Notificacion y alta en Boardroom con dedupe propio: si el cierre fallo
+    # y Meta reintenta, el prospecto vuelve a recibir el mensaje pero el
+    # asesor NO recibe la ficha dos veces.
+    advisor_notify_ok = _imss_flow_notify_once(
+        f"imss_flow_notif:{flow_token}:handoff",
+        _imss_build_advisor_notification(phone, data))
+    data["advisor_notify_ok"] = advisor_notify_ok
+    user_data[phone] = data
+    if not advisor_notify_ok:
+        _imss_log_lead_backup(phone, data)
+
+    # Solo se marca tras un alta CONFIRMADA por Boardroom. _notify_boardroom_
+    # lead_qualified() absorbe sus propios errores, asi que marcar por el
+    # simple hecho de haberlo intentado perderia el lead para siempre: el
+    # reintento de Meta veria la clave puesta y no volveria a intentarlo.
+    boardroom_key = f"imss_flow_boardroom:{flow_token}"
+    if not _state_store.aux_get(boardroom_key):
+        if _notify_boardroom_lead_qualified(phone, "prestamo_imss_ley73", _ensure_user(phone)):
+            _imss_flow_marcar(boardroom_key)
+
+    user_state[phone] = "imss_q_horario_calc"
+
+    if not cierre_entregado:
+        # No se marca completado: el prospecto no recibio el cierre. Si Meta
+        # reintenta, se vuelve a intentar entregarlo (asesor y Boardroom ya
+        # estan protegidos por sus propias claves de dedupe).
+        log.error("imss_flow_cierre_no_entregado phone_last4=%s", _digits(phone)[-4:])
+        _imss_log_lead_backup(phone, data, resultado="cierre_send_failed")
+    else:
+        _imss_flow_marcar(completado_key)
+
+    return imss_flow.build_success_response(flow_token, {"resultado": "calificado"})
+
+
+def _imss_flow_handle_rejected_ack(phone: str, flow_token: str) -> dict:
+    _imss_close(phone)
+    return imss_flow.build_success_response(flow_token, {"resultado": "no_calificado"})
 
 
 # ── Flujo IMSS ────────────────────────────────────────────────────────────────
@@ -3819,6 +4149,66 @@ def webhook():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "sheets": _srdy}), 200
+
+
+@app.route("/ext/flow/imss", methods=["POST"])
+def imss_dynamic_flow():
+    """Endpoint cifrado del Flow dinámico de IMSS (data_exchange). Contrato
+    verificado contra la guía oficial de Meta "Implementar puntos finales
+    para flujos": firma X-Hub-Signature-256 (mismo mecanismo que /webhook),
+    HTTP 421 si no se puede descifrar, respuesta cifrada como text/plain."""
+    raw = request.get_data()
+    if not _verify_sig(raw, request.headers.get("X-Hub-Signature-256", "")):
+        return jsonify({"error": "unauthorized"}), 403
+
+    if not IMSS_FLOW_PRIVATE_KEY:
+        log.error("❌ IMSS_FLOW_PRIVATE_KEY no configurado. Flow dinámico IMSS bloqueado.")
+        return jsonify({"error": "not_configured"}), 503
+
+    body = request.get_json(silent=True) or {}
+    try:
+        payload, aes_key, iv = imss_flow.decrypt_request(
+            body.get("encrypted_flow_data", ""),
+            body.get("encrypted_aes_key", ""),
+            body.get("initial_vector", ""),
+            IMSS_FLOW_PRIVATE_KEY,
+        )
+    except imss_flow.FlowDecryptionError:
+        log.exception("❌ Flow IMSS: fallo al descifrar solicitud")
+        return "", 421
+
+    req = imss_flow.parse_decrypted_request(payload)
+    action = req["action"]
+    screen = req["screen"]
+    flow_token = req["flow_token"]
+    step_data = req["data"]
+
+    if action == "ping":
+        response = imss_flow.build_health_check_response()
+    elif action == "error":
+        log.warning("⚠️ Flow IMSS: error notificado por el cliente: %s", step_data)
+        response = imss_flow.build_error_ack_response()
+    else:
+        phone = _state_store.aux_get(f"imss_flow_token:{flow_token}") or ""
+        if not phone:
+            log.warning("⚠️ Flow IMSS: flow_token sin teléfono correlacionado (expiró o es inválido)")
+            response = imss_flow.build_next_screen_response(
+                imss_flow.SCREEN_PROFILE, {},
+                error_message="Tu sesión expiró. Vuelve a intentar desde WhatsApp.")
+        elif screen == imss_flow.SCREEN_PROFILE:
+            response = _imss_flow_handle_profile(phone, step_data, flow_token)
+        elif screen == imss_flow.SCREEN_PENSION:
+            response = _imss_flow_handle_pension(phone, step_data, flow_token)
+        elif screen == imss_flow.SCREEN_HANDOFF:
+            response = _imss_flow_handle_handoff(phone, step_data, flow_token)
+        elif screen == imss_flow.SCREEN_REJECTED:
+            response = _imss_flow_handle_rejected_ack(phone, flow_token)
+        else:
+            log.warning("⚠️ Flow IMSS: pantalla desconocida %r (action=%s)", screen, action)
+            response = imss_flow.build_error_ack_response()
+
+    encrypted = imss_flow.encrypt_response(response, aes_key, iv)
+    return encrypted, 200, {"Content-Type": "text/plain"}
 
 
 @app.route("/ext/boardroom/instruct", methods=["POST"])

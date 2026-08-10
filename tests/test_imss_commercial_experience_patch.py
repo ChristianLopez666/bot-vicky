@@ -997,7 +997,10 @@ def test_closing_includes_vrim_when_preeligible():
 def test_closing_statement_is_the_only_deterministic_source():
     src = inspect.getsource(vicky_app)
     assert src.count("def _imss_build_closing_statement") == 1
-    assert src.count("_imss_build_closing_statement(") == 2  # definicion + unica llamada
+    # definicion + funnel de texto (imss_q_ciudad_calc) + handoff del Flow
+    # dinamico (_imss_flow_handle_handoff): dos llamadas legitimas a LA MISMA
+    # funcion compartida, no una reimplementacion del cierre.
+    assert src.count("_imss_build_closing_statement(") == 3
     # No queda rastro del cierre anterior.
     assert "la propuesta estimada queda en" not in src
     assert "beneficio vinculado de la membresía" not in src
