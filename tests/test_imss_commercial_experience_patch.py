@@ -1136,13 +1136,15 @@ def test_user_data_survives_the_close(monkeypatch):
     assert data["cierre_tipo"] == "revision_aceptada"
 
 
-def test_advisor_notification_age_warning_is_scoped(monkeypatch):
+def test_advisor_notification_omits_vrim_membership_details(monkeypatch):
+    # VRIM (preelegibilidad, oferta, interes, aviso de edad) se retiro de la
+    # alerta al asesor: es informacion de la membresia, no del prestamo.
     sent, advisor_msgs, _, _ = _to_proposal(monkeypatch)
     _accept_and_close()
     aviso = advisor_msgs[-1]
-    assert ("⚠️ Verificar edad: las coberturas de reembolso de gastos médicos por "
-            "accidente y servicio funerario aplican hasta los 70 años.") in aviso
-    assert "VRIM Plus limita" not in aviso
+    for campo in ("Verificar edad", "VRIM preelegible", "Base de elegibilidad VRIM",
+                  "Promoción VRIM presentada", "Interés del cliente en VRIM"):
+        assert campo not in aviso, campo
 
 
 def test_advisor_notification_keeps_required_fields(monkeypatch):
@@ -1153,8 +1155,6 @@ def test_advisor_notification_keeps_required_fields(monkeypatch):
     for campo in ("Nombre: Juan Perez", "WhatsApp: ", "Ciudad: Los Mochis",
                   "Pensión mensual: ", "Monto estimado: ", "Monto solicitado por cliente: ",
                   "Cuota estimada: ", "Plazo: ", "Origen de la propuesta activa: ",
-                  "Base de elegibilidad VRIM: ", "VRIM preelegible: Sí",
-                  "Promoción VRIM presentada: Sí", "Interés del cliente en VRIM: ",
                   "Estado del funnel: "):
         assert campo in aviso, campo
 

@@ -402,14 +402,13 @@ def test_advisor_notification_contains_pending_validation(monkeypatch):
     assert "Requiere revisión manual" in advisor_msgs[-1]
 
 
-def test_advisor_notification_contains_vrim_and_age_warning(monkeypatch):
+def test_advisor_notification_omits_vrim_and_age_warning(monkeypatch):
     sent, advisor_msgs, _ = _run_full_imss_flow(monkeypatch, with_horario=False)
     msg = advisor_msgs[-1]
-    assert "VRIM preelegible: Sí" in msg
-    assert "Promoción VRIM presentada: Sí" in msg
-    assert "Base de elegibilidad VRIM: propuesta_monto" in msg
-    assert "⚠️ Verificar edad" in msg
-    assert "70 años" in msg
+    assert "VRIM preelegible" not in msg
+    assert "Promoción VRIM presentada" not in msg
+    assert "Base de elegibilidad VRIM" not in msg
+    assert "Verificar edad" not in msg
 
 
 def test_advisor_notify_ok_captured_on_success(monkeypatch):
