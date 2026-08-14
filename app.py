@@ -72,6 +72,9 @@ ADV_TPL_LANG = os.getenv("ADVISOR_TEMPLATE_LANG", "es_MX").strip()
 GG_CREDS  = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
 SHEET_ID  = os.getenv("SHEETS_ID_CONVERSACIONES", "").strip()
 SHEET_TAB = os.getenv("SHEETS_TAB_CONVERSACIONES", "Conversaciones").strip()
+# Reporte compacto de leads: mismo spreadsheet, pestana aparte. Una fila por
+# telefono (upsert), no una fila por mensaje -- ver _report_upsert_lead().
+SHEET_TAB_REPORTE = os.getenv("SHEETS_TAB_REPORTE_LEADS", "Reporte Leads").strip()
 
 
 STATE_TTL = 24 * 60 * 60
@@ -389,6 +392,29 @@ _svc = None
 _srdy = False
 _HDR = ["Phone", "Nombre", "Mensaje", "Fecha", "Tipo", "Origen",
         "Servicio", "Estado", "Resultado", "Error", "MsgID"]
+_HDR_REPORTE = ["Telefono", "Nombre", "Ciudad", "Producto", "Pension",
+                "Monto", "Cuota", "Plazo", "Estado", "Fecha inicio",
+                "Ultima actualizacion"]
+
+def _sheets_ensure_tab(title: str, header: list) -> None:
+    """Crea la pestana si no existe (via batchUpdate addSheet) y escribe el
+    header si la fila 1 esta vacia. No falla el arranque si algo sale mal --
+    mismo criterio que el resto de _sheets_init()."""
+    meta = _svc.spreadsheets().get(
+        spreadsheetId=SHEET_ID, fields="sheets.properties.title").execute()
+    existentes = {s["properties"]["title"] for s in meta.get("sheets", [])}
+    if title not in existentes:
+        _svc.spreadsheets().batchUpdate(
+            spreadsheetId=SHEET_ID,
+            body={"requests": [{"addSheet": {"properties": {"title": title}}}]}
+        ).execute()
+    last_col = chr(ord("A") + len(header) - 1)
+    r = _svc.spreadsheets().values().get(
+        spreadsheetId=SHEET_ID, range=f"{title}!A1:{last_col}1").execute()
+    if not r.get("values"):
+        _svc.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID, range=f"{title}!A1:{last_col}1",
+            valueInputOption="RAW", body={"values": [header]}).execute()
 
 def _sheets_init():
     global _svc, _srdy
@@ -400,12 +426,13 @@ def _sheets_init():
             scopes=["https://www.googleapis.com/auth/spreadsheets"])
         _svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
         _srdy = True
-        r = _svc.spreadsheets().values().get(
-            spreadsheetId=SHEET_ID, range=f"{SHEET_TAB}!A1:K1").execute()
-        if not r.get("values"):
-            _svc.spreadsheets().values().update(
-                spreadsheetId=SHEET_ID, range=f"{SHEET_TAB}!A1:K1",
-                valueInputOption="RAW", body={"values": [_HDR]}).execute()
+        _sheets_ensure_tab(SHEET_TAB, _HDR)
+        try:
+            _sheets_ensure_tab(SHEET_TAB_REPORTE, _HDR_REPORTE)
+        except Exception:
+            # El reporte de leads es un extra sobre el log crudo -- si falla
+            # su inicializacion, _log() debe seguir funcionando igual.
+            log.exception("❌ Error inicializando pestaña de reporte de leads.")
         log.info("✅ Sheets inicializado.")
     except Exception:
         log.exception("❌ Error inicializando Sheets.")
@@ -439,6 +466,62 @@ def _log(phone, nombre, msg, tipo, origen, resultado="", error="", mid=""):
             ]]}).execute()
     except Exception:
         log.exception("❌ Error en Sheets")
+
+
+def _report_upsert_lead(phone: str, **campos) -> None:
+    """Reporte compacto de leads (pestaña SHEET_TAB_REPORTE): UNA fila por
+    telefono, no una fila por mensaje como _log(). Busca el telefono en la
+    columna A; si existe actualiza esa fila (conservando lo que ya tenia y
+    sin pisar con vacio), si no, agrega una fila nueva.
+
+    Uso: _report_upsert_lead(phone, nombre=..., ciudad=..., producto=...,
+    pension=..., monto=..., cuota=..., plazo=..., estado=...)
+    Solo se pasan los campos que ya se conocen en ese punto del funnel -- los
+    que falten se completan (o se conservan) en la siguiente llamada.
+    """
+    if not _srdy:
+        return
+    ph = re.sub(r"\D", "", str(phone))
+    try:
+        existentes = _svc.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range=f"{SHEET_TAB_REPORTE}!A:K").execute().get("values", [])
+        fila_idx = None
+        actual = {}
+        for i, fila in enumerate(existentes[1:], start=2):
+            if fila and re.sub(r"\D", "", fila[0]) == ph:
+                fila_idx = i
+                fila_completa = fila + [""] * (len(_HDR_REPORTE) - len(fila))
+                actual = dict(zip(_HDR_REPORTE, fila_completa))
+                break
+
+        ahora = now_mx()
+        clave = {
+            "nombre": "Nombre", "ciudad": "Ciudad", "producto": "Producto",
+            "pension": "Pension", "monto": "Monto", "cuota": "Cuota",
+            "plazo": "Plazo", "estado": "Estado",
+        }
+        fusion = dict(actual)
+        fusion["Telefono"] = ph
+        for k, v in campos.items():
+            col = clave.get(k)
+            if col and v not in (None, ""):
+                fusion[col] = v
+        fusion["Fecha inicio"] = actual.get("Fecha inicio") or ahora
+        fusion["Ultima actualizacion"] = ahora
+
+        fila_valores = [str(fusion.get(h, "")) for h in _HDR_REPORTE]
+        if fila_idx:
+            _svc.spreadsheets().values().update(
+                spreadsheetId=SHEET_ID,
+                range=f"{SHEET_TAB_REPORTE}!A{fila_idx}:K{fila_idx}",
+                valueInputOption="RAW", body={"values": [fila_valores]}).execute()
+        else:
+            _svc.spreadsheets().values().append(
+                spreadsheetId=SHEET_ID, range=f"{SHEET_TAB_REPORTE}!A:K",
+                valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+                body={"values": [fila_valores]}).execute()
+    except Exception:
+        log.exception("❌ Error en reporte de leads")
 
 # ── WhatsApp helpers ──────────────────────────────────────────────────────────
 _WA_BASE = "https://graph.facebook.com/v20.0"
@@ -2321,20 +2404,34 @@ def _imss_build_advisor_notification(phone: str, data: dict) -> str:
         lines.append(f"Propuesta inicial (referencia): ${data['propuesta_monto']:,.0f} "
                      f"a {data.get('propuesta_plazo', IMSS_PLAZO_MESES)} meses")
 
-    basis = data.get("vrim_eligibility_basis")
-    if basis:
-        lines.append(f"Base de elegibilidad VRIM: {basis}")
-    lines.append(f"VRIM preelegible: {'Sí' if data.get('vrim_preeligible') else 'No'}")
-    lines.append(f"Promoción VRIM presentada: {'Sí' if data.get('vrim_offered') else 'No'}")
-    lines.append(f"Interés del cliente en VRIM: {data.get('vrim_interest', 'sin_respuesta')}")
-    lines.append("⚠️ Verificar edad: las coberturas de reembolso de gastos médicos "
-                 "por accidente y servicio funerario aplican hasta los 70 años.")
+    # VRIM (preelegibilidad, oferta, interes, aviso de edad) se retiro de esta
+    # alerta a peticion de Christian: es informacion de la membresia, no del
+    # prestamo, y el asesor solo necesita los datos para llamar al prospecto.
+    # Sigue viviendo en `data` (Sheets/reporte de leads la puede seguir usando).
     lines.append(f"Estado del funnel: {user_state.get(phone, 'ND')}")
     lines.append("")
     lines.append("Resumen: Cliente solicitó cálculo de préstamo IMSS. Vicky generó una "
                  "propuesta estimada usando la calculadora existente. Requiere revisión "
                  "manual antes de prometer condiciones. Recomendación: llamar.")
     return "\n".join(lines)
+
+
+def _imss_report_lead_qualified(phone: str, data: dict) -> None:
+    """Actualiza el reporte compacto de leads en el momento de calificacion
+    (nombre + ciudad ya capturados). Usa la propuesta ACTIVA, igual que la
+    alerta de WhatsApp al asesor, para que ambos coincidan."""
+    monto_activo, cuota_activa, plazo_activo = _imss_get_propuesta_activa(data)
+    _report_upsert_lead(
+        phone,
+        nombre=data.get("nombre", ""),
+        ciudad=data.get("ciudad", ""),
+        producto="IMSS pensionados",
+        pension=(f"${data['pension']:,.0f}" if data.get("pension") else ""),
+        monto=(f"${monto_activo:,.0f}" if monto_activo else ""),
+        cuota=(f"${cuota_activa:,.0f}" if cuota_activa else ""),
+        plazo=(f"{plazo_activo} meses" if plazo_activo else ""),
+        estado="Calificado — pendiente de llamar",
+    )
 
 
 def _imss_backup_num(v) -> str:
@@ -2556,6 +2653,10 @@ def _imss_flow_handle_pension(phone: str, step_data: dict, flow_token: str) -> d
         f"{propuesta['plazo']} meses\n"
         "Aún no confirma contacto — puede requerir seguimiento si abandona el Flow."
     )
+    _report_upsert_lead(
+        phone, producto="IMSS pensionados", pension=f"${pension:,.0f}",
+        monto=f"${propuesta['monto']:,.0f}", cuota=f"${propuesta['cuota']:,.0f}",
+        plazo=f"{propuesta['plazo']} meses", estado="Propuesta calculada")
 
     vrim_teaser = (
         f"🎁 Si tu propuesta es de ${IMSS_MONTO_MINIMO:,.0f} o más, te enviaremos por "
@@ -2624,6 +2725,7 @@ def _imss_flow_handle_handoff(phone: str, step_data: dict, flow_token: str) -> d
     user_data[phone] = data
     if not advisor_notify_ok:
         _imss_log_lead_backup(phone, data)
+    _imss_report_lead_qualified(phone, data)
 
     # Solo se marca tras un alta CONFIRMADA por Boardroom. _notify_boardroom_
     # lead_qualified() absorbe sus propios errores, asi que marcar por el
@@ -2829,6 +2931,10 @@ def funnel_imss(phone: str, msg: str) -> None:
             f"{propuesta['plazo']} meses\n"
             "Aún no confirma revisión — puede requerir seguimiento si no responde."
         )
+        _report_upsert_lead(
+            phone, producto="IMSS pensionados", pension=f"${m:,.0f}",
+            monto=f"${propuesta['monto']:,.0f}", cuota=f"${propuesta['cuota']:,.0f}",
+            plazo=f"{propuesta['plazo']} meses", estado="Propuesta calculada")
 
         # Solo condiciones SIN IVA en este mensaje (nunca IMSS_CAT, que es el
         # criterio con IVA de uso interno). Ambas cifras salen de las
@@ -3137,6 +3243,7 @@ def funnel_imss(phone: str, msg: str) -> None:
         user_data[phone] = data
         if not advisor_notify_ok:
             _imss_log_lead_backup(phone, data)
+        _imss_report_lead_qualified(phone, data)
         _notify_boardroom_lead_qualified(phone, "prestamo_imss_ley73", _ensure_user(phone))
 
         user_state[phone] = "imss_q_horario_calc"
