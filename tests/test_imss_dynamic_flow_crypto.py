@@ -14,6 +14,7 @@ cifrado ocurre en el proceso de test.
 """
 
 import json
+import re
 import os
 import sys
 from base64 import b64decode, b64encode
@@ -298,29 +299,63 @@ def test_flow_json_pantallas_terminales_son_handoff_y_rejected():
     assert terminales == {imss_flow.SCREEN_HANDOFF, imss_flow.SCREEN_REJECTED}
 
 
-def test_flow_json_footers_con_data_exchange_no_llevan_next_estatico():
+def _componentes(screen):
+    """Recorre TODO el arbol de la pantalla, no solo los hijos de Form.
+
+    Las versiones anteriores de estas pruebas solo miraban dentro de Form y se
+    volvieron ciegas al meter NavigationList, que vive fuera. Un chequeo que
+    solo cubre parte del arbol se ve igual de verde que uno que cubre todo.
+    """
+    pendientes = [screen["layout"]]
+    while pendientes:
+        nodo = pendientes.pop()
+        if isinstance(nodo, dict):
+            if "type" in nodo:
+                yield nodo
+            pendientes.extend(nodo.values())
+        elif isinstance(nodo, list):
+            pendientes.extend(nodo)
+
+
+def _acciones(screen):
+    for comp in _componentes(screen):
+        accion = comp.get("on-click-action")
+        if isinstance(accion, dict):
+            yield accion
+
+
+def test_flow_json_data_exchange_no_lleva_next_estatico():
     """data_exchange deja que el ENDPOINT decida la siguiente pantalla -- un
     'next' estatico ahi seria ignorado y confunde la intencion del diseno."""
     for screen in imss_flow.IMSS_FLOW_JSON["screens"]:
-        for child in screen["layout"]["children"]:
-            if child.get("type") != "Form":
-                continue
-            for form_child in child["children"]:
-                action = form_child.get("on-click-action")
-                if action and action.get("name") == "data_exchange":
-                    assert "next" not in action
+        for accion in _acciones(screen):
+            if accion.get("name") == "data_exchange":
+                assert "next" not in accion
 
 
 def test_flow_json_navigate_actions_apuntan_a_screens_validos():
     valid_ids = {s["id"] for s in imss_flow.IMSS_FLOW_JSON["screens"]}
     for screen in imss_flow.IMSS_FLOW_JSON["screens"]:
-        for child in screen["layout"]["children"]:
-            if child.get("type") != "Form":
-                continue
-            for form_child in child["children"]:
-                action = form_child.get("on-click-action")
-                if action and action.get("name") == "navigate":
-                    assert action["next"]["name"] in valid_ids
+        for accion in _acciones(screen):
+            if accion.get("name") == "navigate":
+                assert accion["next"]["name"] in valid_ids
+
+
+def test_flow_json_referencias_dinamicas_son_cadena_completa():
+    """Flow JSON solo sustituye ${data.x} cuando ocupa TODA la cadena.
+
+    Incrustado dentro de una frase lo imprime literal: el 2026-08-18 los
+    clientes vieron "Tasa fija anual ${data.tasa} sin IVA" en la pantalla de
+    propuesta. Lo que necesite texto alrededor se arma en el backend y viaja
+    como un solo campo (ver disclaimer y vrim_teaser).
+    """
+    for screen in imss_flow.IMSS_FLOW_JSON["screens"]:
+        for comp in _componentes(screen):
+            texto = comp.get("text")
+            if isinstance(texto, str) and "${" in texto:
+                assert re.fullmatch(r"\$\{[^}]+\}", texto.strip()), (
+                    f'{screen["id"]}/{comp.get("type")}: referencia incrustada -> {texto!r}'
+                )
 
 
 def test_flow_json_no_contiene_secretos():
@@ -333,10 +368,14 @@ def test_flow_json_profile_options_coinciden_con_perfiles_validos():
     profile_screen = next(
         s for s in imss_flow.IMSS_FLOW_JSON["screens"] if s["id"] == imss_flow.SCREEN_PROFILE
     )
-    form = profile_screen["layout"]["children"][1]
-    radio = next(c for c in form["children"] if c["type"] == "RadioButtonsGroup")
-    ids = {opt["id"] for opt in radio["data-source"]}
+    lista = next(c for c in _componentes(profile_screen) if c["type"] == "NavigationList")
+    ids = {item["id"] for item in lista["list-items"]}
     assert ids == imss_flow.VALID_PROFILES
+    # Cada renglon avanza por si solo: sin boton de confirmar, y llevando su
+    # propio perfil. Si alguien lo cambia a payload dinamico, todos mandarian
+    # lo mismo y el enrutamiento del endpoint se rompe en silencio.
+    for item in lista["list-items"]:
+        assert item["on-click-action"]["payload"] == {"profile": item["id"]}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -358,6 +397,20 @@ def test_build_flow_message_payload_forma_verificada():
     # con "(#131009) Parameter value is not valid". El campo es opcional y
     # solo debe viajar si lleva contenido real.
     assert "data" not in params["flow_action_payload"]
+
+
+def test_build_flow_message_payload_respeta_limites_de_whatsapp():
+    """Limites de la tarjeta interactiva. El del boton es el que muerde: 20
+    caracteres. Un texto mas largo lo rechaza Meta al enviar, o sea que se
+    descubre en produccion y no en pruebas."""
+    payload = imss_flow.build_flow_message_payload(
+        "6681234567", "123456789", imss_flow.generate_flow_token())
+    interactive = payload["interactive"]
+    cta = interactive["action"]["parameters"]["flow_cta"]
+    assert len(cta) <= 20, f"flow_cta de {len(cta)} caracteres: {cta!r}"
+    assert len(interactive["header"]["text"]) <= 60
+    assert len(interactive["footer"]["text"]) <= 60
+    assert len(interactive["body"]["text"]) <= 1024
 
 
 def test_build_flow_message_payload_sin_flow_id_falla():

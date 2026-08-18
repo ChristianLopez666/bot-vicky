@@ -2662,26 +2662,37 @@ def _imss_flow_handle_pension(phone: str, step_data: dict, flow_token: str) -> d
         f"🎁 Si tu propuesta es de ${IMSS_MONTO_MINIMO:,.0f} o más, te enviaremos por "
         "WhatsApp información de VRIM Plus. 12 meses sin costo."
     )
+    # La nota legal se arma COMPLETA aquí, igual que vrim_teaser. Flow JSON solo
+    # sustituye ${data.x} cuando es la cadena entera: incrustado dentro de una
+    # frase lo imprime literal, y el cliente terminaba viendo "${data.tasa}" en
+    # el renglón de su tasa y su CAT (visto en produccion el 2026-08-18).
+    disclaimer = (
+        f"Tasa fija anual {IMSS_TASA_ANUAL_SIN_IVA:.2f}% sin IVA · "
+        f"CAT informativo {IMSS_CAT_SIN_IVA:.1f}% sin IVA. Sujeto a validación final."
+    )
     return imss_flow.build_next_screen_response(imss_flow.SCREEN_PROPOSAL, {
         "profile": step_data.get("profile", ""),
         "pension": str(pension),
         "monto": f"${propuesta['monto']:,.0f}",
         "pago": f"${propuesta['cuota']:,.0f}",
         "plazo": f"{propuesta['plazo']} meses",
-        "tasa": f"{IMSS_TASA_ANUAL_SIN_IVA:.2f}%",
-        "cat": f"{IMSS_CAT_SIN_IVA:.1f}%",
+        "disclaimer": disclaimer,
         "vrim_teaser": vrim_teaser,
     })
 
 
 def _imss_flow_handle_handoff(phone: str, step_data: dict, flow_token: str) -> dict:
+    # Solo se pide el nombre: teclear es lo mas dificil para el publico
+    # objetivo (pensionados) y esta es la ultima pantalla, justo donde mas caro
+    # sale perder al prospecto. La ciudad la pregunta el asesor en la
+    # conversacion; rio abajo ya se maneja como opcional (ver
+    # _imss_build_advisor_notification, que solo la imprime si viene).
     nombre = imss_flow.validate_nonempty_text(step_data.get("nombre"), max_len=100)
-    ciudad = imss_flow.validate_nonempty_text(step_data.get("ciudad"), max_len=100)
-    if not nombre or not ciudad:
+    if not nombre:
         return imss_flow.build_next_screen_response(
             imss_flow.SCREEN_HANDOFF,
             {k: step_data.get(k, "") for k in ("profile", "pension", "monto", "pago", "plazo")},
-            error_message="Indica tu nombre completo y tu ciudad para continuar.",
+            error_message="Indica tu nombre completo para continuar.",
         )
 
     # Idempotencia del paso final. La clave se escribe al TERMINAR, no al
@@ -2694,7 +2705,6 @@ def _imss_flow_handle_handoff(phone: str, step_data: dict, flow_token: str) -> d
 
     data = _ensure_user(phone)
     data["nombre"] = nombre
-    data["ciudad"] = ciudad
     data["desea_revision"] = "Sí"
     # Mismo patrón que imss_q_ciudad_calc: las etiquetas se calculan UNA sola
     # vez aquí y se persisten, para que la respuesta 1/2/3 posterior se

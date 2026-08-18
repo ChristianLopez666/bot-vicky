@@ -50,241 +50,213 @@ VALID_PROFILES = {"1", "2", "3", "4"}
 # conocen sin backend usan navigate (Meta recomienda explicitamente evitar
 # el endpoint cuando no es necesario -- IMSS_PROPOSAL -> IMSS_HANDOFF y el
 # "Cambiar monto o plazo" de vuelta a IMSS_PENSION son navigate).
-IMSS_FLOW_JSON: Dict[str, Any] = {
-    "version": FLOW_JSON_VERSION,
-    "data_api_version": DATA_API_VERSION,
-    "routing_model": {
-        SCREEN_PROFILE: [SCREEN_PENSION, SCREEN_REJECTED],
-        SCREEN_PENSION: [SCREEN_PROPOSAL],
-        SCREEN_PROPOSAL: [SCREEN_HANDOFF],
-        SCREEN_HANDOFF: [SCREEN_PENSION],
-        SCREEN_REJECTED: [],
-    },
-    "screens": [
-        {
-            "id": SCREEN_PROFILE,
-            "title": "Préstamo IMSS",
-            "data": {},
-            "layout": {
-                "type": "SingleColumnLayout",
-                "children": [
-                    {"type": "TextHeading", "text": "¿Cuál describe mejor tu situación?"},
-                    {
-                        "type": "Form",
-                        "name": "form_profile",
-                        "children": [
-                            {
-                                "type": "RadioButtonsGroup",
-                                "name": "profile",
-                                "label": "Selecciona una opción",
-                                "required": True,
-                                "data-source": [
-                                    {"id": "1", "title": "Ya recibo pensión IMSS Ley 73"},
-                                    {"id": "2", "title": "Recibo pensión, no sé si es Ley 73"},
-                                    {"id": "3", "title": "Estoy por pensionarme"},
-                                    {"id": "4", "title": "Ayudo a un familiar pensionado"},
-                                ],
-                            },
-                            {
-                                "type": "Footer",
-                                "label": "Continuar",
-                                "on-click-action": {
-                                    "name": "data_exchange",
-                                    "payload": {"profile": "${form.profile}"},
-                                },
-                            },
-                        ],
-                    },
-                ],
-            },
-        },
-        {
-            "id": SCREEN_PENSION,
-            "title": "Préstamo IMSS",
-            "data": {
-                "profile": {"type": "string", "__example__": "1"},
-            },
-            "layout": {
-                "type": "SingleColumnLayout",
-                "children": [
-                    {"type": "TextHeading", "text": "¿Cuánto recibes al mes?"},
-                    {
-                        "type": "Form",
-                        "name": "form_pension",
-                        "children": [
-                            {
-                                "type": "TextInput",
-                                "name": "pension",
-                                "label": "Pensión mensual (MXN)",
-                                "input-type": "number",
-                                "required": True,
-                                "helper-text": "Escribe solo tu pensión mensual",
-                            },
-                            {
-                                "type": "Footer",
-                                "label": "Continuar",
-                                "on-click-action": {
-                                    "name": "data_exchange",
-                                    "payload": {
-                                        "profile": "${data.profile}",
-                                        "pension": "${form.pension}",
-                                    },
-                                },
-                            },
-                        ],
-                    },
-                ],
-            },
-        },
-        {
-            "id": SCREEN_PROPOSAL,
-            "title": "Préstamo IMSS",
-            "data": {
-                "profile": {"type": "string", "__example__": "1"},
-                "pension": {"type": "string", "__example__": "12000"},
-                "monto": {"type": "string", "__example__": "$45,000"},
-                "pago": {"type": "string", "__example__": "$1,362"},
-                "plazo": {"type": "string", "__example__": "48 meses"},
-                "tasa": {"type": "string", "__example__": "22.39%"},
-                "cat": {"type": "string", "__example__": "24.8%"},
-                "vrim_teaser": {"type": "string", "__example__": ""},
-            },
-            "layout": {
-                "type": "SingleColumnLayout",
-                "children": [
-                    {"type": "TextHeading", "text": "Tu propuesta estimada"},
-                    {"type": "TextSubheading", "text": "Monto aproximado"},
-                    {"type": "TextBody", "text": "${data.monto}"},
-                    {"type": "TextSubheading", "text": "Pago mensual"},
-                    {"type": "TextBody", "text": "${data.pago}"},
-                    {"type": "TextSubheading", "text": "Plazo"},
-                    {"type": "TextBody", "text": "${data.plazo}"},
-                    {
-                        "type": "TextCaption",
-                        "text": "Tasa fija anual ${data.tasa} sin IVA · CAT informativo ${data.cat} sin IVA. Sujeto a validación final.",
-                    },
-                    {
-                        "type": "TextBody",
-                        "text": "${data.vrim_teaser}",
-                        "visible": "${data.vrim_teaser != \"\"}",
-                    },
-                    {
-                        "type": "Footer",
-                        "label": "Continuar",
-                        "on-click-action": {
-                            "name": "navigate",
-                            "next": {"type": "screen", "name": SCREEN_HANDOFF},
-                            "payload": {
-                                "profile": "${data.profile}",
-                                "pension": "${data.pension}",
-                                "monto": "${data.monto}",
-                                "pago": "${data.pago}",
-                                "plazo": "${data.plazo}",
-                            },
-                        },
-                    },
-                ],
-            },
-        },
-        {
-            "id": SCREEN_HANDOFF,
-            "title": "Préstamo IMSS",
-            "terminal": True,
-            "success": True,
-            "data": {
-                "profile": {"type": "string", "__example__": "1"},
-                "pension": {"type": "string", "__example__": "12000"},
-                "monto": {"type": "string", "__example__": "$45,000"},
-                "pago": {"type": "string", "__example__": "$1,362"},
-                "plazo": {"type": "string", "__example__": "48 meses"},
-            },
-            "layout": {
-                "type": "SingleColumnLayout",
-                "children": [
-                    {"type": "TextHeading", "text": "Tu asesor te atenderá personalmente"},
-                    {
-                        "type": "TextBody",
-                        "text": "Christian López continuará tu atención por WhatsApp. Es fácil y sin costo.",
-                    },
-                    {
-                        "type": "Form",
-                        "name": "form_handoff",
-                        "children": [
-                            {
-                                "type": "TextInput",
-                                "name": "nombre",
-                                "label": "Nombre completo",
-                                "input-type": "text",
-                                "required": True,
-                            },
-                            {
-                                "type": "TextInput",
-                                "name": "ciudad",
-                                "label": "Ciudad",
-                                "input-type": "text",
-                                "required": True,
-                            },
-                            {
-                                "type": "EmbeddedLink",
-                                "text": "Cambiar monto o plazo",
-                                "on-click-action": {
-                                    "name": "navigate",
-                                    "next": {"type": "screen", "name": SCREEN_PENSION},
-                                    "payload": {"profile": "${data.profile}"},
-                                },
-                            },
-                            {
-                                "type": "Footer",
-                                "label": "Quiero que me contacten",
-                                "on-click-action": {
-                                    "name": "data_exchange",
-                                    "payload": {
-                                        "profile": "${data.profile}",
-                                        "pension": "${data.pension}",
-                                        "monto": "${data.monto}",
-                                        "pago": "${data.pago}",
-                                        "plazo": "${data.plazo}",
-                                        "nombre": "${form.nombre}",
-                                        "ciudad": "${form.ciudad}",
-                                    },
-                                },
-                            },
-                        ],
-                    },
-                ],
-            },
-        },
-        {
-            "id": SCREEN_REJECTED,
-            "title": "Préstamo IMSS",
-            "terminal": True,
-            "success": True,
-            "data": {},
-            "layout": {
-                "type": "SingleColumnLayout",
-                "children": [
-                    {"type": "TextHeading", "text": "¡Gracias por tu interés!"},
-                    {
-                        "type": "TextBody",
-                        "text": "Para calcular una propuesta necesitamos que tu pensión ya esté activa. "
-                        "Si gustas, Christian puede contactarte cuando te pensiones.",
-                    },
-                    {
-                        "type": "Form",
-                        "name": "form_rejected",
-                        "children": [
-                            {
-                                "type": "Footer",
-                                "label": "Entendido",
-                                "on-click-action": {"name": "data_exchange", "payload": {}},
-                            },
-                        ],
-                    },
-                ],
-            },
-        },
-    ],
-}
+# Imagenes del Flow en base64. Viven aqui como constantes de modulo para que
+# IMSS_FLOW_JSON sea un espejo EXACTO de lo publicado en Meta: cualquier
+# divergencia entre este archivo y el Flow real es un bug esperando a pasar.
+# Dimensionadas al tamano de despliegue real (no a la resolucion original):
+# arriba de ~16k caracteres por linea el copy/paste al editor de Meta se corrompe.
+_IMG_LOGO_COHIFIS_B64 = "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"
+
+_IMG_ASESOR_B64 = "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"
+
+IMSS_FLOW_JSON: Dict[str, Any] = {'version': FLOW_JSON_VERSION,
+ 'data_api_version': DATA_API_VERSION,
+ 'routing_model': {'IMSS_PROFILE': ['IMSS_PENSION', 'IMSS_REJECTED'],
+                   'IMSS_PENSION': ['IMSS_PROPOSAL'],
+                   'IMSS_PROPOSAL': ['IMSS_HANDOFF'],
+                   'IMSS_HANDOFF': ['IMSS_PENSION'],
+                   'IMSS_REJECTED': []},
+ 'screens': [{'id': 'IMSS_PROFILE',
+              'title': 'Préstamo IMSS',
+              'data': {},
+              'layout': {'type': 'SingleColumnLayout',
+                         'children': [{'type': 'Image',
+                                       'src': _IMG_LOGO_COHIFIS_B64,
+                                       'width': 96,
+                                       'height': 96,
+                                       'scale-type': 'contain',
+                                       'alt-text': 'COHIFIS Finanzas Inteligentes'},
+                                      {'type': 'TextHeading',
+                                       'text': '¿Cuál describe mejor tu situación?'},
+                                      {'type': 'TextBody',
+                                       'text': 'Toca la opción que te corresponde.'},
+                                      {'type': 'NavigationList',
+                                       'name': 'nav_profile',
+                                       'list-items': [{'id': '1',
+                                                       'main-content': {'title': 'Ya '
+                                                                                 'recibo '
+                                                                                 'pensión '
+                                                                                 'IMSS '
+                                                                                 'Ley '
+                                                                                 '73',
+                                                                        'description': 'Calculo '
+                                                                                       'tu '
+                                                                                       'propuesta '
+                                                                                       'ahora'},
+                                                       'on-click-action': {'name': 'data_exchange',
+                                                                           'payload': {'profile': '1'}}},
+                                                      {'id': '2',
+                                                       'main-content': {'title': 'Pensionado, '
+                                                                                 'no '
+                                                                                 'sé '
+                                                                                 'si '
+                                                                                 'Ley '
+                                                                                 '73',
+                                                                        'description': 'Yo '
+                                                                                       'lo '
+                                                                                       'reviso '
+                                                                                       'por '
+                                                                                       'ti'},
+                                                       'on-click-action': {'name': 'data_exchange',
+                                                                           'payload': {'profile': '2'}}},
+                                                      {'id': '3',
+                                                       'main-content': {'title': 'Estoy '
+                                                                                 'por '
+                                                                                 'pensionarme',
+                                                                        'description': 'Te '
+                                                                                       'busco '
+                                                                                       'cuando '
+                                                                                       'te '
+                                                                                       'pensiones'},
+                                                       'on-click-action': {'name': 'data_exchange',
+                                                                           'payload': {'profile': '3'}}},
+                                                      {'id': '4',
+                                                       'main-content': {'title': 'Ayudo '
+                                                                                 'a un '
+                                                                                 'familiar '
+                                                                                 'pensionado',
+                                                                        'description': 'Contesta '
+                                                                                       'por '
+                                                                                       'él '
+                                                                                       'o '
+                                                                                       'ella'},
+                                                       'on-click-action': {'name': 'data_exchange',
+                                                                           'payload': {'profile': '4'}}}]}]}},
+             {'id': 'IMSS_PENSION',
+              'title': 'Préstamo IMSS',
+              'data': {'profile': {'type': 'string', '__example__': '1'}},
+              'layout': {'type': 'SingleColumnLayout',
+                         'children': [{'type': 'TextHeading',
+                                       'text': '¿Cuánto recibes al mes de pensión?'},
+                                      {'type': 'TextBody',
+                                       'text': 'Lo usamos únicamente para calcular tu '
+                                               'propuesta.'},
+                                      {'type': 'Form',
+                                       'name': 'form_pension',
+                                       'children': [{'type': 'TextInput',
+                                                     'name': 'pension',
+                                                     'label': 'Escribe tu pensión',
+                                                     'input-type': 'number',
+                                                     'required': True},
+                                                    {'type': 'Footer',
+                                                     'label': 'Continuar',
+                                                     'on-click-action': {'name': 'data_exchange',
+                                                                         'payload': {'profile': '${data.profile}',
+                                                                                     'pension': '${form.pension}'}}}]}]}},
+             {'id': 'IMSS_PROPOSAL',
+              'title': 'Préstamo IMSS',
+              'data': {'profile': {'type': 'string', '__example__': '1'},
+                       'pension': {'type': 'string', '__example__': '12000'},
+                       'monto': {'type': 'string', '__example__': '$45,000'},
+                       'pago': {'type': 'string', '__example__': '$1,362'},
+                       'plazo': {'type': 'string', '__example__': '48 meses'},
+                       'vrim_teaser': {'type': 'string',
+                                       '__example__': '🎁 Si tu propuesta es de $40,000 '
+                                                      'o más...'},
+                       'disclaimer': {'type': 'string',
+                                      '__example__': 'Tasa fija anual 22.39% sin IVA · '
+                                                     'CAT informativo 24.8% sin IVA. '
+                                                     'Sujeto a validación final.'}},
+              'layout': {'type': 'SingleColumnLayout',
+                         'children': [{'type': 'TextHeading',
+                                       'text': 'Tu propuesta estimada'},
+                                      {'type': 'TextCaption',
+                                       'text': 'Monto aproximado'},
+                                      {'type': 'TextSubheading',
+                                       'text': '${data.monto}'},
+                                      {'type': 'TextCaption', 'text': 'Pago mensual'},
+                                      {'type': 'TextSubheading',
+                                       'text': '${data.pago}'},
+                                      {'type': 'TextCaption', 'text': 'Plazo'},
+                                      {'type': 'TextSubheading',
+                                       'text': '${data.plazo}'},
+                                      {'type': 'TextCaption',
+                                       'text': '${data.disclaimer}'},
+                                      {'type': 'TextBody',
+                                       'text': '${data.vrim_teaser}'},
+                                      {'type': 'Footer',
+                                       'label': 'Continuar',
+                                       'on-click-action': {'name': 'navigate',
+                                                           'next': {'type': 'screen',
+                                                                    'name': 'IMSS_HANDOFF'},
+                                                           'payload': {'profile': '${data.profile}',
+                                                                       'pension': '${data.pension}',
+                                                                       'monto': '${data.monto}',
+                                                                       'pago': '${data.pago}',
+                                                                       'plazo': '${data.plazo}'}}}]}},
+             {'id': 'IMSS_HANDOFF',
+              'title': 'Préstamo IMSS',
+              'terminal': True,
+              'success': True,
+              'data': {'profile': {'type': 'string', '__example__': '1'},
+                       'pension': {'type': 'string', '__example__': '12000'},
+                       'monto': {'type': 'string', '__example__': '$45,000'},
+                       'pago': {'type': 'string', '__example__': '$1,362'},
+                       'plazo': {'type': 'string', '__example__': '48 meses'}},
+              'layout': {'type': 'SingleColumnLayout',
+                         'children': [{'type': 'TextHeading',
+                                       'text': 'Tu asesor te atenderá personalmente'},
+                                      {'type': 'Image',
+                                       'src': _IMG_ASESOR_B64,
+                                       'width': 160,
+                                       'height': 160,
+                                       'scale-type': 'cover',
+                                       'alt-text': 'Christian López, asesor COHIFIS'},
+                                      {'type': 'TextBody',
+                                       'text': 'Christian López continuará tu atención '
+                                               'por WhatsApp. Es fácil y sin costo.'},
+                                      {'type': 'Form',
+                                       'name': 'form_handoff',
+                                       'children': [{'type': 'TextInput',
+                                                     'name': 'nombre',
+                                                     'label': 'Nombre completo',
+                                                     'input-type': 'text',
+                                                     'required': True},
+                                                    {'type': 'EmbeddedLink',
+                                                     'text': 'Calcular con otra '
+                                                             'pensión',
+                                                     'on-click-action': {'name': 'navigate',
+                                                                         'next': {'type': 'screen',
+                                                                                  'name': 'IMSS_PENSION'},
+                                                                         'payload': {'profile': '${data.profile}'}}},
+                                                    {'type': 'Footer',
+                                                     'label': 'Quiero que me contacten',
+                                                     'on-click-action': {'name': 'data_exchange',
+                                                                         'payload': {'profile': '${data.profile}',
+                                                                                     'pension': '${data.pension}',
+                                                                                     'monto': '${data.monto}',
+                                                                                     'pago': '${data.pago}',
+                                                                                     'plazo': '${data.plazo}',
+                                                                                     'nombre': '${form.nombre}'}}}]}]}},
+             {'id': 'IMSS_REJECTED',
+              'title': 'Préstamo IMSS',
+              'terminal': True,
+              'success': True,
+              'data': {},
+              'layout': {'type': 'SingleColumnLayout',
+                         'children': [{'type': 'TextHeading',
+                                       'text': '¡Gracias por tu interés!'},
+                                      {'type': 'TextBody',
+                                       'text': 'Para calcular una propuesta '
+                                               'necesitamos que tu pensión ya esté '
+                                               'activa. Si gustas, Christian puede '
+                                               'contactarte cuando te pensiones.'},
+                                      {'type': 'Form',
+                                       'name': 'form_rejected',
+                                       'children': [{'type': 'Footer',
+                                                     'label': 'Entendido',
+                                                     'on-click-action': {'name': 'data_exchange',
+                                                                         'payload': {}}}]}]}}]}
 
 
 def generate_flow_token() -> str:
@@ -318,10 +290,11 @@ def build_flow_message_payload(to: str, flow_id: str, flow_token: str) -> Dict[s
         "type": "interactive",
         "interactive": {
             "type": "flow",
-            "header": {"type": "text", "text": "Préstamo IMSS"},
+            "header": {"type": "text", "text": "Préstamo para pensionados IMSS"},
             "body": {
-                "text": "Responde unas preguntas rápidas y te preparo una propuesta estimada, "
-                "con el resultado en la misma conversación."
+                "text": "En menos de un minuto te digo de cuánto podría ser tu préstamo y "
+                "cuánto pagarías al mes. Son 3 preguntas, sin documentos y sin compromiso."
+                "\n\nToca el botón de abajo para empezar."
             },
             "footer": {"text": "Christian López · COHIFIS"},
             "action": {
@@ -330,7 +303,7 @@ def build_flow_message_payload(to: str, flow_id: str, flow_token: str) -> Dict[s
                     "flow_message_version": FLOW_MESSAGE_VERSION,
                     "flow_token": flow_token,
                     "flow_id": flow_id,
-                    "flow_cta": "Calcular propuesta",
+                    "flow_cta": "Ver mi propuesta",
                     "flow_action": "navigate",
                     "flow_action_payload": {"screen": SCREEN_PROFILE},
                 },
