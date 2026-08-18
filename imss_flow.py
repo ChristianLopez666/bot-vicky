@@ -300,7 +300,12 @@ def build_flow_message_payload(to: str, flow_id: str, flow_token: str) -> Dict[s
 
     flow_action="navigate" hacia IMSS_PROFILE: la primera pantalla no tiene
     parametros que dependan del backend, asi que se evita llamar al endpoint
-    en INIT (recomendacion explicita de Meta)."""
+    en INIT (recomendacion explicita de Meta).
+
+    Por lo mismo flow_action_payload va SIN la clave "data". El campo es
+    opcional y Meta rechaza el objeto vacio con "(#131009) Parameter value is
+    not valid / Parameter data in flow_action_payload" -- verificado contra
+    produccion el 2026-08-18. Solo debe incluirse si lleva contenido real."""
     flow_id = (flow_id or "").strip()
     if not flow_id:
         raise ValueError("flow_id no puede estar vacio")
@@ -327,7 +332,7 @@ def build_flow_message_payload(to: str, flow_id: str, flow_token: str) -> Dict[s
                     "flow_id": flow_id,
                     "flow_cta": "Calcular propuesta",
                     "flow_action": "navigate",
-                    "flow_action_payload": {"screen": SCREEN_PROFILE, "data": {}},
+                    "flow_action_payload": {"screen": SCREEN_PROFILE},
                 },
             },
         },

@@ -354,6 +354,10 @@ def test_build_flow_message_payload_forma_verificada():
     assert params["flow_token"] == token
     assert params["flow_action"] == "navigate"
     assert params["flow_action_payload"]["screen"] == imss_flow.SCREEN_PROFILE
+    # Regresion 2026-08-18: Meta rechaza flow_action_payload con "data": {}
+    # con "(#131009) Parameter value is not valid". El campo es opcional y
+    # solo debe viajar si lleva contenido real.
+    assert "data" not in params["flow_action_payload"]
 
 
 def test_build_flow_message_payload_sin_flow_id_falla():
