@@ -290,10 +290,11 @@ def build_flow_message_payload(to: str, flow_id: str, flow_token: str) -> Dict[s
         "type": "interactive",
         "interactive": {
             "type": "flow",
-            "header": {"type": "text", "text": "Préstamo IMSS"},
+            "header": {"type": "text", "text": "Préstamo para pensionados IMSS"},
             "body": {
-                "text": "Responde unas preguntas rápidas y te preparo una propuesta estimada, "
-                "con el resultado en la misma conversación."
+                "text": "En menos de un minuto te digo de cuánto podría ser tu préstamo y "
+                "cuánto pagarías al mes. Son 3 preguntas, sin documentos y sin compromiso."
+                "\n\nToca el botón de abajo para empezar."
             },
             "footer": {"text": "Christian López · COHIFIS"},
             "action": {
@@ -302,7 +303,7 @@ def build_flow_message_payload(to: str, flow_id: str, flow_token: str) -> Dict[s
                     "flow_message_version": FLOW_MESSAGE_VERSION,
                     "flow_token": flow_token,
                     "flow_id": flow_id,
-                    "flow_cta": "Calcular propuesta",
+                    "flow_cta": "Ver mi propuesta",
                     "flow_action": "navigate",
                     "flow_action_payload": {"screen": SCREEN_PROFILE},
                 },

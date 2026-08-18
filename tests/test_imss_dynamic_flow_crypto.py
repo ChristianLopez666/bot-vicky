@@ -399,6 +399,20 @@ def test_build_flow_message_payload_forma_verificada():
     assert "data" not in params["flow_action_payload"]
 
 
+def test_build_flow_message_payload_respeta_limites_de_whatsapp():
+    """Limites de la tarjeta interactiva. El del boton es el que muerde: 20
+    caracteres. Un texto mas largo lo rechaza Meta al enviar, o sea que se
+    descubre en produccion y no en pruebas."""
+    payload = imss_flow.build_flow_message_payload(
+        "6681234567", "123456789", imss_flow.generate_flow_token())
+    interactive = payload["interactive"]
+    cta = interactive["action"]["parameters"]["flow_cta"]
+    assert len(cta) <= 20, f"flow_cta de {len(cta)} caracteres: {cta!r}"
+    assert len(interactive["header"]["text"]) <= 60
+    assert len(interactive["footer"]["text"]) <= 60
+    assert len(interactive["body"]["text"]) <= 1024
+
+
 def test_build_flow_message_payload_sin_flow_id_falla():
     with pytest.raises(ValueError):
         imss_flow.build_flow_message_payload("6681234567", "", imss_flow.generate_flow_token())
