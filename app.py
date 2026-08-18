@@ -2368,12 +2368,37 @@ def _imss_build_closing_statement(data: dict) -> str:
     return "\n\n".join(partes)
 
 
+def _imss_flow_build_closing(data: dict, horario: str | None) -> str:
+    """Cierre del Flow dinamico: BREVE a proposito.
+
+    El funnel de texto usa _imss_build_closing_statement, que repite monto,
+    pago y plazo porque ahi el cliente nunca los vio en pantalla. En el Flow
+    SI los vio, y repetirlos al salir rompe la continuidad: el prospecto
+    siente que lo pasaron a otra conversacion. Aqui solo se confirma.
+    """
+    nombre = str(data.get("nombre") or "").strip()
+    primer_nombre = nombre.split()[0] if nombre else ""
+    saludo = f"✅ *Listo, {primer_nombre}.*" if primer_nombre else "✅ *Listo.*"
+    if horario:
+        return (f"{saludo} *Christian López te contactará "
+                f"{horario[:1].lower()}{horario[1:]}.*")
+    # Unico caso que sigue abierto: eligio "otro dia y horario especifico".
+    return (f"{saludo}\n\nPara agendar tu llamada, escribeme el *dia y el horario* "
+            "que prefieras, por ejemplo:\n“El jueves a las 10:00 a. m.”")
+
+
+
 def _imss_build_advisor_notification(phone: str, data: dict) -> str:
     lines = ["📣 PROSPECTO IMSS CALIFICADO — LLAMAR", "",
              "Producto: Préstamo IMSS pensionados"]
     if data.get("nombre"):
         lines.append(f"Nombre: {data['nombre']}")
     lines.append(f"WhatsApp: {phone}")
+    # Cuando el horario se captura DENTRO del Flow viaja en esta misma ficha,
+    # en vez de llegar despues como un aviso suelto (que es lo que hace el
+    # funnel de texto, donde la respuesta llega en un turno posterior).
+    if data.get("horario_contacto"):
+        lines.append(f"Llamar: {data['horario_contacto']}")
     if data.get("ciudad"):
         lines.append(f"Ciudad: {data['ciudad']}")
     if data.get("origen"):
@@ -2632,6 +2657,18 @@ def _imss_flow_handle_pension(phone: str, step_data: dict, flow_token: str) -> d
                                propuesta["plazo"], "propuesta_inicial")
     data["vrim_preeligible"] = True
     data["vrim_eligibility_basis"] = "propuesta_monto"
+    # Las etiquetas de horario se calculan y PERSISTEN aqui, no al cerrar: el
+    # cliente las va a ver dentro del Flow, y su respuesta tiene que
+    # resolverse contra lo que vio. Mismo principio que el funnel de texto.
+    horarios = _imss_build_horario_opciones()
+    # Dentro del Flow las opciones son botones, no texto libre. Entre semana
+    # antes del cierre las tres etiquetas son franjas concretas y "otro dia y
+    # horario" no aparece: en el funnel de texto daba igual porque el cliente
+    # simplemente lo escribia, pero aqui se quedaria SIN forma de pedirlo. Se
+    # agrega siempre como ultima opcion.
+    if _IMSS_OTRO_HORARIO_LABEL not in horarios.values():
+        horarios = {**horarios, "4": _IMSS_OTRO_HORARIO_LABEL}
+    data["imss_horarios_ofrecidos"] = horarios
     user_data[phone] = data
     user_state[phone] = "imss_q_revision"
 
@@ -2678,6 +2715,7 @@ def _imss_flow_handle_pension(phone: str, step_data: dict, flow_token: str) -> d
         "plazo": f"{propuesta['plazo']} meses",
         "disclaimer": disclaimer,
         "vrim_teaser": vrim_teaser,
+        "horarios": [{"id": k, "title": horarios[k]} for k in sorted(horarios)],
     })
 
 
@@ -2706,19 +2744,21 @@ def _imss_flow_handle_handoff(phone: str, step_data: dict, flow_token: str) -> d
     data = _ensure_user(phone)
     data["nombre"] = nombre
     data["desea_revision"] = "Sí"
-    # Mismo patrón que imss_q_ciudad_calc: las etiquetas se calculan UNA sola
-    # vez aquí y se persisten, para que la respuesta 1/2/3 posterior se
-    # resuelva contra lo que el cliente realmente vio, no contra un horario
-    # recalculado en el momento de responder.
-    data["imss_horarios_ofrecidos"] = _imss_build_horario_opciones()
+    # El horario ya se pregunto DENTRO del Flow, en la misma pantalla del
+    # nombre. Se resuelve contra las etiquetas que se le mostraron al cliente
+    # --persistidas al calcular la propuesta-- y nunca contra un recalculo:
+    # si contesta horas despues, la etiqueta sigue significando lo mismo.
+    opciones = _imss_horarios_ofrecidos(data)
+    horario = _imss_normalize_horario(str(step_data.get("horario") or ""), opciones)
+    if horario:
+        data["horario_contacto"] = horario
     user_data[phone] = data
 
-    # Mismo orden que imss_q_ciudad_calc: primero el cierre + pregunta de
-    # horario (reutilizado tal cual), despues la notificacion al asesor.
-    # El cierre es el efecto que decide si el prospecto queda o no colgado:
-    # sin el, queda en imss_q_horario_calc esperando una pregunta que nunca
-    # vio. Por eso su resultado gobierna si el paso se marca completado.
-    cierre_entregado = send_msg(phone, _imss_build_closing_statement(data))
+    # El cierre es el efecto que decide si el prospecto queda o no colgado, y
+    # por eso su resultado gobierna si el paso se marca completado. Va BREVE:
+    # el cliente acaba de ver monto, pago y plazo en pantalla, y repetirlos al
+    # salir del Flow es justo lo que lo hacia sentir otra conversacion.
+    cierre_entregado = send_msg(phone, _imss_flow_build_closing(data, horario))
     if data.get("vrim_preeligible") and not data.get("vrim_offered"):
         if send_msg(phone, _IMSS_VRIM_PROMO_MESSAGE):
             data["vrim_offered"] = True
@@ -2746,7 +2786,12 @@ def _imss_flow_handle_handoff(phone: str, step_data: dict, flow_token: str) -> d
         if _notify_boardroom_lead_qualified(phone, "prestamo_imss_ley73", _ensure_user(phone)):
             _imss_flow_marcar(boardroom_key)
 
-    user_state[phone] = "imss_q_horario_calc"
+    # Solo se queda esperando texto quien eligio "otro dia y horario": es el
+    # unico caso en que falta un dato. El resto ya cerro dentro del Flow.
+    if horario:
+        _imss_close(phone, tipo="revision_aceptada", data=data)
+    else:
+        user_state[phone] = "imss_q_horario_calc"
 
     if not cierre_entregado:
         # No se marca completado: el prospecto no recibio el cierre. Si Meta

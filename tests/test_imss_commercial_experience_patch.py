@@ -997,14 +997,45 @@ def test_closing_includes_vrim_when_preeligible():
 def test_closing_statement_is_the_only_deterministic_source():
     src = inspect.getsource(vicky_app)
     assert src.count("def _imss_build_closing_statement") == 1
-    # definicion + funnel de texto (imss_q_ciudad_calc) + handoff del Flow
-    # dinamico (_imss_flow_handle_handoff): dos llamadas legitimas a LA MISMA
-    # funcion compartida, no una reimplementacion del cierre.
-    assert src.count("_imss_build_closing_statement(") == 3
+    # Definicion + su unica llamada, desde el funnel de TEXTO
+    # (imss_q_ciudad_calc). El Flow dinamico dejo de usarla a proposito el
+    # 2026-08-18: ahi el cliente ya vio monto, pago y plazo en pantalla, y
+    # repetirlos al salir rompia la continuidad del formulario. Tiene su
+    # propio cierre breve, que es otro mensaje, no otra version del mismo.
+    assert src.count("_imss_build_closing_statement(") == 2
+    assert src.count("def _imss_flow_build_closing") == 1
+    assert src.count("_imss_flow_build_closing(") == 2
     # No queda rastro del cierre anterior.
     assert "la propuesta estimada queda en" not in src
     assert "beneficio vinculado de la membresía" not in src
     assert "¿En qué horario te puede llamar Christian hoy?" not in src
+
+
+def test_flow_closing_no_repite_la_propuesta():
+    """El cierre del Flow confirma y agenda; NO vuelve a listar las cifras.
+
+    Repetirlas era lo que hacia sentir al prospecto que lo habian pasado a
+    otra conversacion al salir del formulario.
+    """
+    data = {"nombre": "Juan Perez", "pension": 12000.0,
+            "propuesta_monto": 45000.0, "propuesta_cuota": 1362.0,
+            "propuesta_plazo": 48, "vrim_preeligible": True}
+    cierre = vicky_app._imss_flow_build_closing(data, "Hoy por la tarde")
+
+    assert "Juan" in cierre
+    assert "hoy por la tarde" in cierre
+    for cifra in ("45,000", "1,362", "12,000", "48 meses"):
+        assert cifra not in cierre, f"el cierre del Flow repite {cifra}"
+    assert len(cierre) < 200, "el cierre del Flow debe ser breve"
+
+
+def test_flow_closing_pide_el_horario_libre_solo_si_eligio_otro():
+    data = {"nombre": "Juan Perez"}
+    cierre = vicky_app._imss_flow_build_closing(data, None)
+    assert "dia y el horario" in cierre
+    # Y con horario resuelto no se le vuelve a preguntar nada.
+    assert "dia y el horario" not in vicky_app._imss_flow_build_closing(
+        data, "Manana por la manana")
 
 
 def test_closing_statement_reads_the_active_proposal():
