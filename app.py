@@ -1230,11 +1230,96 @@ def _send_neutral_fallback(phone: str) -> None:
     send_msg(phone, NEUTRAL_FALLBACK_MESSAGE)
 
 
+def _emit_boardroom_observation(payload: dict) -> None:
+    """OBSERVATION_EVENT fire-and-forget hacia /bus/event para los turnos que
+    Vicky Redes resuelve localmente (funnels activos, menu, botones/listas,
+    referrals de Meta, deteccion de producto): Boardroom/Rodys reciben el
+    evento, pero Vicky no espera ni actua sobre la respuesta. Mismo contrato,
+    mismo endpoint y mismos headers que _request_boardroom_instruction --
+    Boardroom lo atiende por la rama canonica, registra la Observacion y
+    devuelve un fallback que aqui nadie lee.
+
+    Alcance real de la garantia: MAXIMO UN INTENTO de POST por ejecucion de
+    handle(), no "exactamente una Observacion". El hilo daemon no reintenta si
+    el envio se pierde, _seen_ids vive en memoria (tope 3000, se pierde al
+    reiniciar) y los mensajes sin message_id no se deduplican. Boardroom
+    tampoco deduplica hoy: no hay indice por event_id ni por message_id en
+    boardroom/rodys/. Si algun dia se agrega dedupe del lado servidor, la
+    llave correcta es "message_id" (estable por mensaje de WhatsApp), nunca
+    "event_id" (uuid4 nuevo en cada _build_boardroom_event).
+    """
+    if not _BUS_ACTIVE or not BUS_URL or not BUS_INTERNAL_TOKEN:
+        return
+
+    def _post() -> None:
+        try:
+            resp = requests.post(
+                _bus_event_url(),
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {BUS_INTERNAL_TOKEN}",
+                    "X-Source-System": "vicky",
+                    "X-Event-Type": "inbound_message",
+                },
+                timeout=3,
+            )
+            # Un no-2xx no es lo mismo que un timeout. El timeout es transitorio
+            # y cuesta un mensaje; un 400/401/403 es una falla sistemica muda:
+            # Boardroom rechaza TODAS las Observaciones, Rodys se queda ciego y
+            # Vicky sigue operando normal sin que nada lo delate. Ya paso en
+            # produccion un 401 de BUS_INTERNAL_TOKEN en este mismo bus
+            # (incidente SECOM 2026-08-09). Va en nivel error justamente para
+            # poder filtrarlo en Render y enterarse el mismo dia. El hermano
+            # sincrono (_request_boardroom_instruction) ya hacia esta
+            # comprobacion; esta rama se habia quedado sin ella.
+            # No se reintenta a proposito: reintentar rompe la semantica de
+            # maximo un intento por mensaje y puede duplicar Observaciones.
+            if not 200 <= resp.status_code < 300:
+                log.error(
+                    "Boardroom observation rechazada http=%s phone_last4=%s",
+                    resp.status_code, str(payload.get("phone") or "")[-4:],
+                )
+        except Exception as exc:
+            log.warning(
+                "Boardroom observation emit fallido phone_last4=%s error=%s: %s",
+                str(payload.get("phone") or "")[-4:], type(exc).__name__, str(exc),
+            )
+
+    threading.Thread(target=_post, daemon=True).start()
+
+
+def _flush_boardroom_observation() -> None:
+    """Emite la Observacion pendiente del mensaje en curso, si nadie la mando
+    ya. Corre en el finally de handle(), asi que cubre los ~18 retornos
+    locales del dispatcher -- incluidos los que se agreguen despues -- sin
+    instrumentar cada uno.
+
+    Limpia siempre el thread-local: gunicorn reusa hilos entre requests y un
+    evento olvidado aqui se emitiria de nuevo con el siguiente mensaje.
+    """
+    event = getattr(_tl, "boardroom_event", None)
+    already_emitted = getattr(_tl, "boardroom_emitted", False)
+    _tl.boardroom_event = None
+    _tl.boardroom_emitted = False
+    if event is None or already_emitted:
+        return
+    _emit_boardroom_observation(event)
+
+
 def _handle_boardroom_authority(phone: str, msg_obj: dict, mtype: str, text: str) -> bool:
     if not BOARDROOM_IS_AUTHORITY:
         return False
 
-    payload = _build_boardroom_event(phone, text, msg_obj, mtype)
+    # El evento canonico ya viene construido por handle() (un solo event_id
+    # por mensaje). El respaldo cubre una llamada directa fuera del dispatcher.
+    payload = getattr(_tl, "boardroom_event", None) or _build_boardroom_event(phone, text, msg_obj, mtype)
+    # El latch sube ANTES del POST, no despues: si esta llamada expira o
+    # falla, el finally de handle() no debe mandar un segundo intento del
+    # mismo mensaje. Un intento perdido es aceptable; uno duplicado no, porque
+    # FLUJO_BLOQUEADO cuenta Observaciones consecutivas y Boardroom no
+    # deduplica.
+    _tl.boardroom_emitted = True
     body, error = _request_boardroom_instruction(payload)
     if body is None:
         log.warning("Boardroom authority fallback reason=%s phone_last4=%s", error, phone[-4:])
@@ -3744,6 +3829,28 @@ def _is_financial_context(n: str, svc: str | None = None) -> bool:
 
 # ── Procesamiento del mensaje ─────────────────────────────────────────────────
 def handle(msg_obj: dict) -> None:
+    """Punto de entrada de cada mensaje entrante.
+
+    Envuelve al dispatcher real para garantizar un solo intento de emision
+    hacia Boardroom/Rodys por mensaje (RFC-003 Fase 3). El reset del
+    thread-local es obligatorio y va aqui, no en el dispatcher: gunicorn
+    reusa hilos, y _handle_dispatch() tiene retornos tempranos (telefono
+    vacio, mensaje duplicado, nfm_reply) que nunca llegan a construir el
+    evento -- sin reset, esos mensajes reemitirian el evento del mensaje
+    anterior atendido por el mismo hilo.
+
+    El finally corre pase lo que pase, incluida una excepcion dentro de un
+    funnel: el evento recibido se observa aunque el turno haya fallado.
+    """
+    _tl.boardroom_event = None
+    _tl.boardroom_emitted = False
+    try:
+        _handle_dispatch(msg_obj)
+    finally:
+        _flush_boardroom_observation()
+
+
+def _handle_dispatch(msg_obj: dict) -> None:
     phone = msg_obj.get("from", "")
     if not phone:
         return
@@ -3792,6 +3899,19 @@ def handle(msg_obj: dict) -> None:
             interactive_event["kind"], interactive_event["raw_type"],
             interactive_event["interactive_id"],
         )
+
+    # Rodys/Boardroom (RFC-003 Fase 3): el evento canonico se construye UNA
+    # sola vez por mensaje, exactamente aqui. Ni antes ni despues:
+    #   - Despues de normalizar, porque mtype y text_for_boardroom recien
+    #     existen a partir de este punto.
+    #   - Antes de que cualquier funnel toque user_state, para que
+    #     last_known_stage sea la etapa a la que LLEGO el mensaje y no la que
+    #     quedo tras procesarlo. Es lo que FLUJO_BLOQUEADO necesita para
+    #     contar repeticiones, y es el mismo criterio de Vicky SECOM, que
+    #     emite antes de _route_command().
+    # nfm_reply no llega aqui (retorna arriba, fuera de alcance de Boardroom),
+    # asi que queda excluido por construccion, sin un check aparte.
+    _tl.boardroom_event = _build_boardroom_event(phone, text_for_boardroom, msg_obj, mtype)
 
     if BOARDROOM_IS_AUTHORITY:
         logged_text = text_for_boardroom if text_for_boardroom else f"[{_canonical_message_type(mtype)}]"
