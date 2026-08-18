@@ -1253,7 +1253,7 @@ def _emit_boardroom_observation(payload: dict) -> None:
 
     def _post() -> None:
         try:
-            requests.post(
+            resp = requests.post(
                 _bus_event_url(),
                 json=payload,
                 headers={
@@ -1264,6 +1264,22 @@ def _emit_boardroom_observation(payload: dict) -> None:
                 },
                 timeout=3,
             )
+            # Un no-2xx no es lo mismo que un timeout. El timeout es transitorio
+            # y cuesta un mensaje; un 400/401/403 es una falla sistemica muda:
+            # Boardroom rechaza TODAS las Observaciones, Rodys se queda ciego y
+            # Vicky sigue operando normal sin que nada lo delate. Ya paso en
+            # produccion un 401 de BUS_INTERNAL_TOKEN en este mismo bus
+            # (incidente SECOM 2026-08-09). Va en nivel error justamente para
+            # poder filtrarlo en Render y enterarse el mismo dia. El hermano
+            # sincrono (_request_boardroom_instruction) ya hacia esta
+            # comprobacion; esta rama se habia quedado sin ella.
+            # No se reintenta a proposito: reintentar rompe la semantica de
+            # maximo un intento por mensaje y puede duplicar Observaciones.
+            if not 200 <= resp.status_code < 300:
+                log.error(
+                    "Boardroom observation rechazada http=%s phone_last4=%s",
+                    resp.status_code, str(payload.get("phone") or "")[-4:],
+                )
         except Exception as exc:
             log.warning(
                 "Boardroom observation emit fallido phone_last4=%s error=%s: %s",

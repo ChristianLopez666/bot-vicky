@@ -77,15 +77,15 @@ def _referral_msg(phone: str, text: str, mid: str) -> dict:
 
 
 class _FakeResponse:
-    status_code = 200
-    text = ""
+    def __init__(self, status_code=200):
+        self.status_code = status_code
+        self.text = ""
 
-    @staticmethod
-    def json():
+    def json(self):
         return {}
 
 
-def _base_patches(monkeypatch, *, post_side_effect=None):
+def _base_patches(monkeypatch, *, post_side_effect=None, post_status=200):
     """Aisla handle() de I/O real y captura cada POST a /bus/event.
 
     Se parchea requests.post (no _emit_boardroom_observation) a proposito: asi
@@ -115,7 +115,7 @@ def _base_patches(monkeypatch, *, post_side_effect=None):
         posts.append({"url": url, "json": kwargs.get("json"), "headers": kwargs.get("headers")})
         if post_side_effect is not None:
             raise post_side_effect
-        return _FakeResponse()
+        return _FakeResponse(post_status)
 
     monkeypatch.setattr(vicky_app.requests, "post", fake_post)
     return sent, posts
@@ -257,6 +257,41 @@ def test_timeout_sincrono_no_dispara_segundo_post(monkeypatch):
     _, posts = _base_patches(monkeypatch, post_side_effect=requests.exceptions.Timeout())
     vicky_app.handle(_text_msg("6681234567", "zzz texto que no rutea a nada", "mid-timeout"))
     assert len(_bus_posts(posts)) == 1
+
+
+def test_respuesta_no_2xx_se_registra_como_error_sin_reintentar(monkeypatch, caplog):
+    """Un rechazo HTTP de Boardroom no puede pasar en silencio.
+
+    Un timeout es transitorio y cuesta un mensaje; un 400/401/403 significa que
+    Boardroom rechaza TODAS las Observaciones y Rodys se queda ciego sin que
+    nada lo delate en los logs de Vicky. Ya paso con un 401 de
+    BUS_INTERNAL_TOKEN en este mismo bus (incidente SECOM 2026-08-09).
+
+    Se afirman las tres cosas a la vez: queda registrado en nivel error, sigue
+    siendo UN SOLO POST (no se reintenta, eso duplicaria Observaciones) y la
+    conversacion del cliente no se ve afectada.
+    """
+    sent, posts = _base_patches(monkeypatch, post_status=500)
+    with caplog.at_level("ERROR"):
+        vicky_app.handle(_text_msg("6681234567", "menu", "mid-500"))
+
+    assert len(_bus_posts(posts)) == 1, "un rechazo no debe disparar reintento"
+    assert any(
+        "Boardroom observation rechazada" in r.message and r.levelname == "ERROR"
+        for r in caplog.records
+    ), "el rechazo HTTP debe quedar en el log en nivel error"
+    assert sent, "el menu debe haberse enviado pese al rechazo de Boardroom"
+
+
+def test_respuesta_2xx_no_registra_error(monkeypatch, caplog):
+    """El camino feliz no debe ensuciar el log de errores: si esto ruidea, el
+    filtro por nivel en Render deja de servir para detectar el caso real."""
+    _, posts = _base_patches(monkeypatch, post_status=200)
+    with caplog.at_level("ERROR"):
+        vicky_app.handle(_text_msg("6681234567", "menu", "mid-200"))
+
+    assert len(_bus_posts(posts)) == 1
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
 
 
 def test_falla_de_boardroom_no_rompe_el_funnel(monkeypatch):
