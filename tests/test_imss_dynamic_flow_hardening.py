@@ -307,6 +307,37 @@ def test_handoff_con_cierre_fallido_no_se_marca_completado(monkeypatch, avisos):
     assert len(avisos) == 1
 
 
+def test_handoff_solo_requiere_nombre_sin_ciudad(monkeypatch, avisos):
+    """La pantalla de handoff dejo de pedir ciudad: teclear es lo mas dificil
+    para el publico objetivo y era el ultimo paso, donde mas caro sale perder
+    al prospecto. El paso debe calificar con el nombre solo, y la ficha del
+    asesor simplemente no trae el renglon de Ciudad."""
+    token = imss_flow.generate_flow_token()
+    _preparar_prospecto_con_propuesta(token, avisos)
+    monkeypatch.setattr(vicky_app, "send_msg", lambda to, text: True)
+
+    r = vicky_app._imss_flow_handle_handoff(PHONE, {"nombre": "Juan Pérez"}, token)
+
+    assert r["data"]["extension_message_response"]["params"]["resultado"] == "calificado"
+    assert vicky_app.user_data[PHONE]["nombre"] == "Juan Pérez"
+    assert not vicky_app.user_data[PHONE].get("ciudad")
+    assert len(avisos) == 1
+    assert "Ciudad:" not in avisos[0]
+
+
+def test_handoff_sigue_exigiendo_nombre(monkeypatch, avisos):
+    """Sin nombre no hay ficha que mandar: debe regresar a la misma pantalla
+    con error, no calificar al prospecto."""
+    token = imss_flow.generate_flow_token()
+    _preparar_prospecto_con_propuesta(token, avisos)
+    monkeypatch.setattr(vicky_app, "send_msg", lambda to, text: True)
+
+    r = vicky_app._imss_flow_handle_handoff(PHONE, {"nombre": "   "}, token)
+
+    assert r["screen"] == imss_flow.SCREEN_HANDOFF
+    assert avisos == []
+
+
 def test_handoff_exitoso_si_deduplica_el_reintento(monkeypatch, avisos):
     token = imss_flow.generate_flow_token()
     _preparar_prospecto_con_propuesta(token, avisos)
