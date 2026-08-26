@@ -316,7 +316,11 @@ def build_flow_message_payload(to: str, flow_id: str, flow_token: str) -> Dict[s
                     # en tests/test_imss_dynamic_flow_crypto.py, que es la unica
                     # red antes de produccion (Meta rechaza el envio, no hay
                     # error en pruebas locales).
-                    "flow_cta": "Toca aquí",
+                    # La mano va DENTRO del boton, no solo en el cuerpo: entre
+                    # la instruccion del cuerpo y el boton se interpone el
+                    # footer, asi que la senal y su destino quedaban separados.
+                    # Con el emoji aqui, el boton se senala a si mismo.
+                    "flow_cta": "👇 Toca aquí",
                     "flow_action": "navigate",
                     "flow_action_payload": {"screen": SCREEN_PROFILE},
                 },
