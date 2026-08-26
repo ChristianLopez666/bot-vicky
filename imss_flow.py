@@ -297,7 +297,7 @@ def build_flow_message_payload(to: str, flow_id: str, flow_token: str) -> Dict[s
                 # y va aparte, con la flecha apuntando al boton -- para quien
                 # no tiene claro que es un boton, "el verde de abajo" es la
                 # unica referencia que no falla.
-                "text": "En menos de un minuto te digo cuánto podrías recibir y "
+                "text": "En segundos te digo cuánto podrías recibir y "
                 "cuánto pagarías al mes."
                 "\n\nSon 3 preguntas. Sin documentos y sin compromiso."
                 "\n\n👇 Toca el botón verde de aquí abajo."
