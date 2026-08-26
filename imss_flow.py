@@ -292,9 +292,15 @@ def build_flow_message_payload(to: str, flow_id: str, flow_token: str) -> Dict[s
             "type": "flow",
             "header": {"type": "text", "text": "Préstamo para pensionados IMSS"},
             "body": {
-                "text": "En menos de un minuto te digo de cuánto podría ser tu préstamo y "
-                "cuánto pagarías al mes. Son 3 preguntas, sin documentos y sin compromiso."
-                "\n\nToca el botón de abajo para empezar."
+                # Tres bloques cortos en vez de un parrafo corrido: el publico
+                # objetivo escanea, no lee. El ultimo bloque es la instruccion
+                # y va aparte, con la flecha apuntando al boton -- para quien
+                # no tiene claro que es un boton, "el verde de abajo" es la
+                # unica referencia que no falla.
+                "text": "En menos de un minuto te digo cuánto podrías recibir y "
+                "cuánto pagarías al mes."
+                "\n\nSon 3 preguntas. Sin documentos y sin compromiso."
+                "\n\n👇 Toca el botón verde de aquí abajo."
             },
             "footer": {"text": "Christian López · COHIFIS"},
             "action": {
@@ -303,7 +309,14 @@ def build_flow_message_payload(to: str, flow_id: str, flow_token: str) -> Dict[s
                     "flow_message_version": FLOW_MESSAGE_VERSION,
                     "flow_token": flow_token,
                     "flow_id": flow_id,
-                    "flow_cta": "Ver mi propuesta",
+                    # "Ver mi propuesta" describia el resultado en vocabulario
+                    # de asesor ("propuesta"), no la accion. Aqui el boton solo
+                    # dice que hacer: el cuerpo ya explico que se gana. 9 de los
+                    # 20 caracteres que admite Meta -- ver la asercion de limites
+                    # en tests/test_imss_dynamic_flow_crypto.py, que es la unica
+                    # red antes de produccion (Meta rechaza el envio, no hay
+                    # error en pruebas locales).
+                    "flow_cta": "Toca aquí",
                     "flow_action": "navigate",
                     "flow_action_payload": {"screen": SCREEN_PROFILE},
                 },
