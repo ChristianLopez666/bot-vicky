@@ -219,24 +219,50 @@ def test_el_recordatorio_se_entrega_una_sola_vez_cuando_vence(monkeypatch):
     assert sent == []
 
 
-def test_si_el_cliente_agradece_el_recordatorio_ya_no_existe(monkeypatch):
-    """El recorrido real: propuesta -> "gracias" -> cortesia. Despues de eso NO
-    puede quedar nada armado: el cliente respondio, asi que "si no responde en
-    una hora" dejo de aplicar. Se comprueba sobre el almacen y recorriendo el
-    webhook, no llamando a nudge_cancel() a mano -- el defecto que esto cubre
-    era justamente que la cortesia volvia a armarlo despues de que el webhook
-    ya lo habia cancelado."""
+def test_la_oferta_del_menu_tambien_lleva_recordatorio_a_la_hora(monkeypatch):
+    """La cortesia termina con "escriba menu si requiere algun otro servicio":
+    esa oferta queda abierta, asi que le corresponde la misma hora de espera
+    que a la pregunta de horario. El recorrido va por handle(), no llamando a
+    nudge_arm() a mano: el webhook cancela el recordatorio al entrar el
+    mensaje, y lo que se comprueba es que la respuesta de Vicky lo vuelve a
+    dejar armado con su motivo propio."""
     phone = "6683334411"
     sent, _ = _llegar_a_horario(monkeypatch, phone)
-    assert phone in vicky_app._state_store._nudge_mem
 
     vicky_app.handle(_text_msg(phone, "gracias", "m7"))
 
     assert [t for _, t in sent][-1] == cc.CORTESIA_FINAL
-    assert phone not in vicky_app._state_store._nudge_mem
+    due, ctx = vicky_app._state_store._nudge_mem[phone]
+    assert ctx["motivo"] == "cortesia_final"
+    assert due - time.time() > vicky_app.CIERRE_NUDGE_SECONDS - 60
+
+    # Y al vencer, se entrega.
     sent.clear()
-    assert vicky_app.nudge_sweep_once() == 0
-    assert sent == []
+    vicky_app._state_store._nudge_mem[phone] = (
+        time.time() - 1, {"armed_at": time.time() - vicky_app.CIERRE_NUDGE_SECONDS,
+                          "motivo": "cortesia_final"})
+    assert vicky_app.nudge_sweep_once() == 1
+    assert [t for _, t in sent] == [cc.NUDGE]
+
+
+def test_el_recordatorio_no_se_entrega_dos_veces_en_el_mismo_ciclo(monkeypatch):
+    """Si el cliente se quedo callado, ya recibio "Quedo atenta..." y despues
+    escribe "gracias", la cortesia NO le vuelve a programar la misma frase."""
+    phone = "6683334416"
+    sent, _ = _llegar_a_horario(monkeypatch, phone)
+
+    # Vence el recordatorio del acuse y se entrega.
+    vicky_app._state_store._nudge_mem[phone] = (
+        time.time() - 1, {"armed_at": time.time() - vicky_app.CIERRE_NUDGE_SECONDS,
+                          "motivo": "acuse_propuesta_texto"})
+    assert vicky_app.nudge_sweep_once() == 1
+
+    # El cliente reacciona; la cortesia sale, pero sin reprogramar el cierre.
+    sent.clear()
+    vicky_app.handle(_text_msg(phone, "gracias", "m7"))
+
+    assert [t for _, t in sent] == [cc.CORTESIA_FINAL]
+    assert phone not in vicky_app._state_store._nudge_mem
 
 
 def test_si_el_cliente_elige_horario_el_recordatorio_ya_no_existe(monkeypatch):

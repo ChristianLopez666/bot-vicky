@@ -1535,12 +1535,16 @@ def reset(phone: str):
 # ultima linea de una conversacion que el propio cliente abrio hace menos de
 # una hora, asi que va en texto libre dentro de la ventana de 24h de Meta.
 #
-# INVARIANTE: el recordatorio se arma en UN solo lugar por conversacion -- el
-# cierre automatico que entrega la propuesta -- y cualquier mensaje entrante
-# del cliente lo cancela (ver _handle_dispatch). Ninguna respuesta de Vicky a
-# un mensaje del cliente lo vuelve a armar: si el cliente contesto, ya
-# respondio, y "si no responde en una hora" dejo de aplicar. Rearmarlo despues
-# de la cortesia convertia el cierre en un segundo mensaje no pedido.
+# REGLA: el recordatorio acompana a un mensaje de Vicky que deja algo ABIERTO
+# y sin contestar. Hoy son dos: el acuse que entrega la propuesta (deja la
+# pregunta de horario) y la cortesia (deja la oferta "escriba menu..."). La
+# confirmacion de horario y la despedida NO lo arman: ahi no queda nada
+# pendiente de responder.
+#
+# Cualquier mensaje entrante del cliente lo cancela (ver _handle_dispatch), y
+# dentro de un mismo ciclo se entrega UNA sola vez: si el cliente se quedo
+# callado, recibio la linea de cierre y despues escribio, la cortesia no le
+# vuelve a programar la misma frase. El ciclo lo abre el acuse.
 CIERRE_NUDGE_SECONDS = int(os.getenv("CIERRE_NUDGE_SECONDS", "3600") or 3600)
 # Un barrido puede atrasarse (reinicio del worker, Redis intermitente). Un
 # recordatorio muy vencido ya no se entrega: llegar 20 horas tarde es peor que
@@ -1557,8 +1561,19 @@ _nudge_sweeper_started = False
 _nudge_sweeper_lock = threading.Lock()
 
 
-def nudge_arm(phone: str, motivo: str) -> None:
-    """Programa (o reprograma) el recordatorio de cierre de este telefono."""
+def nudge_arm(phone: str, motivo: str, inicia_ciclo: bool = False) -> None:
+    """Programa (o reprograma) el recordatorio de cierre de este telefono.
+
+    `inicia_ciclo=True` -- el acuse que entrega la propuesta -- abre un ciclo
+    nuevo y limpia la marca de entrega. Sin el, si el recordatorio de este
+    ciclo ya salio no se vuelve a programar: el cliente no debe recibir dos
+    veces la misma linea de cierre."""
+    data = _ensure_user(phone)
+    if inicia_ciclo:
+        if data.pop("nudge_entregado", None) is not None:
+            user_data[phone] = data
+    elif data.get("nudge_entregado"):
+        return
     ahora = time.time()
     _state_store.nudge_set(
         phone, ahora + CIERRE_NUDGE_SECONDS,
@@ -1579,7 +1594,14 @@ def nudge_deliver(phone: str, ctx: dict) -> bool:
             log.warning("cierre_nudge_descartado_por_atraso phone_last4=%s horas=%.1f",
                         _digits(phone)[-4:], atraso / 3600)
             return False
-    return send_msg(phone, cc.NUDGE)
+    ok = send_msg(phone, cc.NUDGE)
+    if ok:
+        # Marca de ciclo: una respuesta posterior de Vicky ya no reprograma
+        # esta misma frase. La limpia el siguiente acuse.
+        data = _ensure_user(phone)
+        data["nudge_entregado"] = True
+        user_data[phone] = data
+    return ok
 
 
 def nudge_sweep_once() -> int:
@@ -3007,7 +3029,7 @@ def _imss_flow_handle_handoff(phone: str, step_data: dict, flow_token: str) -> d
         # manda si el cierre si llego: agradecer por una propuesta que el
         # cliente nunca vio seria peor que no decir nada.
         send_msg(phone, cc.ACUSE_PROPUESTA)
-        nudge_arm(phone, "acuse_propuesta_flow")
+        nudge_arm(phone, "acuse_propuesta_flow", inicia_ciclo=True)
         _imss_flow_marcar(completado_key)
 
     return imss_flow.build_success_response(flow_token, {"resultado": "calificado"})
@@ -3490,6 +3512,7 @@ def funnel_imss(phone: str, msg: str) -> None:
                     send_msg(phone, cc.CORTESIA_FINAL)
                     data["cortesia_final_enviada"] = True
                     user_data[phone] = data
+                    nudge_arm(phone, "cortesia_final")
                 # El estado NO se libera: si el cliente contesta que no
                 # necesita nada mas, esa negativa todavia tiene donde caer.
                 return
@@ -3526,7 +3549,7 @@ def funnel_imss(phone: str, msg: str) -> None:
         # queda esperando a que el cliente escriba para agradecerle.
         if cierre_entregado:
             send_msg(phone, cc.ACUSE_PROPUESTA)
-            nudge_arm(phone, "acuse_propuesta_texto")
+            nudge_arm(phone, "acuse_propuesta_texto", inicia_ciclo=True)
 
         # Notificar al asesor ANTES de quedar a la espera del horario -- el
         # lead ya debe quedar calificado y registrado aunque el prospecto
@@ -3560,6 +3583,10 @@ def funnel_imss(phone: str, msg: str) -> None:
             send_msg(phone, cc.CORTESIA_FINAL)
             data["cortesia_final_enviada"] = True
             _imss_close(phone, tipo="revision_aceptada", data=data)
+            # La cortesia termina con "escriba menu si requiere algun otro
+            # servicio": esa oferta queda abierta, asi que le corresponde la
+            # misma hora de espera que a la pregunta de horario.
+            nudge_arm(phone, "cortesia_final")
             return
         # 1/2/3 se resuelven contra las etiquetas que el cliente realmente vio;
         # cualquier otro texto valido se conserva como horario libre con el
