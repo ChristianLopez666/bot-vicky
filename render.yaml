@@ -3,7 +3,7 @@ services:
     name: bot-vicky
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --max-requests 200 --max-requests-jitter 50 --timeout 60
+    startCommand: gunicorn filtered_app:app --bind 0.0.0.0:$PORT --max-requests 200 --max-requests-jitter 50 --timeout 60
     envVars:
       - key: META_TOKEN
         sync: true
