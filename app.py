@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 
 import whatsapp_interactive as wai
 import imss_flow
+import cierre_cortesia as cc
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -86,6 +87,7 @@ class StateStore:
         self._state_mem = {}
         self._data_mem = {}
         self._aux_mem = {}
+        self._nudge_mem = {}
         redis_url = (os.getenv("KV_URL", "").strip() or os.getenv("REDIS_URL", "").strip())
         if redis_url and _redis_libs:
             try:
@@ -209,6 +211,77 @@ class StateStore:
         now = time.time()
         for k in [k for k, (exp, _) in self._aux_mem.items() if exp <= now]:
             self._aux_mem.pop(k, None)
+
+    # ── Recordatorio diferido de cierre ───────────────────────────────────────
+    # ZSET con el vencimiento como score: como maximo un recordatorio pendiente
+    # por telefono. La RECLAMACION es el propio ZREM -- solo devuelve 1 al
+    # proceso que gano la carrera --, asi que con varios workers el mensaje se
+    # entrega una sola vez. Sin Redis degrada a memoria del proceso, igual que
+    # aux_*: en un reinicio el recordatorio se pierde, nunca se duplica.
+    NUDGE_ZSET = "vicky:nudge:pending"
+
+    def is_durable(self) -> bool:
+        """True si el estado vive en Redis/Valkey y sobrevive al proceso."""
+        return self._redis is not None
+
+    def _nudge_ctx_key(self, phone: str) -> str:
+        return "vicky:nudge:ctx:" + re.sub(r"\D", "", str(phone))
+
+    def nudge_set(self, phone: str, due_ts: float, ctx: dict, ttl: int) -> bool:
+        try:
+            if self._redis:
+                pipe = self._redis.pipeline()
+                pipe.zadd(self.NUDGE_ZSET, {str(phone): float(due_ts)})
+                pipe.setex(self._nudge_ctx_key(phone), max(int(ttl), 1),
+                           json.dumps(ctx, ensure_ascii=False))
+                pipe.execute()
+                return True
+            self._nudge_mem[str(phone)] = (float(due_ts), dict(ctx))
+            return True
+        except Exception:
+            return False
+
+    def nudge_clear(self, phone: str) -> bool:
+        try:
+            if self._redis:
+                pipe = self._redis.pipeline()
+                pipe.zrem(self.NUDGE_ZSET, str(phone))
+                pipe.delete(self._nudge_ctx_key(phone))
+                pipe.execute()
+                return True
+            self._nudge_mem.pop(str(phone), None)
+            return True
+        except Exception:
+            return False
+
+    def nudge_pop_due(self, now_ts: float, limit: int = 50) -> list:
+        """Devuelve [(phone, ctx)] de los recordatorios vencidos y los reclama
+        en el mismo paso: cada entrada se le entrega a un solo llamador."""
+        out = []
+        try:
+            if self._redis:
+                vencidos = self._redis.zrangebyscore(
+                    self.NUDGE_ZSET, "-inf", float(now_ts), start=0, num=int(limit))
+                for phone in vencidos:
+                    if self._redis.zrem(self.NUDGE_ZSET, phone) != 1:
+                        continue  # otro worker lo reclamo primero
+                    key = self._nudge_ctx_key(phone)
+                    raw = self._redis.get(key)
+                    self._redis.delete(key)
+                    try:
+                        ctx = json.loads(raw) if raw else {}
+                    except Exception:
+                        ctx = {}
+                    out.append((phone, ctx if isinstance(ctx, dict) else {}))
+                return out
+            vencidos = [ph for ph, (due, _) in list(self._nudge_mem.items()) if due <= now_ts]
+            for phone in vencidos[:int(limit)]:
+                item = self._nudge_mem.pop(phone, None)
+                if item is not None:
+                    out.append((phone, item[1]))
+            return out
+        except Exception:
+            return out
 
 class _StateMap:
     def __init__(self, store: StateStore):
@@ -1453,6 +1526,116 @@ def _ensure_user(phone: str) -> dict:
 def reset(phone: str):
     user_state.pop(phone, None)
     user_data.pop(phone, None)
+
+
+# ── Recordatorio automatico de cierre ─────────────────────────────────────────
+# Cuando Vicky ya dio por cerrado su turno (entrego la propuesta, agradecio) y
+# el cliente no vuelve a escribir, se le manda UNA sola burbuja de cierre
+# pasada una hora. No es una campana ni un mensaje business-initiated: es la
+# ultima linea de una conversacion que el propio cliente abrio hace menos de
+# una hora, asi que va en texto libre dentro de la ventana de 24h de Meta.
+#
+# REGLA: el recordatorio acompana a un mensaje de Vicky que deja algo ABIERTO
+# y sin contestar. Hoy son dos: el acuse que entrega la propuesta (deja la
+# pregunta de horario) y la cortesia (deja la oferta "escriba menu..."). La
+# confirmacion de horario y la despedida NO lo arman: ahi no queda nada
+# pendiente de responder.
+#
+# Cualquier mensaje entrante del cliente lo cancela (ver _handle_dispatch), y
+# dentro de un mismo ciclo se entrega UNA sola vez: si el cliente se quedo
+# callado, recibio la linea de cierre y despues escribio, la cortesia no le
+# vuelve a programar la misma frase. El ciclo lo abre el acuse.
+CIERRE_NUDGE_SECONDS = int(os.getenv("CIERRE_NUDGE_SECONDS", "3600") or 3600)
+# Un barrido puede atrasarse (reinicio del worker, Redis intermitente). Un
+# recordatorio muy vencido ya no se entrega: llegar 20 horas tarde es peor que
+# no llegar, y ademas se arrima al borde de la ventana de 24h.
+CIERRE_NUDGE_MAX_ATRASO = int(os.getenv("CIERRE_NUDGE_MAX_ATRASO", str(6 * 3600)) or 6 * 3600)
+CIERRE_NUDGE_TICK = int(os.getenv("CIERRE_NUDGE_TICK", "60") or 60)
+CIERRE_NUDGE_SWEEPER = (os.getenv("CIERRE_NUDGE_SWEEPER", "true").strip().lower()
+                        in ("1", "true", "yes", "on"))
+# Clase capturada al importar a proposito: los tests sustituyen
+# threading.Thread por un doble que ejecuta el target en linea, y el barrido es
+# un bucle infinito.
+_NUDGE_THREAD_CLS = threading.Thread
+_nudge_sweeper_started = False
+_nudge_sweeper_lock = threading.Lock()
+
+
+def nudge_arm(phone: str, motivo: str, inicia_ciclo: bool = False) -> None:
+    """Programa (o reprograma) el recordatorio de cierre de este telefono.
+
+    `inicia_ciclo=True` -- el acuse que entrega la propuesta -- abre un ciclo
+    nuevo y limpia la marca de entrega. Sin el, si el recordatorio de este
+    ciclo ya salio no se vuelve a programar: el cliente no debe recibir dos
+    veces la misma linea de cierre."""
+    data = _ensure_user(phone)
+    if inicia_ciclo:
+        if data.pop("nudge_entregado", None) is not None:
+            user_data[phone] = data
+    elif data.get("nudge_entregado"):
+        return
+    ahora = time.time()
+    _state_store.nudge_set(
+        phone, ahora + CIERRE_NUDGE_SECONDS,
+        {"armed_at": ahora, "motivo": motivo},
+        ttl=CIERRE_NUDGE_SECONDS + CIERRE_NUDGE_MAX_ATRASO + 3600)
+    _nudge_ensure_sweeper()
+
+
+def nudge_cancel(phone: str) -> None:
+    _state_store.nudge_clear(phone)
+
+
+def nudge_deliver(phone: str, ctx: dict) -> bool:
+    armed_at = float(ctx.get("armed_at") or 0)
+    if armed_at:
+        atraso = time.time() - (armed_at + CIERRE_NUDGE_SECONDS)
+        if atraso > CIERRE_NUDGE_MAX_ATRASO:
+            log.warning("cierre_nudge_descartado_por_atraso phone_last4=%s horas=%.1f",
+                        _digits(phone)[-4:], atraso / 3600)
+            return False
+    ok = send_msg(phone, cc.NUDGE)
+    if ok:
+        # Marca de ciclo: una respuesta posterior de Vicky ya no reprograma
+        # esta misma frase. La limpia el siguiente acuse.
+        data = _ensure_user(phone)
+        data["nudge_entregado"] = True
+        user_data[phone] = data
+    return ok
+
+
+def nudge_sweep_once() -> int:
+    entregados = 0
+    for phone, ctx in _state_store.nudge_pop_due(time.time()):
+        try:
+            if nudge_deliver(phone, ctx):
+                entregados += 1
+        except Exception:
+            log.exception("cierre_nudge_error phone_last4=%s", _digits(phone)[-4:])
+    return entregados
+
+
+def _nudge_loop() -> None:
+    while True:
+        time.sleep(max(CIERRE_NUDGE_TICK, 5))
+        try:
+            nudge_sweep_once()
+        except Exception:
+            log.exception("cierre_nudge_barrido_fallido")
+
+
+def _nudge_ensure_sweeper() -> None:
+    """Arranca el barrido una sola vez por proceso, de forma perezosa: mientras
+    nadie programe un recordatorio no hace falta ningun hilo."""
+    global _nudge_sweeper_started
+    if not CIERRE_NUDGE_SWEEPER or _nudge_sweeper_started:
+        return
+    with _nudge_sweeper_lock:
+        if _nudge_sweeper_started:
+            return
+        _NUDGE_THREAD_CLS(target=_nudge_loop, daemon=True,
+                          name="CierreNudgeSweeper").start()
+        _nudge_sweeper_started = True
 
 # ── Menú general ──────────────────────────────────────────────────────────────
 _MENU = (
@@ -2840,6 +3023,13 @@ def _imss_flow_handle_handoff(phone: str, step_data: dict, flow_token: str) -> d
         log.error("imss_flow_cierre_no_entregado phone_last4=%s", _digits(phone)[-4:])
         _imss_log_lead_backup(phone, data, resultado="cierre_send_failed")
     else:
+        # Acuse de cortesia automatico: el prospecto acaba de terminar el
+        # cuestionario y ya vio su propuesta, asi que se le agradece y se le
+        # confirma el contacto SIN esperar a que escriba otra vez. Solo se
+        # manda si el cierre si llego: agradecer por una propuesta que el
+        # cliente nunca vio seria peor que no decir nada.
+        send_msg(phone, cc.ACUSE_PROPUESTA)
+        nudge_arm(phone, "acuse_propuesta_flow", inicia_ciclo=True)
         _imss_flow_marcar(completado_key)
 
     return imss_flow.build_success_response(flow_token, {"resultado": "calificado"})
@@ -3299,15 +3489,40 @@ def funnel_imss(phone: str, msg: str) -> None:
 
     if state == "imss_post_cierre":
         n_msg = norm(msg).strip()
+        ya_despedido = data.get("cierre_tipo") == "despedida"
+
+        if cc.es_respuesta_negativa(n_msg):
+            # "No gracias" / "asi esta bien": se le agradece el tiempo y la
+            # atencion y ahi termina. No se reprograma el recordatorio -- el
+            # cliente ya dijo que no necesita nada mas.
+            if not ya_despedido:
+                send_msg(phone, cc.DESPEDIDA_NEGATIVA)
+                data["cierre_tipo"] = "despedida"
+                user_data[phone] = data
+            nudge_cancel(phone)
+            return
+
         if _is_pure_courtesy_message(n_msg):
+            if ya_despedido:
+                # Ya hubo despedida: la cortesia se absorbe en silencio, sin
+                # volver a ofrecer nada ni caer en el fallback neutral.
+                return
             if data.get("cierre_tipo") == "revision_aceptada":
-                send_msg(phone, "Con gusto 😊\nChristian revisará tu caso y te contactará a la brevedad.")
-            else:
-                send_msg(phone,
-                    "Con gusto 😊\nSi después quieres revisar una propuesta, escríbeme "
-                    "\"Préstamo IMSS\" o \"cuánto me prestan\".")
-        else:
-            send_msg(phone, "¡Con gusto! Si necesitas algo más, aquí estoy 😊")
+                if not data.get("cortesia_final_enviada"):
+                    send_msg(phone, cc.CORTESIA_FINAL)
+                    data["cortesia_final_enviada"] = True
+                    user_data[phone] = data
+                    nudge_arm(phone, "cortesia_final")
+                # El estado NO se libera: si el cliente contesta que no
+                # necesita nada mas, esa negativa todavia tiene donde caer.
+                return
+            send_msg(phone,
+                "Con gusto 😊\nSi después quieres revisar una propuesta, escríbeme "
+                "\"Préstamo IMSS\" o \"cuánto me prestan\".")
+            reset(phone)
+            return
+
+        send_msg(phone, "¡Con gusto! Si necesitas algo más, aquí estoy 😊")
         reset(phone)
         return
 
@@ -3328,7 +3543,13 @@ def funnel_imss(phone: str, msg: str) -> None:
 
         # Cierre + pregunta de horario en UNA sola burbuja (ya no se manda una
         # segunda pregunta suelta de horario).
-        send_msg(phone, _imss_build_closing_statement(data))
+        cierre_entregado = send_msg(phone, _imss_build_closing_statement(data))
+
+        # Mismo acuse automatico que el Flow dinamico: la conversacion no se
+        # queda esperando a que el cliente escriba para agradecerle.
+        if cierre_entregado:
+            send_msg(phone, cc.ACUSE_PROPUESTA)
+            nudge_arm(phone, "acuse_propuesta_texto", inicia_ciclo=True)
 
         # Notificar al asesor ANTES de quedar a la espera del horario -- el
         # lead ya debe quedar calificado y registrado aunque el prospecto
@@ -3346,13 +3567,26 @@ def funnel_imss(phone: str, msg: str) -> None:
 
     if state == "imss_q_horario_calc":
         n_horario = norm(msg).strip()
+        if cc.es_respuesta_negativa(n_horario):
+            # Una negativa tampoco es un horario. Sin esto, "no gracias" se
+            # guardaba como horario_contacto y el asesor recibia una hora de
+            # contacto que el cliente nunca dio.
+            send_msg(phone, cc.DESPEDIDA_NEGATIVA)
+            nudge_cancel(phone)
+            _imss_close(phone, tipo="despedida", data=data)
+            return
         if _is_pure_courtesy_message(n_horario):
             # Cortesia pura (gracias/ok/listo/etc), no es un horario: no se
             # guarda horario_contacto ni se manda una actualizacion falsa al
             # asesor. Se cierra de forma segura (menor friccion) conservando
             # los datos comerciales ya capturados.
-            send_msg(phone, "¡Con gusto! Christian López te contactará pronto. 😊")
+            send_msg(phone, cc.CORTESIA_FINAL)
+            data["cortesia_final_enviada"] = True
             _imss_close(phone, tipo="revision_aceptada", data=data)
+            # La cortesia termina con "escriba menu si requiere algun otro
+            # servicio": esa oferta queda abierta, asi que le corresponde la
+            # misma hora de espera que a la pregunta de horario.
+            nudge_arm(phone, "cortesia_final")
             return
         # 1/2/3 se resuelven contra las etiquetas que el cliente realmente vio;
         # cualquier otro texto valido se conserva como horario libre con el
@@ -3866,6 +4100,11 @@ def _handle_dispatch(msg_obj: dict) -> None:
             _seen_ids.add(mid)
     _tl.mid = mid
 
+    # El cliente respondio: se cancela el recordatorio de cierre pendiente.
+    # Va aqui, antes de cualquier ruteo, para que valga aunque el mensaje
+    # termine en un funnel, en el menu, en Boardroom o descartado.
+    nudge_cancel(phone)
+
     # Cualquier mensaje del asesor reabre su ventana de 24h en WhatsApp. Se
     # registra aqui, antes de cualquier ruteo, para que valga aunque el mensaje
     # termine en un funnel, en el menu o descartado. No altera el ruteo.
@@ -3941,11 +4180,15 @@ def _handle_dispatch(msg_obj: dict) -> None:
         # conversacion (ej. opcion 6 -> "si" -> fallback en vez de la
         # siguiente pregunta del funnel).
         active_state = user_state.get(phone, "")
-        if active_state == "imss_post_cierre" and not _is_pure_courtesy_message(norm(text_for_boardroom) if text_for_boardroom else ""):
-            # Mensaje post-cierre que no es cortesia pura (ej. "gracias, tambien
-            # quiero cotizar auto"): se libera el estado y se deja caer al resto
-            # del pre-router (menu/opciones/intent IMSS/campana/Boardroom) en vez
-            # de tragarlo como agradecimiento.
+        _n_post_cierre = norm(text_for_boardroom) if text_for_boardroom else ""
+        if active_state == "imss_post_cierre" and not (
+            _is_pure_courtesy_message(_n_post_cierre)
+            or cc.es_respuesta_negativa(_n_post_cierre)
+        ):
+            # Mensaje post-cierre que no es cortesia ni negativa de cierre (ej.
+            # "gracias, tambien quiero cotizar auto"): se libera el estado y se
+            # deja caer al resto del pre-router (menu/opciones/intent IMSS/
+            # campana/Boardroom) en vez de tragarlo como agradecimiento.
             reset(phone)
             active_state = ""
         elif active_state.startswith("imss_"):
@@ -4144,7 +4387,9 @@ def _handle_dispatch(msg_obj: dict) -> None:
         return
 
     state = user_state.get(phone, "")
-    if state == "imss_post_cierre" and not _is_pure_courtesy_message(n):
+    if state == "imss_post_cierre" and not (
+        _is_pure_courtesy_message(n) or cc.es_respuesta_negativa(n)
+    ):
         reset(phone)
         state = ""
     elif state.startswith("imss_"):
@@ -4627,6 +4872,13 @@ def ext_lead():
 
 # ── Arranque ──────────────────────────────────────────────────────────────────
 _sheets_init()
+
+# Recordatorios de cierre que quedaron pendientes en Valkey de un worker
+# anterior: el barrido es perezoso, asi que sin esto solo arrancaria cuando
+# alguien programe uno nuevo y los pendientes se entregarian tarde o nunca.
+# Sin Valkey no hay nada que recuperar (el estado murio con el proceso).
+if _state_store.is_durable():
+    _nudge_ensure_sweeper()
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))

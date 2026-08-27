@@ -32,6 +32,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app as vicky_app
+import cierre_cortesia as cc
 
 
 class ImmediateThread:
@@ -45,6 +46,15 @@ class ImmediateThread:
 
 
 PHONE = "6685550000"
+
+
+def _cierre(sent):
+    """Ultima burbuja del cierre determinista. Desde el acuse automatico
+    post-propuesta, sent[-1] es el agradecimiento, no el cierre."""
+    for _, texto in reversed(sent):
+        if texto != cc.ACUSE_PROPUESTA:
+            return texto
+    raise AssertionError("no se envio ningun cierre")
 
 
 def _text_msg(phone: str, text: str, mid: str) -> dict:
@@ -704,7 +714,7 @@ def test_closing_uses_monto_alternative(monkeypatch):
     sent, advisor_msgs, _, _ = _to_proposal(monkeypatch)
     vicky_app.handle(_text_msg(PHONE, "y si quiero 80000", "m4"))
     _accept_and_close()
-    cierre = sent[-1][1]
+    cierre = _cierre(sent)
     cuota = vicky_app._imss_calcular_cuota(80000.0, 60)
     assert "$80,000" in cierre
     assert f"${cuota:,.0f} mensuales durante 60 meses" in cierre
@@ -716,7 +726,7 @@ def test_closing_uses_plazo_alternative(monkeypatch):
     vicky_app.handle(_text_msg(PHONE, "30 meses", "m4"))
     _accept_and_close()
     esperado = vicky_app.calcular_propuesta_imss(12000, 30)
-    cierre = sent[-1][1]
+    cierre = _cierre(sent)
     assert f"${esperado['monto']:,.0f}" in cierre
     assert f"${esperado['cuota']:,.0f} mensuales durante 30 meses" in cierre
 
@@ -726,7 +736,7 @@ def test_closing_uses_monto_and_plazo_alternative(monkeypatch):
     vicky_app.handle(_text_msg(PHONE, "60000 a 36 meses", "m4"))
     ultima_propuesta_visible = sent[-1][1]
     _accept_and_close()
-    cierre = sent[-1][1]
+    cierre = _cierre(sent)
     cuota = vicky_app._imss_calcular_cuota(60000.0, 36)
     assert "$60,000" in ultima_propuesta_visible and "36 meses" in ultima_propuesta_visible
     assert "$60,000" in cierre
@@ -738,7 +748,7 @@ def test_closing_uses_automatic_viable_plazo(monkeypatch):
     vicky_app.handle(_text_msg(PHONE, "6 meses", "m4"))
     _accept_and_close()
     viable = vicky_app.calcular_propuesta_imss(12000, 18)
-    cierre = sent[-1][1]
+    cierre = _cierre(sent)
     assert f"${viable['monto']:,.0f}" in cierre
     assert f"${viable['cuota']:,.0f} mensuales durante 18 meses" in cierre
 
@@ -764,7 +774,7 @@ def test_closing_and_advisor_notification_share_the_same_figures(monkeypatch):
         sent, advisor_msgs, _, _ = _to_proposal(monkeypatch, pension="12000")
         vicky_app.handle(_text_msg(PHONE, seguimiento, "m4"))
         _accept_and_close()
-        cierre = sent[-1][1]
+        cierre = _cierre(sent)
         aviso = advisor_msgs[-1]
         monto, cuota, plazo = vicky_app._imss_get_propuesta_activa(_data())
         assert f"${monto:,.0f}" in cierre and f"${monto:,.0f}" in aviso, seguimiento
@@ -777,7 +787,7 @@ def test_never_silently_reverts_to_original_proposal(monkeypatch):
     original_monto = _data()["propuesta_monto"]
     vicky_app.handle(_text_msg(PHONE, "30 meses", "m4"))
     _accept_and_close()
-    cierre = sent[-1][1]
+    cierre = _cierre(sent)
     assert f"${original_monto:,.0f}" not in cierre
     assert f"Monto estimado: ${original_monto:,.0f}" not in advisor_msgs[-1]
 
@@ -940,9 +950,10 @@ def test_closing_and_horario_in_a_single_bubble(monkeypatch):
     _freeze_horario(monkeypatch, MARTES_10AM)   # escenario A: hoy + mañana
     antes = len(sent)
     _accept_and_close()
-    # 3 turnos -> 3 burbujas: nombre, ciudad, cierre+horario.
-    assert len(sent) - antes == 3
-    cierre = sent[-1][1]
+    # 3 turnos -> 4 burbujas: nombre, ciudad, cierre+horario y el acuse
+    # automatico de cortesia que cierra el turno sin esperar al cliente.
+    assert len(sent) - antes == 4
+    cierre = _cierre(sent)
     assert "✅ *Listo, Juan. Ya tenemos una propuesta estimada para ti.*" in cierre
     assert "📞 *¿Cuándo prefieres que te llame Christian?*" in cierre
     assert "1️⃣ Hoy por la tarde" in cierre
@@ -964,7 +975,7 @@ def test_no_separate_second_horario_question(monkeypatch):
 def test_closing_vrim_reference_is_brief(monkeypatch):
     sent, _, _, _ = _to_proposal(monkeypatch)
     _accept_and_close()
-    cierre = sent[-1][1]
+    cierre = _cierre(sent)
     assert "membresía VRIM Plus por 12 meses*, sujeta a formalización" in cierre
     # No repite coberturas ni vuelve a pedir aceptacion de VRIM.
     for cobertura in ("ambulancia", "check-up", "videoconsulta", "funerario",
@@ -1016,7 +1027,7 @@ def test_closing_statement_reads_the_active_proposal():
 def test_closing_uses_first_name_only(monkeypatch):
     sent, _, _, _ = _to_proposal(monkeypatch)
     _accept_and_close(nombre="Maria Fernanda Ruiz Soto")
-    assert "*Listo, Maria." in sent[-1][1]
+    assert "*Listo, Maria." in _cierre(sent)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1380,7 +1391,7 @@ def test_offered_options_are_persisted_on_closing(monkeypatch):
     _accept_and_close()
     ofrecidos = _data()["imss_horarios_ofrecidos"]
     assert ofrecidos == vicky_app._imss_build_horario_opciones(SABADO_1759)
-    cierre = sent[-1][1]
+    cierre = _cierre(sent)
     for numero, etiqueta in (("1️⃣", ofrecidos["1"]), ("2️⃣", ofrecidos["2"]), ("3️⃣", ofrecidos["3"])):
         assert f"{numero} {etiqueta}" in cierre
 
@@ -1389,7 +1400,7 @@ def test_closing_omits_free_text_invitation_when_option_3_is_other(monkeypatch):
     sent, _, _, _ = _to_proposal(monkeypatch)
     _freeze_horario(monkeypatch, DOMINGO_9AM)
     _accept_and_close()
-    cierre = sent[-1][1]
+    cierre = _cierre(sent)
     assert "3️⃣ Otro día y horario específico" in cierre
     # No se repite la invitacion, la opcion 3 ya la representa.
     assert cierre.count("otro día y horario específico") == 0
@@ -1448,7 +1459,7 @@ def test_advisor_label_equals_the_label_shown_to_the_client(monkeypatch):
             sent, advisor_msgs, _, _ = _to_proposal(monkeypatch)
             _freeze_horario(monkeypatch, momento)
             _accept_and_close()
-            cierre = sent[-1][1]
+            cierre = _cierre(sent)
             vicky_app.handle(_text_msg(PHONE, opcion, "h1"))
             etiqueta = _data()["horario_contacto"]
             assert f"{opcion}️⃣ {etiqueta}" in cierre, (momento, opcion)
