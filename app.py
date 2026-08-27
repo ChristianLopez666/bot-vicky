@@ -4372,11 +4372,36 @@ def webhook():
         for entry in data.get("entry", []):
             for chg in entry.get("changes", []):
                 value = chg.get("value") or {}
+                metadata = value.get("metadata") or {}
+                incoming_phone_id = str(metadata.get("phone_number_id") or "").strip()
+
+                # Meta suscribe webhooks a nivel WABA: este servicio puede
+                # recibir eventos de SECOM, Rodys u otros numeros de la misma
+                # cuenta. Redes solo procesa su propio phone_number_id.
+                if WABA_ID:
+                    if incoming_phone_id and incoming_phone_id != WABA_ID:
+                        log.info(
+                            "🧱 Webhook descartado por phone_number_id ajeno: recibido=%s esperado=%s",
+                            incoming_phone_id, WABA_ID,
+                        )
+                        continue
+                else:
+                    # Fallback legacy: evita dejar mudo el bot, pero hace visible
+                    # como ERROR que el aislamiento no esta operativo.
+                    log.error(
+                        "❌ WABA_PHONE_ID no configurado: aislamiento webhook degradado; "
+                        "procesando evento en modo legacy"
+                    )
+
+                if not incoming_phone_id:
+                    log.warning(
+                        "⚠️ Webhook sin metadata.phone_number_id; procesando por compatibilidad"
+                    )
+
                 for msg in value.get("messages", []):
                     handle(msg)
-                # Bucle hermano, no alternativo: un webhook mixto trae messages[]
-                # y statuses[] a la vez y ambos deben procesarse. Hasta ahora la
-                # clave `statuses` simplemente no se leia nunca.
+                # Statuses ajenos se descartan por la misma guardia ANTES de
+                # llegar aqui; nunca deben activar reintentos ni efectos de Redes.
                 _handle_statuses(value.get("statuses", []))
         return jsonify({"status": "ok"}), 200
     except Exception:
