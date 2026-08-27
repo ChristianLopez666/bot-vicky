@@ -294,13 +294,16 @@ def build_flow_message_payload(to: str, flow_id: str, flow_token: str) -> Dict[s
             "body": {
                 # Tres bloques cortos en vez de un parrafo corrido: el publico
                 # objetivo escanea, no lee. El ultimo bloque es la instruccion
-                # y va aparte, con la flecha apuntando al boton -- para quien
-                # no tiene claro que es un boton, "el verde de abajo" es la
-                # unica referencia que no falla.
+                # y va aparte -- para quien no tiene claro que es un boton,
+                # "el verde de abajo" es la referencia que no falla.
+                #
+                # SIN emoji a proposito: el senalador vive en el flow_cta, que
+                # es lo que hay que tocar. Dos manos apuntando a lo mismo se
+                # anulan entre si y ninguna manda.
                 "text": "En segundos te digo cuánto podrías recibir y "
                 "cuánto pagarías al mes."
                 "\n\nSon 3 preguntas. Sin documentos y sin compromiso."
-                "\n\n👇 Toca el botón verde de aquí abajo."
+                "\n\nToca el botón verde de aquí abajo."
             },
             "footer": {"text": "Christian López · COHIFIS"},
             "action": {
@@ -316,7 +319,15 @@ def build_flow_message_payload(to: str, flow_id: str, flow_token: str) -> Dict[s
                     # en tests/test_imss_dynamic_flow_crypto.py, que es la unica
                     # red antes de produccion (Meta rechaza el envio, no hay
                     # error en pruebas locales).
-                    "flow_cta": "Toca aquí",
+                    # La mano va DENTRO del boton, y solo aqui: entre la
+                    # instruccion del cuerpo y el boton se interpone el footer,
+                    # asi que una flecha alla arriba senalaba a traves de otro
+                    # renglon. Aqui el boton se senala a si mismo.
+                    #
+                    # Mano hacia la DERECHA, no hacia abajo: dentro del boton
+                    # apunta a las palabras que hay que tocar. La de abajo
+                    # apuntaria al piso.
+                    "flow_cta": "👉 Toca aquí",
                     "flow_action": "navigate",
                     "flow_action_payload": {"screen": SCREEN_PROFILE},
                 },
