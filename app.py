@@ -1535,8 +1535,12 @@ def reset(phone: str):
 # ultima linea de una conversacion que el propio cliente abrio hace menos de
 # una hora, asi que va en texto libre dentro de la ventana de 24h de Meta.
 #
-# Cualquier mensaje entrante del cliente cancela el recordatorio pendiente
-# (ver _handle_dispatch): "si no responde" significa exactamente eso.
+# INVARIANTE: el recordatorio se arma en UN solo lugar por conversacion -- el
+# cierre automatico que entrega la propuesta -- y cualquier mensaje entrante
+# del cliente lo cancela (ver _handle_dispatch). Ninguna respuesta de Vicky a
+# un mensaje del cliente lo vuelve a armar: si el cliente contesto, ya
+# respondio, y "si no responde en una hora" dejo de aplicar. Rearmarlo despues
+# de la cortesia convertia el cierre en un segundo mensaje no pedido.
 CIERRE_NUDGE_SECONDS = int(os.getenv("CIERRE_NUDGE_SECONDS", "3600") or 3600)
 # Un barrido puede atrasarse (reinicio del worker, Redis intermitente). Un
 # recordatorio muy vencido ya no se entrega: llegar 20 horas tarde es peor que
@@ -3486,7 +3490,6 @@ def funnel_imss(phone: str, msg: str) -> None:
                     send_msg(phone, cc.CORTESIA_FINAL)
                     data["cortesia_final_enviada"] = True
                     user_data[phone] = data
-                    nudge_arm(phone, "cortesia_final")
                 # El estado NO se libera: si el cliente contesta que no
                 # necesita nada mas, esa negativa todavia tiene donde caer.
                 return
@@ -3557,7 +3560,6 @@ def funnel_imss(phone: str, msg: str) -> None:
             send_msg(phone, cc.CORTESIA_FINAL)
             data["cortesia_final_enviada"] = True
             _imss_close(phone, tipo="revision_aceptada", data=data)
-            nudge_arm(phone, "cortesia_final")
             return
         # 1/2/3 se resuelven contra las etiquetas que el cliente realmente vio;
         # cualquier otro texto valido se conserva como horario libre con el
@@ -3577,7 +3579,6 @@ def funnel_imss(phone: str, msg: str) -> None:
                         "en el horario indicado.* 😊")
         notify_advisor(f"⏰ HORARIO DE CONTACTO — {data.get('nombre', 'ND')} — {horario}")
         _imss_close(phone, tipo="revision_aceptada", data=data)
-        nudge_arm(phone, "horario_registrado")
         return
 
 
