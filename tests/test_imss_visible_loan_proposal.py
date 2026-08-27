@@ -17,6 +17,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app as vicky_app
+import cierre_cortesia as cc
 
 
 class ImmediateThread:
@@ -27,6 +28,14 @@ class ImmediateThread:
 
     def start(self):
         self.target(*self.args, **self.kwargs)
+
+
+def _cierre(sent):
+    """Cierre determinista: sent[-1] es ahora el acuse automatico."""
+    for _, texto in reversed(sent):
+        if texto != cc.ACUSE_PROPUESTA:
+            return texto
+    raise AssertionError("no se envio ningun cierre")
 
 
 def _text_msg(phone: str, text: str, mid: str) -> dict:
@@ -315,7 +324,7 @@ def test_captures_city_and_closes_with_review_message(monkeypatch):
     # Sin horario: el cierre determinista es la ULTIMA burbuja -- ahora
     # incluye la pregunta de horario en el mismo mensaje.
     sent, advisor_msgs, _ = _run_full_imss_flow(monkeypatch, with_horario=False)
-    closing = sent[-1][1]
+    closing = _cierre(sent)
     assert "Christian" in closing
     assert "revisará" in closing
     for forbidden in ("aprobado", "autorizado", "ya calificaste", "garantizado"):
@@ -325,7 +334,7 @@ def test_captures_city_and_closes_with_review_message(monkeypatch):
 
 def test_closing_message_references_real_captured_data(monkeypatch):
     sent, _, _ = _run_full_imss_flow(monkeypatch, with_horario=False)
-    closing = sent[-1][1]
+    closing = _cierre(sent)
     data = vicky_app.user_data.get("6682222222", {})
     assert f"{data['pension']:,.0f}" in closing
     assert f"{data['propuesta_monto']:,.0f}" in closing
@@ -459,10 +468,12 @@ def test_gracias_after_successful_close_gets_courtesy_not_fallback(monkeypatch):
     vicky_app.handle(_text_msg("6682222222", "gracias", "m8"))
     assert boardroom_calls == []
     assert all(vicky_app.NEUTRAL_FALLBACK_MESSAGE not in s[1] for s in sent)
-    assert "Christian" in sent[-1][1]
+    # La cortesia final es sin genero y ofrece el menu; el estado se conserva
+    # para que una negativa posterior ("no gracias") todavia tenga donde caer.
+    assert sent[-1][1] == cc.CORTESIA_FINAL
     # no se manda notificacion adicional al asesor por la cortesia
     assert len(advisor_msgs) == 3
-    assert vicky_app.user_state.get("6682222222") is None
+    assert vicky_app.user_state.get("6682222222") == "imss_post_cierre"
 
 
 def test_courtesy_after_successful_close_does_not_spam_on_second_message(monkeypatch):
@@ -515,10 +526,9 @@ def test_no_neutral_fallback_during_imss_flow(monkeypatch):
 def test_no_duplicate_responses_in_imss_flow(monkeypatch):
     sent, advisor_msgs, boardroom_calls = _run_full_imss_flow(monkeypatch)
     # bienvenida, ley73->pension, propuesta, VRIM, nombre?, ciudad?,
-    # cierre+horario (una sola burbuja), confirmacion horario = 8 burbujas
-    # para 7 turnos. Antes eran 9: el cierre y la pregunta de horario se
-    # unificaron en un solo mensaje.
-    assert len(sent) == 8
+    # cierre+horario (una sola burbuja), acuse automatico de cortesia,
+    # confirmacion horario = 9 burbujas para 7 turnos.
+    assert len(sent) == 9
 
 
 # Contrato tecnico: product_code no cambia
