@@ -1,0 +1,15 @@
+# Vicky Redes → Radar, contrato 1.1
+
+Namespace fijo de prospectos: uuid5(uuid.NAMESPACE_URL, "https://cohifis.com.mx/vicky/redes/leads"). Nombre de UUID: teléfono canónico 521 + últimos diez dígitos, después de validar el formato mexicano. lead_id = RS- + UUID resultante. No cambiarlo tras activar: rompería identidades. Namespace de eventos: uuid5(uuid.NAMESPACE_URL, "https://cohifis.com.mx/vicky/events"); nombre source|event_type|clave según contrato. Fuente exclusiva vicky_redes.
+
+Bitácora durable: EVENTOS_RADAR_REDES, dentro del spreadsheet existente SHEETS_ID_CONVERSACIONES. Conserva columnas del contrato, estados de entrega y payload original. No usa memoria como único respaldo ni agrega servicios. Transporte firmado con token y HMAC propios de Redes. No compartir con SECOM.
+
+Variables: RADAR_RECORD_ENABLED=true para observar; RADAR_EMIT_ENABLED=true para entregar. Ambas apagadas por defecto hasta configurar y validar. RADAR_EVENTS_URL debe apuntar a /api/v1/vicky/events de Radar; RADAR_VICKY_TOKEN, RADAR_VICKY_HMAC_SECRET y RADAR_SITE_DISPATCH_TOKEN deben corresponder al Site. En Radar configurar VICKY_REDES_TOKEN, VICKY_REDES_HMAC_SECRET y VICKY_REDES_PHONE_NUMBER_ID con el mismo WABA_PHONE_ID del bot. Reutiliza GOOGLE_CREDENTIALS_JSON y SHEETS_ID_CONVERSACIONES, sin cambiar otras variables.
+
+Registra inbound, requested, sent, failed y estados sent/delivered/read/failed. Excluye el número del asesor de la cartera de prospectos. No altera el contenido ni el resultado de las llamadas WhatsApp. Un timeout de Meta no inventa un fallo definitivo: conserva requested. Los avisos al asesor siguen su instrumentación existente; no se convierten en contacto efectivo ni venta. El conector observa, no dirige campañas.
+
+La recuperación corre en el proceso existente: páginas de 200 filas, hasta 10 intentos por ciclo de 60 segundos, backoff hasta 15 minutos. Cada hilo tiene transporte Google propio. El request_id de los estados se recupera de la bitácora por fuente + phone_number_id + lead_id + wamid; si es desconocido o ambiguo, espera. Un 200 sin acuse exacto no confirma entrega. Un 401/403 apaga el cliente hasta corregir configuración/reiniciar. Si falla la escritura inicial de Sheets, el evento aún no es recuperable por la cola. No promete captura sin pérdidas bajo caída de Sheets.
+
+Validación: pruebas unitarias de identidad, aislamiento, captura, correlación, reinicio, reintento, acuse y protección de filas; pruebas Flask de integración; los cuatro tipos inbound/requested/sent/read generados por el conector pasan el parser real de Radar. La suite GitHub Actions debe aprobar antes de integrar. Producción pendiente de configurar Render, activar flags y verificar evento → D1 → prospecto y reinicio.
+
+Reversión: apagar RADAR_EMIT_ENABLED y RADAR_RECORD_ENABLED o revertir este cambio. Conservar ambas bitácoras y datos de Radar.

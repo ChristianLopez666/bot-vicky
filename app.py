@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 
 import whatsapp_interactive as wai
 import imss_flow
+import radar_bridge
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -278,6 +279,13 @@ else:
 
 # ── Flask + estado ────────────────────────────────────────────────────────────
 app = Flask(__name__)
+_radar = radar_bridge.from_environment(phone_id=WABA_ID, advisor=ADVISOR_NUM, credentials=GG_CREDS, sheet_id=SHEET_ID)
+
+
+@app.before_request
+def _radar_start_outbox():
+    _radar.start()
+
 _state_store = StateStore()
 user_state = _StateMap(_state_store)
 user_data = _DataMap(_state_store)
@@ -529,7 +537,11 @@ _WA_BASE = "https://graph.facebook.com/v20.0"
 def _wa_post(payload: dict) -> requests.Response:
     url = f"{_WA_BASE}/{WABA_ID}/messages"
     hdr = {"Authorization": f"Bearer {META_TOKEN}", "Content-Type": "application/json"}
-    return requests.post(url, headers=hdr, json=payload, timeout=15)
+    request_id = str(uuid.uuid4())
+    _radar.requested(payload, request_id)
+    response = requests.post(url, headers=hdr, json=payload, timeout=15)
+    _radar.response(payload, request_id, response)
+    return response
 
 def send_msg(to: str, text: str) -> bool:
     if not META_TOKEN or not WABA_ID:
@@ -4398,6 +4410,10 @@ def webhook():
                         "⚠️ Webhook sin metadata.phone_number_id; procesando por compatibilidad"
                     )
 
+                try:
+                    _radar.webhook(value)
+                except Exception as exc:
+                    log.warning("Radar no pudo registrar el webhook (%s)", type(exc).__name__)
                 for msg in value.get("messages", []):
                     handle(msg)
                 # Statuses ajenos se descartan por la misma guardia ANTES de
@@ -4657,3 +4673,4 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     log.info(f"🚀 Vicky Bot en puerto {port}")
     app.run(host="0.0.0.0", port=port)
+
