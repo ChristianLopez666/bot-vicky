@@ -39,7 +39,8 @@ class RadarBridge:
         self._tab_ready = False
         self.client = client or RadarClient(url="", token="", hmac_secret="")
         self.log = EventLog(self._append)
-        self.worker = OutboxWorker(lambda: SheetsOutbox(self._service(), self.sheet_id), self.client)
+        self.worker = OutboxWorker(lambda: SheetsOutbox(self._service(), self.sheet_id), self.client,
+                                   fingerprint=self.client.fingerprint(self.phone_id))
 
     def _service(self):
         if not self.credentials or not self.sheet_id:

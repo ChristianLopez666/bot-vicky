@@ -36,6 +36,9 @@ EVENTS_HEADER = [
 PENDIENTE = "PENDIENTE"
 ENVIADO = "ENVIADO"
 RECHAZADO = "RECHAZADO"
+# Radar rechazo la credencial, la firma o el numero (401/403). No es culpa del
+# evento: vuelve a intentarse cuando el circuito de autenticacion se cierra.
+RECHAZADO_AUTH = "RECHAZADO_AUTH"
 
 EVENT_TYPES = {
     "message_requested",
@@ -365,6 +368,71 @@ STATUS_TO_EVENT = {
 
 
 # ==========================
+# Motivo de rechazo: allowlist, nunca texto libre
+# ==========================
+# Solo se conservan codigos y mensajes de Radar ya conocidos, con su fuente.
+# Cualquier otra cosa se reemplaza por DETALLE_OMITIDO: un cuerpo de error
+# puede traer telefonos, correos, tokens o URLs, y el log y la hoja no son
+# lugar para eso. Agregar una entrada aqui exige evidencia de que Radar la usa.
+DETALLE_OMITIDO = "detalle_omitido"
+RESPUESTA_NO_ESTRUCTURADA = "respuesta_no_estructurada"
+
+KNOWN_ERRORS = frozenset({
+    "invalid_payload",                 # log de produccion SECOM, 17-sep 20:00 UTC
+    "invalid_signature",               # contrato confirmado por Work, 9-sep
+    "source_header_body_mismatch",     # idem
+    "phone_number_id_not_authorized",  # idem
+})
+KNOWN_DETAILS = frozenset({
+    "advisor_notification no es válido.",                       # produccion, 17-sep
+    "Firma invalida",                                           # aceptacion real, 10-sep
+    "phone_number_id no autorizado para esta fuente",           # idem
+    "Contrato o fuente de cabecera no coincide con el cuerpo",  # idem
+    "Vicky Redes requiere lead.lead_id RS-<uuid5>.",            # contrato Work, 9-sep
+    "lead.phone_e164 debe usar 521 + 10 dígitos.",              # idem
+    "message_requested requiere delivery.status=requested.",   # idem
+})
+
+
+def _response_fingerprint(raw: bytes, key: str) -> str:
+    """HMAC-SHA256 del cuerpo crudo con el secreto del canal.
+
+    No reversible: un SHA-256 simple de un cuerpo corto (p. ej. con un
+    telefono) se podria reconstruir por fuerza bruta. Con la clave del canal,
+    quien lea el log no puede; Radar, que tiene el mismo secreto, si puede
+    calcularlo sobre su propia respuesta para identificar cual fue.
+    """
+    import hashlib
+    import hmac as _hmac
+    return _hmac.new((key or "").encode("utf-8"), raw or b"", hashlib.sha256).hexdigest()
+
+
+def rejection_summary(resp: Any, key: str = "") -> Dict[str, Any]:
+    """Resumen seguro de una respuesta de error de Radar. Nunca el cuerpo."""
+    codigo = getattr(resp, "status_code", 0)
+    raw = getattr(resp, "content", None)
+    if not isinstance(raw, (bytes, bytearray)):
+        raw = str(getattr(resp, "text", "") or "").encode("utf-8")
+    resumen = {"http": codigo, "error": RESPUESTA_NO_ESTRUCTURADA,
+               "detalle": RESPUESTA_NO_ESTRUCTURADA,
+               "huella": _response_fingerprint(bytes(raw), key)}
+    try:
+        cuerpo = resp.json()
+    except Exception:
+        cuerpo = None
+    if isinstance(cuerpo, dict):
+        error, detalle = cuerpo.get("error"), cuerpo.get("detail")
+        resumen["error"] = error if isinstance(error, str) and error in KNOWN_ERRORS else DETALLE_OMITIDO
+        resumen["detalle"] = (detalle if isinstance(detalle, str) and detalle.strip() in KNOWN_DETAILS
+                              else DETALLE_OMITIDO)
+    return resumen
+
+
+def format_rejection(resumen: Dict[str, Any]) -> str:
+    return "http={http} error={error} detalle={detalle} huella={huella}".format(**resumen)
+
+
+# ==========================
 # Cliente HTTP hacia Radar
 # ==========================
 class RadarClient:
@@ -390,6 +458,18 @@ class RadarClient:
         self.timeout = timeout
         # Inyectable para poder probar sin red.
         self._post = poster
+        # Ultimo rechazo de autenticacion (solo campos de allowlist + huella).
+        self.last_rejection: Optional[Dict[str, Any]] = None
+
+    def fingerprint(self, extra: str = "") -> str:
+        """Huella corta de la configuracion de transporte.
+
+        Si cambia (se corrigio una credencial o la URL), el circuito de
+        autenticacion se cierra solo. Es un hash: no revela los secretos.
+        """
+        import hashlib
+        base = "|".join([self.url, self.token, self.hmac_secret, self.dispatch_token, str(extra or "")])
+        return hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
 
     def configured(self) -> bool:
         return bool(self.enabled and self.url and self.token and self.hmac_secret)
@@ -432,7 +512,7 @@ class RadarClient:
         return cabeceras
 
     def send(self, event: Dict[str, Any]) -> str:
-        """Devuelve el radar_state resultante: ENVIADO, RECHAZADO o PENDIENTE."""
+        """Devuelve el radar_state resultante: ENVIADO, RECHAZADO, RECHAZADO_AUTH o PENDIENTE."""
         if not self.configured():
             return PENDIENTE
 
@@ -465,14 +545,18 @@ class RadarClient:
         if codigo in (400, 413):
             log.error(
                 "Radar rechazo el evento %s con %s: %s",
-                event.get("event_id"), codigo, str(getattr(resp, "text", ""))[:300],
+                event.get("event_id"), codigo, format_rejection(rejection_summary(resp, self.hmac_secret)),
             )
             return RECHAZADO
         if codigo in (401, 403):
-            # Credencial o firma incorrectas. Se apaga el emisor: seguir
-            # intentando solo acumula rechazos y ruido.
-            log.error("Radar rechazo la autenticacion (%s); emisor apagado", codigo)
-            self.enabled = False
-            return PENDIENTE
+            # Credencial, firma o numero incorrectos. Antes se apagaba el
+            # emisor solo en memoria y se tiraba el motivo: cada reinicio lo
+            # volvia a encender y nadie sabia por que Radar decia que no
+            # (auditoria 18-sep, siete 403 sin causa). Ahora el motivo queda
+            # en el log (solo allowlist + huella) y el circuito persistente
+            # decide cuando volver a intentar.
+            self.last_rejection = rejection_summary(resp, self.hmac_secret)
+            log.error("Radar rechazo la autenticacion: %s", format_rejection(self.last_rejection))
+            return RECHAZADO_AUTH
         log.warning("Radar respondio %s; el evento queda pendiente", codigo)
         return PENDIENTE
