@@ -2,7 +2,7 @@
 
 Asistente **receptivo** de WhatsApp para GastroRadar. Sin Boardroom ni procesos financieros. No envía campañas.
 
-**Estado: NO APTO PARA DESPLIEGUE.** Ver [informe](docs/INFORME_AUDITORIA.md).
+**Estado: NO APTO PARA DESPLIEGUE.** Ver [cierre de la auditoría](docs/CIERRE_ISSUE_24.md) e [informe](docs/INFORME_AUDITORIA.md).
 
 ## Cómo funciona
 
@@ -13,6 +13,10 @@ Asistente **receptivo** de WhatsApp para GastroRadar. Sin Boardroom ni procesos 
 5. Un envío `incierto` no se reintenta solo, para no duplicar mensajes.
 
 Cola dentro de Redis y sin servicio "worker" aparte: evita pagar otro servicio. Si el volumen crece, los hilos pueden moverse a otro proceso sin cambiar el formato de la cola.
+
+## Negativas
+
+Una negativa a ser contactado ("no quiero un asesor", "cancelar") retira la solicitud y los avisos pendientes sin exigir BAJA. Volver a contactar requiere un SÍ nuevo. Alcance en el [cierre](docs/CIERRE_ISSUE_24.md).
 
 ## IA
 

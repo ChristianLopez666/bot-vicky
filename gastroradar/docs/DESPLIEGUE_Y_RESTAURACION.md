@@ -2,6 +2,10 @@
 
 **Nada de esto se ha ejecutado.** Cada paso que toca Render o Meta requiere autorización.
 
+**No fusionar a `main` sin desactivar Auto-Deploy:** fusionar redespliega y reinicia el bot publicado.
+
+**Configuración leída en Render (25-nov, solo lectura), servicio `bot-vicky-redes`:** commit `dc6f64d`, rama `main`, Auto-Deploy activado, Root Directory vacío, Build `pip install -r requirements.txt`, Start `gunicorn app:app`, plan Starter, 1 instancia. Variables de entorno y versión de Python: no leídas.
+
 ## 0. Antes de tocar nada (respaldo)
 
 1. En Render, abrir el servicio del bot y anotar: commit desplegado, rama, Auto-Deploy, **Root Directory**, **Build Command**, **Start Command**, versión de Python, plan, y plan y persistencia del Key Value.
@@ -40,7 +44,7 @@ Comprobar: `/ready` en 200; diagnóstico con token válido y número coincidente
 
 ## 4. Restauración
 
-1. Poner Root Directory, Build y Start **exactamente** como se anotaron en el paso 0. En GitHub el arranque figura como `gunicorn filtered_app:app --bind 0.0.0.0:$PORT --max-requests 200 --max-requests-jitter 50 --timeout 60`, pero manda lo que diga el panel.
+1. Poner Root Directory, Build y Start **exactamente** como se anotaron en el paso 0. El valor leído el 25-nov es Root Directory vacío y Start `gunicorn app:app`. `render.yaml` en GitHub dice otra cosa (`filtered_app:app`): no usarlo para restaurar.
 2. Desplegar el commit anotado. No dar por hecho que un "Rollback" de Render revierte también la configuración: revisarla.
 3. Verificar `/health` y una conversación real.
 4. Las claves nuevas usan el prefijo `vgr:` y las anteriores `vicky:`, así que no chocan.

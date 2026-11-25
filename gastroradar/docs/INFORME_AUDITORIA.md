@@ -2,6 +2,8 @@
 
 ## Dictamen: NO APTO PARA DESPLIEGUE
 
+**Actualización:** hallazgos de la auditoría de Work, 24 horas, costos y pruebas reales pendientes en [CIERRE_ISSUE_24.md](CIERRE_ISSUE_24.md). Ese documento manda sobre este.
+
 El código pasa sus pruebas locales con servicios simulados. No se ha probado contra WhatsApp, un Redis real, Google Sheets, OpenAI ni Render.
 
 El `app.py` v0.1 no se recibió. Esta versión se **escribió desde cero**: no es una auditoría de la v0.1. La auditoría es propia; falta la revisión independiente prevista.
@@ -11,32 +13,22 @@ El `app.py` v0.1 no se recibió. Esta versión se **escribió desde cero**: no e
 | Punto | Resultado |
 |---|---|
 | Commit en GitHub | `main` = `dc6f64d` (18-sep). PR 16 abierto. Repositorio **público** |
-| Versión en Render | **No verificada** |
+| Versión en Render | `dc6f64d`, igual que `main`. Auto-Deploy activado, plan Starter |
 | Salud actual | `/health` 200 una vez, `sheets: true` |
-| Arranque según el repositorio | `filtered_app:app` |
+| Arranque | Render usa `gunicorn app:app`; `render.yaml` dice `filtered_app:app`. En producción no se aplica ese filtro de bitácora |
 | Número conectado | **No verificado** |
 | Aviso al asesor anterior | Texto libre con respaldo de plantilla (`ADVISOR_TEMPLATE_NAME`) |
-| Sheets / Redis reales | **No verificados** |
+| Redis | El único Key Value de la cuenta es gratuito, sin persistencia y con `allkeys_lru`: **no sirve para la versión nueva**. No se verificó qué servicio lo usa |
+| Sheets | `/health` indica activo; contenido no verificado |
 | Respaldo | Paquete git creado, verificado y restaurado localmente |
 | Suite anterior | 567 pasan, 19 fallan; GitHub reporta lo mismo en `main` |
 | Historial en busca de secretos | **No revisado** |
 
 ## Etapa E — Las 24 horas
 
-**Causa real: no determinada.** No se leyeron los registros de Render. Hipótesis a contrastar:
+**Causa real: no determinada.** Evidencia y lo que falta: [CIERRE_ISSUE_24.md](CIERRE_ISSUE_24.md#vgr-02--las-24-horas-pendiente-causa-no-determinada).
 
-| Hipótesis | Evidencia disponible | Cómo confirmarla |
-|---|---|---|
-| Pérdida de estado a las 24 h | El código anterior usa `STATE_TTL` = 24 h | Comparar hora del último mensaje con el fallo |
-| Reinicios borran la memoria | Nota del 22-sep sobre reinicios con 512 MB; sin Redis el bot anterior usa memoria | Eventos de Render y arranque "Estado en memoria" |
-| Ventana de 24 h de WhatsApp | Fuera de ella no se entrega texto libre; afecta avisos al asesor | Estados `failed`, código 131047 |
-| Token temporal o vencido | Nota del 10-ago: un token del Graph API Explorer tiró el bot | Tipo y vencimiento del token en Meta |
-| Suspensión por inactividad | Solo aplica a plan gratuito; plan no verificado | Plan del servicio |
-| Webhook u OpenAI | El webhook anterior responde 200 aun si falla el proceso, así que Meta no reintenta | Registros "webhook POST" |
-
-**Mensajes programados:** no sirven como solución. Un mensaje a la hora programada puede despertar un servicio y abre la ventana solo del número que lo envía. No renueva tokens ni recupera estado. Si se envía desde el número del asesor, la versión nueva no lo contesta. Para vigilar conviene un monitor externo sobre `/ready` más un estado de entrega revisado.
-
-La versión nueva usa plantilla para el asesor, no responde mensajes con más de 24 h y registra cada fallo de entrega. No envía campañas.
+La versión nueva usa plantilla para el asesor, no responde mensajes con más de 24 h (salvo aplicar bajas y negativas) y registra cada fallo de entrega. No envía campañas.
 
 ## Errores encontrados en el ciclo adversarial y corregidos
 
@@ -74,25 +66,14 @@ Contrastada con `tugastroradar.com/planes` el 25-nov: Esencial gratis, Conecta $
 - El beneficio de la terminal Inbursa **no aparece** en esa página: no se menciona hasta poner `TPV_BENEFIT_VERIFIED=true`.
 - No se verificó la configuración interna de producción de GastroRadar.
 
-## Costos mensuales estimados (USD, no cotización)
+## Costos
 
-Supuestos: 500 conversaciones al mes con 6 respuestas cada una (3,000 mensajes), 100 avisos al asesor.
-
-| Concepto | Estimado | Confianza |
-|---|---|---|
-| Render web, plan Starter | 7 | Fuente de búsqueda; confirmar. Quizá ya se paga |
-| Render Key Value con persistencia | desde ~10 | Fuente de terceros; quizá ya se paga |
-| Meta: respuestas, (3,000 − 1,000 gratis) × 0.0085 | 17 | Fuentes de terceros sobre el cambio del 1-oct-2026 |
-| Meta: 100 plantillas de utilidad × 0.0085 | 0.85 | Igual |
-| OpenAI `gpt-4o-mini` (0.15 / 0.60 por millón), tope de 300 llamadas al día, 700 + 150 tokens | máx. ~1.76 | Precio de agregador; apagada hoy = 0 |
-| Google Sheets | 0 | Dentro de cuotas habituales |
-
-Total aproximado: **18 a 37**, según lo que ya se pague. Si el número no tiene los 1,000 mensajes gratis, sumar 8.50. Confirmar tarifas en [Meta](https://developers.facebook.com/documentation/business-messaging/whatsapp/pricing), [Render](https://render.com/pricing) y OpenAI.
+La estimación anterior usaba tarifas de terceros y queda **retirada**. Ver [CIERRE_ISSUE_24.md](CIERRE_ISSUE_24.md#vgr-03--costo-bloqueado-con-el-diseño-actual).
 
 ## Pendientes que bloquean el despliegue
 
 1. Decidir el destino de `/ext/lead`, el Flow de IMSS, Boardroom, Radar, Rodys y las conversaciones financieras abiertas.
-2. Verificar Render: commit, plan, Key Value persistente y registros del problema de 24 h.
+2. Elegir una alternativa de almacenamiento (ver cierre, VGR-03). Sin gasto adicional el diseño actual no es durable.
 3. Verificar número, `phone_number_id`, token permanente y qué apps de Meta comparten la cuenta con SECOM.
 4. Aprobar la plantilla del asesor y confirmar un aviso `delivered`.
 5. Ensayo real con número de prueba: WhatsApp, Redis, Sheets y arranque en Render.
