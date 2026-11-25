@@ -19,6 +19,8 @@ CONTACT_EMAIL = "contacto@tugastroradar.com"
 REQUEST_TTL = 24 * 60 * 60
 PRODUCT = "GastroRadar"
 KEY = "gr_asesor"                      # dentro de user_data; no toca otros datos
+WITHDRAWN_KEY = "gr_retiros:"          # contador de retiros por teléfono (almacén auxiliar)
+WITHDRAWN_TTL = 30 * 24 * 60 * 60      # mucho mayor que el plazo de un reintento a Meta
 
 MENU = (
     "1. Encontrar comida\n2. Registrar mi negocio\n3. Planes\n4. Publicidad y banners\n"
@@ -64,7 +66,7 @@ TOPICS = (
     ("terminal", r"\b(terminal|tpv|punto de venta|inbursa|cobrar con tarjeta)\b"),
     ("banners", r"\b(banner|banners|publicidad|anunci\w+|promocionar)\b"),
     ("soporte", r"\b(soporte|ayuda|problema|error|falla|queja|reporte|no funciona|corregir|"
-                r"retirar (mi )?ficha|no puedo|mi cuenta|acceso)\b"),
+                r"retirar (mi )?ficha|dar de baja|no puedo|mi cuenta|acceso)\b"),
     ("registro", r"\b(registr\w+|dar de alta|inscribir\w*|mi (negocio|restaurante|local|puesto))\b"),
     ("planes", r"\b(plan|planes|conecta|presencia|esencial|mensualidad)\b"),
     ("comida", r"\b(comer|comida|restaurantes?|tacos|sushi|mariscos|pizza|cenar|desayunar|antojo)\b"),
@@ -74,7 +76,9 @@ CONTRACT = r"\bcontrat\w+\b"
 
 # ── Contacto: bajas y negativas ───────────────────────────────────────────────
 # "baja": retiro de contacto. Siempre se le indica al asesor.
-OPT_OUT = (r"^(baja|stop)$|\bdar(me)? de baja\b|\bdenme de baja\b|"
+OPT_OUT = (r"^(baja|stop)$|"
+           r"\bdar(me)? de baja\b(?! (a )?(mi|la|el|un|una) (negocio|ficha|restaurante|local|puesto))|"
+           r"\bdenme de baja\b|"
            r"\bno (me )?(contacten|contacte|llamen|llame|escriban|escriba|busquen|busque|marquen|marque)\b|"
            r"\bno (quiero|necesito|deseo) que (nadie )?me (contacten|contacte|llamen|llame|escriban|"
            r"escriba|busquen|busque)\b|\bno quiero (recibir )?(mas )?mensajes\b|"
@@ -91,6 +95,26 @@ CANCEL = (r"^((ya )?(quiero )?(cancelar|cancela|cancelen|cancelalo)( (mi |la )?(
 PERSON = (r"\b(asesor|asesora|humano|persona|ejecutivo|que me (llamen|contacten)|"
           r"hablar con alguien|que me atienda alguien|atencion humana)\b")
 NEGATION = r"\b(no|ni|sin)\b"
+# Pedir contacto sin ambigüedad. Nombrar al asesor o preguntar por él no basta.
+_LEAD = r"^((hola|buenas|buenos dias|buenas tardes|buenas noches|si|ok|oye|vicky|por favor) )*"
+_WHO = r"( un| una| el| al)? (asesor|asesora|ejecutivo|agente|humano|persona|atencion humana|alguien)\b"
+_ASK = r"(yo )?(quiero|quisiera|necesito|ocupo|solicito|pido|deseo|requiero|me gustaria)( por favor)?"
+EXPLICIT = _LEAD + (
+    r"((un |una )?(asesor|asesora|ejecutivo|humano|persona real|atencion humana)"
+    r"( por favor| gracias| (para|sobre) .+)?$|"
+    # "persona" o "alguien" solos pueden ser quien busca personal: exigen pedir trato.
+    + _ASK + r"( un| una| el| al)? (asesor|asesora|ejecutivo|agente|atencion humana)\b|"
+    + _ASK + r" (hablar con|contactar a|que me atienda|que me contacte|que me llame)" + _WHO + "|"
+    + _ASK + r" que me (contacten|contacte|llamen|llame)\b|"
+    r"que me (contacten|llamen)\b|"
+    r"que me (contacte|llame|atienda)" + _WHO + "|"
+    r"(pasame|paseme|comunicame|comuniqueme|contactame|ponme|transfiereme) con" + _WHO + "|"
+    r"(contactar|hablar) (a|con)" + _WHO + ")")
+DOUBT = r"\b(o no|o puedo|o es|si o no)\b"
+CONFIRM = ("Si quieres que te contacte una persona, escribe ASESOR. No he enviado ninguna solicitud. "
+           "Para ver las opciones escribe MENU.")
+CONFIRM_PENDING = ("Tu solicitud ya está enviada al asesor; no he enviado otra. "
+                   "Escribe MENU para ver las opciones.")
 MENU_WORDS = r"^(hola|buenos dias|buenas tardes|buenas noches|buenas|menu|inicio|info|0)( vicky)?$"
 THANKS = r"^(muchas )?(gracias|ok|va|perfecto|excelente|de acuerdo|adios)( gracias)?$"
 YES_NO = r"^(si|claro|sii|dale)$"
@@ -112,6 +136,8 @@ SKIPPED = "De acuerdo. Tu solicitud ya fue enviada. Escribe MENU para ver las op
 STOP_SENT = ("El aviso anterior ya se había enviado y no puedo deshacerlo. Le envié al asesor la "
              "indicación de no contactarte, pero no puedo asegurar que la vea a tiempo.")
 STOP_RECORDED = "Envié al asesor la indicación de no contactarte."
+STOP_UNKNOWN = ("Envié al asesor la indicación de no contactarte. Si ya había recibido una solicitud "
+                "tuya, no la puedo deshacer.")
 STOP_FAILED = f"No pude avisar al asesor. Para que no te contacten escribe a {CONTACT_EMAIL}."
 NOTHING_PENDING = "De acuerdo, no pediré que te contacten. Escribe MENU para ver las opciones."
 THANKS_REPLY = "Con gusto. Escribe MENU si necesitas algo más."
@@ -135,26 +161,57 @@ def topic_of(t: str):
     return next((name for name, pattern in TOPICS if re.search(pattern, t)), None)
 
 
-def handle(phone, mtype, text, *, states, store, send, notify, report, now=time.time):
-    """Atiende un mensaje. `states` y `store` son user_state y user_data de app.py."""
+def _generation(phone, aux_get) -> int:
+    try:
+        return int(aux_get(WITHDRAWN_KEY + str(phone)) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+# Avisos que se refieren a una solicitud que la persona puede retirar.
+_TIED = re.compile(r"^GastroRadar: (?:piden un asesor|datos de quien pidió asesor)\. "
+                   r"Ref (\d+)\. WhatsApp: (\d+)\.")
+
+
+def may_resend(body, aux_get) -> bool:
+    """Antes de reintentar un aviso: False si su solicitud ya fue retirada.
+    El aviso NO CONTACTAR y los avisos ajenos a esta conversación no cambian."""
+    match = _TIED.match(body or "")
+    return not match or int(match.group(1)) == _generation(match.group(2), aux_get)
+
+
+def _pending(row) -> bool:
+    estado = (row or {}).get("Estado", "")
+    return estado.startswith("Solicita asesor") or estado == "No contactar - aviso fallido"
+
+
+def handle(phone, mtype, text, *, states, store, send, notify, report, lookup, aux_get, aux_set,
+           now=time.time):
+    """Atiende un mensaje. `states` y `store` son user_state y user_data de app.py.
+
+    `lookup(phone)` lee la fila de GastroRadar del reporte: dict, {} si no hay,
+    o None si no se pudo leer.
+    """
     if mtype in ("reaction", "system"):
         return
     previous = states.get(phone, "") or ""
     mine = previous.startswith("gr_")
     topic_now = previous[3:] if mine and previous[3:] in ANSWERS else None
     data = dict(store.get(phone) or {})
-    request = data.get(KEY)
-    if request and now() - request.get("ts", 0) > REQUEST_TTL:
-        request = None
+    stored = data.get(KEY)
+    # La antigüedad solo permite volver a pedir asesor; no da por terminada la solicitud.
+    request = stored if stored and now() - stored.get("ts", 0) <= REQUEST_TTL else None
     t = normalize(text)
 
     def finish(reply, state="gr_menu"):
         states[phone] = state
         send(phone, reply)
 
-    def record(topic, estado, nombre=""):
-        report(phone, producto=f"{PRODUCT}: {LABELS.get(topic, LABELS['general'])}",
-               estado=estado, nombre=nombre)
+    def product(topic):
+        return f"{PRODUCT}: {LABELS.get(topic, LABELS['general'])}"
+
+    def record(topic, estado, nombre="", producto=""):
+        report(phone, producto=producto or product(topic), estado=estado, nombre=nombre)
 
     def forget_request():
         data.pop(KEY, None)
@@ -167,24 +224,33 @@ def handle(phone, mtype, text, *, states, store, send, notify, report, now=time.
     opt_out = bool(re.search(OPT_OUT, t))
     cancel = bool(re.search(CANCEL, t))
     if opt_out or re.search(REFUSAL, t) or cancel:
-        if opt_out or request:
-            topic = (request or {}).get("tema", topic_now or "general")
-            ok = notify(f"GastroRadar: NO CONTACTAR. WhatsApp: {phone}. La persona retiró su solicitud.")
-            record(topic, "No contactar" if ok else "No contactar - aviso fallido")
-            forget_request()
-            if not ok:
-                return finish(STOP_FAILED)
-            return finish(STOP_SENT if request else STOP_RECORDED)
-        return finish(NOTHING_PENDING)
+        # Sin sesión (vencida o borrada), el reporte dice si quedó una solicitud.
+        row = None if stored else lookup(phone)
+        unreadable = not stored and row is None
+        if not (opt_out or stored or unreadable or _pending(row)):
+            return finish(NOTHING_PENDING)
+        # Primero se invalidan los reintentos de los avisos anteriores.
+        aux_set(WITHDRAWN_KEY + str(phone), str(_generation(phone, aux_get) + 1), WITHDRAWN_TTL)
+        topic = (stored or {}).get("tema", topic_now or "general")
+        ok = notify(f"GastroRadar: NO CONTACTAR. WhatsApp: {phone}. La persona retiró su solicitud.")
+        record(topic, "No contactar" if ok else "No contactar - aviso fallido",
+               producto=(row or {}).get("Producto", ""))
+        forget_request()
+        if not ok:
+            return finish(STOP_FAILED)
+        if stored or (row or {}).get("Estado") == "Solicita asesor":
+            return finish(STOP_SENT)
+        return finish(STOP_UNKNOWN if unreadable else STOP_RECORDED)
 
     # 2) Atención humana.
-    if re.search(PERSON, t) and not re.search(NEGATION, t):
+    if (re.search(EXPLICIT, t) and "?" not in text and not re.search(NEGATION, t)
+            and not re.search(DOUBT, t)):
         asked = topic_of(t) or topic_now
         if request and asked in (None, request.get("tema")):
             return finish(ALREADY)
         topic = asked or "general"
-        ok = notify(f"GastroRadar: piden un asesor. Tema: {LABELS[topic]}. WhatsApp: {phone}. "
-                    f"Mensaje: {text[:200]}")
+        ok = notify(f"GastroRadar: piden un asesor. Ref {_generation(phone, aux_get)}. WhatsApp: {phone}. "
+                    f"Tema: {LABELS[topic]}. Mensaje: {text[:200]}")
         record(topic, "Solicita asesor" if ok else "Solicita asesor - aviso fallido")
         if not ok:
             return finish(FAILED)
@@ -193,7 +259,7 @@ def handle(phone, mtype, text, *, states, store, send, notify, report, now=time.
         return finish(SENT + ASK_DETAILS, "gr_datos")
 
     if re.search(PERSON, t):
-        return finish(YES_REPLY, previous if mine else "gr_menu")
+        return finish(CONFIRM_PENDING if request else CONFIRM, previous if mine else "gr_menu")
 
     if re.search(MENU_WORDS, t):
         return finish(GREETING)
@@ -214,7 +280,8 @@ def handle(phone, mtype, text, *, states, store, send, notify, report, now=time.
                                or "?" in text)
         if looks_like_data and request:
             clean = re.sub(r"\s+", " ", text).strip()[:150]
-            ok = notify(f"GastroRadar: datos de quien pidió asesor. WhatsApp: {phone}. {clean}")
+            ok = notify(f"GastroRadar: datos de quien pidió asesor. Ref {_generation(phone, aux_get)}. "
+                        f"WhatsApp: {phone}. {clean}")
             record(request.get("tema", "general"), "Solicita asesor", nombre=clean)
             return finish(DETAILS_OK if ok else DETAILS_FAILED)
 

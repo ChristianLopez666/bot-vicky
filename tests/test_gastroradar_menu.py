@@ -31,13 +31,15 @@ class Resp:
 class FakeMeta:
     def __init__(self):
         self.payloads, self.reject_text_to, self.reject_all_to = [], set(), set()
+        self.wamids = []                                # en el mismo orden que payloads
 
     def post(self, url, headers=None, json=None, timeout=None):
         to, kind = json.get("to"), json.get("type")
         if to in self.reject_all_to or (to in self.reject_text_to and kind == "text"):
             return Resp(400, {"error": {"code": 131047}})
         self.payloads.append(json)
-        return Resp(200, {"messages": [{"id": f"wamid.OUT{next(ids)}"}]})
+        self.wamids.append(f"wamid.OUT{next(ids)}")
+        return Resp(200, {"messages": [{"id": self.wamids[-1]}]})
 
 
 class Run:
@@ -438,3 +440,194 @@ def test_como_contratar_respeta_el_tema(w, option, expected):
 def test_negacion_ambigua_con_asesor_no_avisa(w):
     w.say("hola")
     assert "escribe ASESOR" in w.say("no sé si hablar con un asesor") and w.advisor() == []
+
+
+# ── RGR-01: preguntar por un asesor no es pedirlo ───────────────────────────
+@pytest.mark.parametrize("question", [
+    "¿Necesito un asesor para registrar mi negocio?", "¿Qué hace un asesor?", "¿Cuánto cuesta un asesor?",
+    "necesito un asesor para registrar mi negocio?", "¿Puedo hablar con un asesor?",
+    "necesito saber si necesito un asesor", "el asesor cobra", "que es un asesor",
+    "quiero saber cuánto cuesta un asesor", "hay una persona que atienda",
+])
+@pytest.mark.parametrize("option", ["menu", "2"])
+def test_pregunta_sobre_asesor_no_avisa(w, question, option):
+    w.say("hola")
+    w.say(option)
+    reply = w.say(question)
+    assert w.advisor() == [] and w.report() == []
+    assert "No he enviado" in reply and "ASESOR" in reply
+    assert "Envié tu solicitud" in w.say("asesor")        # la confirmación sí avisa
+    assert len(w.advisor()) == 1
+
+
+@pytest.mark.parametrize("request_text", [
+    "ASESOR", "Asesor por favor", "quiero que me contacte un asesor", "quiero un asesor",
+    "hola, quiero un asesor", "asesor para la terminal", "pásame con un asesor",
+    "quiero hablar con una persona", "necesito que me llamen", "que me contacten",
+    "me gustaría hablar con un asesor", "un asesor",
+])
+def test_peticion_explicita_si_avisa(w, request_text):
+    w.say("hola")
+    assert "Envié tu solicitud" in w.say(request_text)
+    assert len(w.advisor()) == 1
+
+
+@pytest.mark.parametrize("text", ["quiero dar de baja mi negocio", "cómo dar de baja mi ficha"])
+def test_baja_de_ficha_no_es_baja_de_contacto(w, text):
+    w.say("hola")
+    assert "/ayuda" in w.say(text) and w.advisor() == []
+
+
+# ── RGR-02: un "failed" tardío no revive una solicitud retirada ─────────────
+def advisor_wamids(w, contains):
+    out = []
+    for payload, wamid in zip(w.meta.payloads, w.meta.wamids):
+        if payload["to"] == ADVISOR:
+            body = (payload["text"]["body"] if payload["type"] == "text"
+                    else payload["template"]["components"][0]["parameters"][0]["text"])
+            if contains in body:
+                out.append(wamid)
+    return out
+
+
+def failed(w, wamid):
+    assert w.webhook({"statuses": [{"id": wamid, "status": "failed", "recipient_id": ADVISOR,
+                                    "errors": [{"code": 131047}]}]}).status_code == 200
+
+
+def count(w, text):
+    return len([m for m in w.advisor() if text in m])
+
+
+@pytest.mark.parametrize("cancel", ["cancelar", "no quiero un asesor", "BAJA"])
+def test_failed_tardio_no_reenvia_solicitud_cancelada(w, cancel):
+    app._advisor_window_touch()
+    w.say("asesor"); w.say("Ana, Tacos"); w.say(cancel)
+    first, details = advisor_wamids(w, "piden un asesor")[0], advisor_wamids(w, "datos de quien")[0]
+    total = len(w.advisor())
+    for wamid in (first, first, details):
+        failed(w, wamid)
+    app._ADV_STATUS_SET.clear(); app._ADV_STATUS_SEEN.clear()   # Meta reentrega tras un reinicio
+    failed(w, first)
+    assert len(w.advisor()) == total
+    assert w.report()[0]["Estado"] == "No contactar"
+
+
+def test_failed_del_aviso_no_contactar_si_se_reenvia(w):
+    app._advisor_window_touch()
+    w.say("asesor"); w.say("cancelar")
+    failed(w, advisor_wamids(w, "NO CONTACTAR")[0])
+    assert count(w, "NO CONTACTAR") == 2 and w.meta.payloads[-1]["type"] == "template"
+
+
+def test_nueva_solicitud_tras_cancelar_conserva_su_reintento(w):
+    app._advisor_window_touch()
+    w.say("asesor"); w.say("cancelar")
+    old = advisor_wamids(w, "piden un asesor")[0]
+    app._advisor_window_touch()
+    w.say("asesor")
+    new = advisor_wamids(w, "piden un asesor")[-1]
+    assert old != new
+    failed(w, old)
+    assert count(w, "piden un asesor") == 2
+    failed(w, new); failed(w, new)
+    assert count(w, "piden un asesor") == 3
+
+
+def test_solicitud_vigente_de_otro_tema_se_sigue_reintentando(w):
+    app._advisor_window_touch()
+    w.say("hola"); w.say("4"); w.say("asesor"); w.say("menu"); w.say("5"); w.say("asesor")
+    failed(w, advisor_wamids(w, "Publicidad y banners")[0])
+    assert count(w, "Publicidad y banners") == 2
+
+
+def test_reintento_de_otros_avisos_no_cambia(w):
+    w.say("cancelar"); w.say("BAJA")
+    app._advisor_window_touch()
+    w.client.post("/ext/lead", json={"nombre": "Prueba", "telefono": "6680000000", "interes": "auto"},
+                  headers={"X-Internal-Token": "interno"})
+    failed(w, advisor_wamids(w, "cohifis.com")[0])
+    assert count(w, "cohifis.com") == 2
+
+
+# ── RGR-03: la negativa vale aunque la sesión haya vencido ──────────────────
+def age(w, session):
+    """Más de 24 h: la sesión sigue presente pero vieja, o Redis ya la borró."""
+    if session == "presente":
+        key = f"vicky:data:{USER}"
+        data = json.loads(w.redis.data[key])
+        data["gr_asesor"]["ts"] -= 86401
+        w.redis.data[key] = json.dumps(data)
+    else:
+        w.redis.data.clear()
+
+
+SESSIONS = ["presente", "vencida"]
+
+
+@pytest.mark.parametrize("session", SESSIONS)
+@pytest.mark.parametrize("phrase", ["No quiero un asesor", "cancelar", "ya no me interesa"])
+def test_negativa_despues_de_24h(w, session, phrase):
+    w.say("hola"); w.say("4"); w.say("asesor")
+    age(w, session)
+    reply = w.say(phrase)
+    assert count(w, "NO CONTACTAR") == 1
+    [row] = w.report()
+    assert row["Estado"] == "No contactar" and row["Producto"] == "GastroRadar: Publicidad y banners"
+    assert "no puedo deshacerlo" in reply
+    w.say(phrase)
+    assert count(w, "NO CONTACTAR") == 1                  # no se repite
+
+
+@pytest.mark.parametrize("session", SESSIONS)
+def test_negativa_tardia_con_aviso_fallido_no_se_da_por_resuelta(w, session):
+    w.say("asesor")
+    age(w, session)
+    w.meta.reject_all_to.add(ADVISOR)
+    reply = w.say("no quiero un asesor")
+    assert "No pude avisar" in reply and "no pediré" not in reply
+    assert w.report()[0]["Estado"] == "No contactar - aviso fallido"
+    w.meta.reject_all_to.clear()
+    w.say("no quiero un asesor")
+    assert count(w, "NO CONTACTAR") == 1 and w.report()[0]["Estado"] == "No contactar"
+
+
+def test_si_sheets_no_se_puede_leer_la_negativa_igual_se_comunica(w, monkeypatch):
+    w.say("asesor")
+    age(w, "vencida")
+
+    def broken(**_):
+        raise TimeoutError()
+    monkeypatch.setattr(w.sheets, "get", broken)
+    reply = w.say("no quiero un asesor")
+    assert count(w, "NO CONTACTAR") == 1 and "no pediré" not in reply
+
+
+def test_negativa_tardia_no_toca_el_historial_financiero(w):
+    old = [USER, "Cliente IMSS", "Culiacán", "Préstamo IMSS", "8500", "", "", "",
+           "Solicita asesor", "ayer", "ayer"]
+    w.sheets.tabs[app.SHEET_TAB_REPORTE].append(list(old))
+    w.say("hola"); w.say("no quiero un asesor")
+    assert w.advisor() == [] and w.sheets.tabs[app.SHEET_TAB_REPORTE][1] == old
+
+
+def test_despues_de_24h_se_puede_pedir_otra_vez(w):
+    w.say("asesor")
+    age(w, "presente")
+    assert "Envié tu solicitud" in w.say("asesor") and count(w, "piden un asesor") == 2
+
+
+@pytest.mark.parametrize("text", [
+    "necesito una persona para mi restaurante", "quiero alguien que cocine", "ocupo una persona de mesero",
+    "necesito un asesor o puedo solo", "quiero ser asesor", "me puede llamar un asesor",
+])
+def test_frases_ambiguas_no_avisan(w, text):
+    w.say("hola")
+    w.say(text)
+    assert w.advisor() == [] and w.report() == []
+
+
+def test_pregunta_con_solicitud_vigente_no_duplica(w):
+    w.say("asesor")
+    assert "no he enviado otra" in w.say("¿cuándo me llama el asesor?")
+    assert len(w.advisor()) == 1

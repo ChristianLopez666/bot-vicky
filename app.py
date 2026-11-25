@@ -3870,11 +3870,30 @@ def handle(msg_obj: dict) -> None:
         _flush_boardroom_observation()
 
 
+def _gr_report_lookup(phone: str):
+    """Fila de GastroRadar en el reporte: dict, {} si no hay, None si no se pudo leer."""
+    if not _srdy:
+        return None
+    ph = re.sub(r"\D", "", str(phone))
+    try:
+        filas = _svc.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range=f"{SHEET_TAB_REPORTE}!A:K").execute().get("values", [])
+        for fila in filas[1:]:
+            if (len(fila) > 3 and re.sub(r"\D", "", fila[0]) == ph
+                    and fila[3].startswith(gastroradar_redes.PRODUCT)):
+                return dict(zip(_HDR_REPORTE, fila + [""] * (len(_HDR_REPORTE) - len(fila))))
+        return {}
+    except Exception:
+        log.exception("❌ Error leyendo reporte de leads")
+        return None
+
 def _handle_gastroradar(phone: str, mtype: str, text: str, mid: str) -> None:
     _log(phone, _nombre(phone), text or f"[{_canonical_message_type(mtype)}]",
          "entrante", "cliente", "gastroradar", "", mid)
     gastroradar_redes.handle(phone, mtype, text, states=user_state, store=user_data,
-                             send=send_msg, notify=notify_advisor, report=_report_upsert_lead)
+                             send=send_msg, notify=notify_advisor, report=_report_upsert_lead,
+                             lookup=_gr_report_lookup, aux_get=_state_store.aux_get,
+                             aux_set=_state_store.aux_set)
 
 def _handle_dispatch(msg_obj: dict) -> None:
     phone = msg_obj.get("from", "")
@@ -4321,6 +4340,9 @@ def _advisor_handle_failed(wamid: str, tracked: dict, err_txt: str) -> None:
     body = _state_store.aux_get(f"adv_retry:{wamid}")
     if not body:
         log.error("asesor_reenvio_omitido: sin cuerpo correlacionado para wamid=%s", wamid[:24])
+        return
+    if not gastroradar_redes.may_resend(body, _state_store.aux_get):
+        log.info("asesor_reenvio_omitido: solicitud retirada wamid=%s", wamid[:24])
         return
     _notify_advisor_via_template(body, motivo="status_failed")
 
