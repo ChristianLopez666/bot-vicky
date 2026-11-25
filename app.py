@@ -20,6 +20,7 @@ import whatsapp_interactive as wai
 import imss_flow
 import radar_bridge
 import gastroradar_redes
+import sheets_client
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -436,7 +437,8 @@ def _sheets_init():
         creds = Credentials.from_service_account_info(
             json.loads(GG_CREDS),
             scopes=["https://www.googleapis.com/auth/spreadsheets"])
-        _svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+        _svc = sheets_client.reuse_spreadsheets(
+            build("sheets", "v4", credentials=creds, cache_discovery=False))
         _srdy = True
         _sheets_ensure_tab(SHEET_TAB, _HDR)
         try:

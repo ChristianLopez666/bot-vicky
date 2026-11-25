@@ -9,6 +9,7 @@ import uuid
 from radar_events import (EventLog, RadarClient, EVENTS_HEADER, EVENTS_TAB,
                           build_event, canonical_ts, statuses_from_value, STATUS_TO_EVENT)
 from radar_outbox import OutboxWorker, SheetsOutbox
+from sheets_client import reuse_spreadsheets
 
 log = logging.getLogger("vicky-redes.radar")
 LEAD_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "https://cohifis.com.mx/vicky/redes/leads")
@@ -49,7 +50,8 @@ class RadarBridge:
             from google.oauth2.service_account import Credentials
             from googleapiclient.discovery import build
             credentials = Credentials.from_service_account_info(json.loads(self.credentials), scopes=["https://www.googleapis.com/auth/spreadsheets"])
-            self._local.service = build("sheets", "v4", credentials=credentials, cache_discovery=False)
+            self._local.service = reuse_spreadsheets(
+                build("sheets", "v4", credentials=credentials, cache_discovery=False))
         return self._local.service
 
     def _append(self, tab, row):
