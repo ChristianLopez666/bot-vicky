@@ -27,6 +27,8 @@ RENOTIFY_AFTER = 24 * 3600
 OUT_TTL = 90 * 24 * 3600
 RANK = {"pendiente": 0, "enviando": 1, "aceptado": 2, "sent": 3, "delivered": 4, "read": 5}
 MX = timezone(timedelta(hours=-7))  # Sinaloa, sin horario de verano
+SENT = ("aceptado", "sent", "delivered", "read")
+UNSURE = ("enviando", "incierto")
 MAX_ATTEMPTS = {"inbound": 8, "send": 6, "sheet": 20, "status": 6}
 
 
@@ -111,7 +113,7 @@ class Service:
 
     def _failed(self, lane, token, job, exc):
         reason = exc.reason if isinstance(exc, Retry) else type(exc).__name__
-        if reason == "bot_apagado":
+        if reason in ("bot_apagado", "usuario_ocupado"):
             self.store.retry(lane, token, job, exc.delay)  # esperar no gasta intentos
             return
         job["attempts"] += 1
@@ -167,9 +169,9 @@ class Service:
         consent = self.store.get_json(f"consent:{wa}", {}) or {}
         consented = consent.get("status") == "otorgado"
         text = d["text"]
-        optout = bool(text) and flow.is_optout(text)
+        stop = bool(text) and flow.is_stop(text)
 
-        if self.now - d["ts"] > WINDOW - 60 and not optout:
+        if self.now - d["ts"] > WINDOW - 60 and not stop:
             # Fuera de la ventana de WhatsApp: no se avanza un dialogo que no se puede contestar.
             self._problem(tx, "r:" + job["id"], "reply", "", "expirado", "mensaje_antiguo")
             return tx
@@ -177,7 +179,7 @@ class Service:
         rate_key = P + f"rate:{wa}:{int(self.now // 600)}"
         count = int(self.store.r.get(rate_key) or 0) + 1
         tx.set(rate_key, count, ex=1200)
-        if count > self.cfg.user_msgs_per_10min and not optout:
+        if count > self.cfg.user_msgs_per_10min and not stop:
             if count == self.cfg.user_msgs_per_10min + 1:
                 self._reply(tx, wa, "Recibí muchos mensajes seguidos. Espera unos minutos y vuelve a escribir.",
                             d, job["id"])
@@ -195,13 +197,14 @@ class Service:
                 res = flow.handle(draft, text, consented, self.cfg, ai=answer or False)
             session = draft
 
+        res.replies += self._apply_events(tx, wa, session, consent, res.events, d)
+
         if not session.get("greeted"):
             session["greeted"] = True
             if res.replies and not res.replies[0].startswith("Hola, soy Vicky"):
                 res.replies[0] = "Soy Vicky, asistente virtual de GastroRadar.\n" + res.replies[0]
         reply = "\n\n".join(res.replies)
 
-        self._apply_events(tx, wa, session, consent, res.events, d)
         history = session.get("history", [])
         if text:
             history = history + [{"role": "user", "text": text[:300]}, {"role": "assistant", "text": reply[:300]}]
@@ -216,8 +219,8 @@ class Service:
                          {"to": wa, "type": "text", "text": {"body": text[:4000]}},
                          expires=d["ts"] + WINDOW - 60)
 
-    def _queue_send(self, tx, out_id, lane, purpose, payload, expires=None, lead_id=""):
-        record = {"id": out_id, "purpose": purpose, "lead_id": lead_id, "status": "pendiente",
+    def _queue_send(self, tx, out_id, lane, purpose, payload, expires=None, lead_id="", cycle=0):
+        record = {"id": out_id, "purpose": purpose, "lead_id": lead_id, "cycle": cycle, "status": "pendiente",
                   "wamid": "", "detail": "", "created": self.now, "payload": payload, "expires": expires}
         tx.set(P + f"out:{out_id}", dumps(record), ex=OUT_TTL)
         tx.push(lane, new_job("send", {"out_id": out_id}, self.now), self.now)
@@ -225,7 +228,8 @@ class Service:
     # ═══ prospectos y consentimiento ════════════════════════════════════
     def _apply_events(self, tx, wa, session, consent, events, d):
         if not events:
-            return
+            return []
+        notes = []
         now = self.now
         leads = self.store.get_json(f"leads_of:{wa}", {}) or {}
         changed = {}
@@ -241,7 +245,10 @@ class Service:
             tx.rpush(P + f"consent_log:{wa}", dumps(consent))
 
         for event, service in events:
-            if event == "consent_denied":
+            if event in ("contact_declined", "request_cancelled"):
+                notes.append(self._cancel(tx, event, service, session, consent, leads, load, changed,
+                                          consent_log, d))
+            elif event == "consent_denied":
                 consent_log("rechazado")
             elif event in ("consent_revoked", "data_deletion"):
                 consent_log("revocado")
@@ -271,13 +278,15 @@ class Service:
                             "municipality": "", "service": service,
                             "origin": "WhatsApp (anuncio)" if d.get("referral") else "WhatsApp",
                             "consent": "", "status": "Incompleto", "history": [], "notified": False,
-                            "complete_notified": False, "notified_at": 0}
+                            "complete_notified": False, "notified_at": 0, "cycle": 0, "notices": []}
                     self._history(lead, "creado")
-                    tx.push("fu:" + lead_id, new_job("followup_due", {"lead_id": lead_id, "wa": wa}, now),
-                            now + FOLLOWUP_DELAY)
+                    self._schedule_followup(tx, lead)
                 if lead["consent"] != "otorgado":
-                    if lead["consent"] == "revocado":
-                        lead.update(status="Incompleto", notified=False, complete_notified=False)
+                    if lead["consent"]:
+                        # Autorizacion nueva: lo pendiente de la anterior ya no vale.
+                        lead.update(status="Incompleto", notified=False, complete_notified=False,
+                                    cycle=lead.get("cycle", 0) + 1, notices=[])
+                        self._schedule_followup(tx, lead)
                     lead["consent"] = "otorgado"
                     self._history(lead, "consentimiento otorgado " + kb.CONSENT_VERSION)
                 for name in ("name", "business", "municipality"):
@@ -298,6 +307,75 @@ class Service:
         tx.set(P + f"leads_of:{wa}", dumps(leads))
         for lead in changed.values():
             self._save_lead(tx, lead)
+        return notes
+
+    def _schedule_followup(self, tx, lead):
+        cycle = lead.get("cycle", 0)
+        # Un carril por ciclo: dos plazos distintos no pueden compartir turno.
+        tx.push(f"fu:{lead['id']}:{cycle}",
+                new_job("followup_due", {"lead_id": lead["id"], "wa": lead["wa"], "cycle": cycle}, self.now),
+                self.now + FOLLOWUP_DELAY)
+
+    def _notice_state(self, lead) -> str:
+        """Cuanto llego al asesor de la autorizacion vigente."""
+        statuses = []
+        for out_id in lead.get("notices", []):
+            record = self.store.get_json(f"out:{out_id}")
+            statuses.append(record["status"] if record else "incierto")
+        if any(x in SENT for x in statuses):
+            return "enviado"
+        return "incierto" if any(x in UNSURE for x in statuses) else "no_enviado"
+
+    def _cancel(self, tx, event, service, session, consent, leads, load, changed, consent_log, d) -> str:
+        """Cancela por una negativa explicita y devuelve la respuesta.
+
+        - Con servicio ("... para la terminal", o "cancelar"): solo ese.
+        - Negativa general: la solicitud en curso, y toda otra que aun no llego al
+          asesor (enviarla contradiria la negativa). Las ya enviadas de otros
+          servicios no se tocan.
+        """
+        found = {key: lead for key, lead in ((k, load(i)) for k, i in leads.items()) if lead}
+        states = {key: self._notice_state(lead) for key, lead in found.items()}
+        active = service or session.get("service")
+        if not active and found:
+            active = max(found, key=lambda k: found[k]["updated"])
+        cancelled, kept = {}, []
+        for key, lead in found.items():
+            if lead["consent"] != "otorgado":
+                continue
+            if key == active or (not service and states[key] == "no_enviado"):
+                lead.update(consent="cancelado", status="No contactar")
+                self._history(lead, "canceló la solicitud de contacto")
+                if states[key] != "no_enviado":
+                    self._notify_advisor(tx, lead, "CANCELÓ: NO CONTACTAR", f"rev-{lead['id']}-{d['mid']}")
+                changed[lead["id"]] = lead
+                cancelled.setdefault(states[key], []).append(kb.SERVICES.get(key, key))
+            else:
+                kept.append(kb.SERVICES.get(key, key))
+
+        status = consent.get("status")
+        if status == "otorgado" and (cancelled or event == "contact_declined"):
+            consent_log("cancelado")
+        elif event == "contact_declined" and status in (None, "rechazado"):
+            consent_log("rechazado")
+
+        parts = []
+        if "no_enviado" in cancelled:
+            parts.append(f"Cancelé tu solicitud de contacto ({', '.join(cancelled['no_enviado'])}); "
+                         "no se enviará al asesor.")
+        for state, verb in (("enviado", "ya se había enviado"), ("incierto", "pudo haberse enviado")):
+            if state in cancelled:
+                parts.append(f"El aviso ({', '.join(cancelled[state])}) {verb} al asesor y no puedo "
+                             "deshacerlo. Cancelé la solicitud e intentaré indicarle que no te contacte; "
+                             "no puedo asegurar que lo vea a tiempo.")
+        if not cancelled:
+            parts.append("De acuerdo, no hice cambios en tus otras solicitudes." if kept
+                         else "De acuerdo, no inicio ningún contacto.")
+        if kept:
+            parts.append(f"Sigue sin cambios tu otra solicitud: {', '.join(kept)}. "
+                         "Si no quieres ningún contacto, escribe BAJA.")
+        parts.append("Si más adelante quieres atención, escribe ASESOR y volveré a pedirte autorización.")
+        return " ".join(parts)
 
     def _history(self, lead, what):
         lead["history"] = (lead["history"] + [f"{stamp(self.now)} {what}"])[-40:]
@@ -333,9 +411,12 @@ class Service:
         else:
             payload = {"to": self.cfg.advisor_number, "type": "text", "text": {"body": summary}}
         self._set_delivery(tx, lead["id"], "pendiente")
-        urgent_stop = title.startswith(("BAJA", "PIDE BORRAR"))
+        urgent_stop = title.startswith(("BAJA", "PIDE BORRAR", "CANCEL"))
+        if not urgent_stop:
+            lead.setdefault("notices", []).append("adv:" + suffix)
         self._queue_send(tx, "adv:" + suffix, "out:advisor",
-                         "advisor_stop" if urgent_stop else "advisor", payload, lead_id=lead["id"])
+                         "advisor_stop" if urgent_stop else "advisor", payload, lead_id=lead["id"],
+                         cycle=lead.get("cycle", 0))
 
     def do_followup_due(self, job):
         """Pasa el seguimiento al carril del usuario para escribir sin carreras."""
@@ -347,7 +428,8 @@ class Service:
         """Prospecto con autorizacion que no termino de dar datos: se avisa igual."""
         tx = Tx()
         lead = self.store.get_json(f"lead:{job['data']['lead_id']}")
-        if lead and lead["consent"] == "otorgado" and not lead["notified"]:
+        if (lead and lead["consent"] == "otorgado" and not lead["notified"]
+                and lead.get("cycle", 0) == job["data"].get("cycle", 0)):
             lead.update(notified=True, notified_at=self.now)
             self._history(lead, "aviso con datos incompletos")
             self._notify_advisor(tx, lead, "Prospecto incompleto", f"inc-{lead['id']}")
@@ -397,6 +479,25 @@ class Service:
         self.store.r.set(P + f"out:{record['id']}", dumps(dict(record, status=status)), ex=OUT_TTL)
 
     def do_send(self, job):
+        record = self.store.get_json(f"out:{job['data']['out_id']}")
+        advisor = bool(record) and record["purpose"] == "advisor" and bool(record["lead_id"])
+        lead = self.store.get_json(f"lead:{record['lead_id']}") if advisor else None
+        if not lead:
+            return self._send(job)
+        # Mientras Meta recibe el aviso se ocupa el carril del usuario: una negativa
+        # se procesa antes (y lo cancela) o despues (y ya sabe que salio).
+        lane, token = "in:" + lead["wa"], uuid.uuid4().hex
+        if not self.store.acquire(lane, token):
+            raise Retry("usuario_ocupado", 1)
+        try:
+            if self.store.pending(lane):
+                raise Retry("usuario_ocupado", 1)   # hay un mensaje suyo sin procesar
+            self.store.commit(self._send(job))   # se guarda antes de soltar el carril
+            return Tx()
+        finally:
+            self.store.release(lane, token)
+
+    def _send(self, job):
         tx = Tx()
         record = self.store.get_json(f"out:{job['data']['out_id']}")
         if not record or record["status"] not in ("pendiente", "enviando"):
@@ -412,8 +513,8 @@ class Service:
             return tx
         if record["purpose"] == "advisor" and record["lead_id"]:
             lead = self.store.get_json(f"lead:{record['lead_id']}")
-            if lead and lead["consent"] != "otorgado":
-                self._mark_out(tx, record, "cancelado", "consentimiento_revocado")
+            if lead and (lead["consent"] != "otorgado" or lead.get("cycle", 0) != record.get("cycle", 0)):
+                self._mark_out(tx, record, "cancelado", "contacto_cancelado")
                 return tx
         self._save_out(record, "enviando")
         result = self.wa.send(record["payload"])

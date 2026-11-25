@@ -25,10 +25,25 @@ OPTOUT = re.compile(
     r"\bno quiero (recibir )?(mas )?mensajes\b|"
     r"\bno (me )?(contacten|contactes|llamen|llames|escriban|escribas|busquen)\b|"
     r"\bya no quiero que me (contacten|llamen|escriban|busquen)\b|"
+    r"\bno quiero que nadie me (contacte|llame|escriba|busque|marque)\b|"
+    r"\bno (necesito|deseo|ocupo) que me (contacten|llamen|escriban|busquen)\b|"
+    r"\b(no me|no (quiero|necesito|deseo) que me) (contacte|llame|escriba|busque|marque|marquen)\b"
+    r"(?! la atencion)|"
     r"\b(retiro|revoco|cancelo) (mi )?(consentimiento|autorizacion|permiso)\b|\bno autorizo\b")
 DELETE = re.compile(r"\b(borr|elimin|quit)\w* (todos )?(mis datos|datos|mi numero|mi informacion)\b")
-NO_HUMAN = re.compile(r"\b(no|sin) (quiero|necesito|ocupo|requiero)( hablar con)?( un| una| el| al| ningun)? "
-                      r"(asesor|asesora|humano|persona|agente|ejecutivo)\b")
+# Negativa a la atencion humana: cancela el contacto, sin exigir BAJA.
+NO_HUMAN = re.compile(
+    r"\b(no|sin|ni) (quiero|necesito|ocupo|requiero|deseo)( hablar con)?( un| una| el| al| ningun)? "
+    r"(asesor|asesora|humano|persona|agente|ejecutivo)\b|"
+    r"\bno (quiero|necesito|deseo)( el| ningun)? contacto\b|"
+    r"\bno hace falta( un| el)? (asesor|asesora)\b|"
+    r"^(ya )?(por favor )?(quiero )?(cancela|cancele|cancelar|cancelen|anula|anular|anulen)( la| mi| el)? "
+    r"(solicitud|asesor|contacto|llamada|cita)\b")
+# "No, quiero un asesor" es una peticion: el "no" con puntuacion contesta a otra cosa.
+LEADING_NO = re.compile(r"^\s*no\s*[,.;!]+", re.IGNORECASE)
+# Solo acota si la frase TERMINA nombrando el servicio; ante la duda, la negativa es general.
+SCOPE = re.compile(r" ?(para|sobre)( la| el| lo de| mi| los| las)? "
+                   r"(terminal|tpv|punto de venta|publicidad|banner|banners|registro|plan|planes)")
 # Frases que son peticiones o preguntas, no un nombre, negocio o municipio.
 NOT_DATA = re.compile(r"^(no (quiero|me|te|gracias)|para que|por que|ver |quiero|quisiera|necesito|"
                       r"me interesa|cuanto|cuando|como (es|se|le|puedo|funciona)|"
@@ -60,7 +75,20 @@ THANKS = re.compile(r"^(muchas )?(gracias|ok|okay|va|perfecto|excelente|de acuer
 YES = re.compile(r"^(si|sii+|s|claro|acepto|autorizo|si autorizo|si acepto|si claro|si por favor|dale)$")
 NO = re.compile(r"^(no|nel|no gracias|no acepto|rechazo|mejor no)$")
 SKIP = re.compile(r"^(omitir|saltar|no se|no tengo|ninguno|no aplica|prefiero no|no quiero decir\w*)$")
-CANCEL = re.compile(r"^(cancelar|cancela|salir|ya no|olvidalo|(ya )?no me interesa)$")
+# Retiro claro en cualquier momento.
+CANCEL = re.compile(r"^(cancelar|cancela|cancelalo|cancelenlo|olvidalo|olvidenlo|siempre no|"
+                    r"(ya )?no me interesa)( gracias| por favor)?$")
+# Solo mientras se piden datos: fuera de ahi pueden ser una simple despedida.
+CANCEL_CAPTURE = re.compile(
+    r"^(salir|(mejor )?ya no( gracias| por favor)?|(mejor |no )?gracias no|mejor no( gracias)?|no gracias|"
+    r"(ya )?no es necesario|(ya )?no hace falta|ya no (lo )?quiero( nada| el servicio)?|"
+    r"(ya )?no (quiero|deseo) (nada|seguir|continuar)|dejalo asi|dejenlo asi|detente|no sigas|para ya)$")
+
+
+def withdraws(t: str, capturing: bool) -> bool:
+    return bool(CANCEL.match(t) or (capturing and CANCEL_CAPTURE.match(t)))
+
+
 QUESTIONISH = re.compile(r"\b(cuanto|como|que|cual|donde|cuando|por que|tienen|puedo|hay)\b")
 COMMERCIAL = ("registro", "planes", "publicidad", "tpv")
 
@@ -72,8 +100,26 @@ def detect(text_n: str):
     return None
 
 
+def intent_text(text: str) -> str:
+    """Texto normalizado para evaluar bajas y negativas."""
+    return norm(LEADING_NO.sub("", text or "", count=1))
+
+
+def declined_service(match, text_n: str) -> str:
+    """Servicio nombrado en la negativa ("... para la terminal"); "" si es general."""
+    scope = SCOPE.fullmatch(text_n[match.end():])
+    service = detect(scope.group(3)) if scope else None
+    return service if service in kb.SERVICES else ""
+
+
+def is_stop(text: str) -> bool:
+    """Baja, negativa o cancelacion: nunca se descarta por antiguedad ni por frecuencia."""
+    t = intent_text(text)
+    return is_optout(text) or bool(NO_HUMAN.search(t)) or withdraws(t, True)
+
+
 def is_optout(text: str) -> bool:
-    t = norm(text)
+    t = intent_text(text)
     return bool(OPTOUT.search(t) or DELETE.search(t))
 
 
@@ -97,7 +143,8 @@ class Result:
     def __init__(self):
         self.replies = []
         # (evento, servicio): consent_granted, consent_denied, consent_revoked,
-        # data_deletion, lead_update, lead_ready
+        # data_deletion, contact_declined, request_cancelled, lead_update, lead_ready.
+        # La respuesta de las dos cancelaciones la redacta el servicio, que sabe que se envio.
         self.events = []
         self.needs_ai = False
 
@@ -149,13 +196,14 @@ def handle(session: dict, text: str, consented: bool, cfg, ai=None) -> Result:
     step = session.get("step")
 
     # La baja se evalua primero, en cualquier estado.
-    if DELETE.search(t):
+    negative = intent_text(text)
+    if DELETE.search(negative):
         session.update(step=None, profile={})
         res.events.append(("data_deletion", session.get("service") or ""))
         res.say("Retiré tu autorización de contacto. El borrado de datos lo atiende una persona: "
                 f"escribe a {kb.CONTACT_EMAIL} indicando este número. Aviso: {kb.PRIVACY_URL}")
         return res
-    if OPTOUT.search(t):
+    if OPTOUT.search(negative):
         session["step"] = None
         res.events.append(("consent_revoked", session.get("service") or ""))
         res.say("Listo. Registré que no quieres que te contacten. Puedes seguir escribiéndome cuando quieras.")
@@ -164,9 +212,17 @@ def handle(session: dict, text: str, consented: bool, cfg, ai=None) -> Result:
         res.say("Solo puedo ayudarte con GastroRadar y no comparto información interna.\n" + kb.MENU)
         return res
 
-    if NO_HUMAN.search(t):
+    declined = NO_HUMAN.search(negative)
+    if declined:
         session["step"] = None
-        res.say("De acuerdo, no inicio ningún contacto. ¿Te ayudo con otra cosa?")
+        res.events.append(("contact_declined", declined_service(declined, negative)))
+        return res
+    # "Cancelar" retira la solicitud en curso. "Salir" solo cuenta mientras se piden datos.
+    capturing = step in kb.QUESTIONS
+    if step != "consent" and (capturing or session.get("service")) and (
+            withdraws(t, capturing) or withdraws(negative, capturing and negative != "gracias")):
+        session["step"] = None
+        res.events.append(("request_cancelled", session["service"]))
         return res
 
     # Pedir el menu o saludar saca de la captura de datos: nadie queda atrapado.
@@ -183,7 +239,7 @@ def handle(session: dict, text: str, consented: bool, cfg, ai=None) -> Result:
             res.events.append(("consent_denied", session["service"]))
             res.say("De acuerdo, no registraré tus datos para contactarte. ¿Te ayudo con otra cosa?")
             return res
-        if CANCEL.match(t) or GREET.match(t):
+        if withdraws(t, True) or GREET.match(t):
             session["step"] = None
             res.say(kb.GREETING)
             return res
@@ -194,10 +250,6 @@ def handle(session: dict, text: str, consented: bool, cfg, ai=None) -> Result:
         return res
 
     if step in kb.QUESTIONS:
-        if CANCEL.match(t):
-            session["step"] = None
-            res.say("Detuve las preguntas. Si tampoco quieres que te contacten, escribe BAJA.")
-            return res
         if REFUSE_FIELD.match(t) or ((SKIP.match(t) or NO.match(t)) and step != "name"):
             session["profile"][step] = ""
             _advance(session, res)

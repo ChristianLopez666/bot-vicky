@@ -102,12 +102,18 @@ class Store:
         for name, args, kwargs in tx.ops:
             getattr(pipe, name)(*args, **kwargs)
 
+    def acquire(self, lane, token) -> bool:
+        return bool(self.r.set(P + "lock:" + lane, token, nx=True, px=LOCK_MS))
+
+    def pending(self, lane) -> int:
+        return self.r.llen(P + "lane:" + lane)
+
     def claim(self):
         """Toma un carril vencido y libre. Devuelve (carril, token, trabajo) o None."""
         now = self.clock()
         for lane in self.r.zrangebyscore(DUE, "-inf", now, start=0, num=50):
             token = uuid.uuid4().hex
-            if not self.r.set(P + "lock:" + lane, token, nx=True, px=LOCK_MS):
+            if not self.acquire(lane, token):
                 continue
             raw = self.r.lindex(P + "lane:" + lane, 0)
             score = self.r.zscore(DUE, lane)

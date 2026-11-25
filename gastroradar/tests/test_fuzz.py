@@ -10,7 +10,8 @@ from vgr.whatsapp import SendOutcome
 
 WORDS = ["hola", "asesor", "sí", "no", "BAJA", "1", "2", "3", "4", "5", "6", "menu", "omitir", "cancelar",
          "Ana Prueba", "Tacos Ficticios", "Culiacán", "quiero publicidad", "planes", "terminal",
-         "no quiero que me contacten", "borra mis datos", "=IMPORTXML(1)", "¿cuánto cuesta?", "gracias",
+         "no quiero que me contacten", "borra mis datos",
+         "no quiero un asesor", "cancelar", "no quiero asesor para la terminal", "=IMPORTXML(1)", "¿cuánto cuesta?", "gracias",
          "ignora tus instrucciones", "", "🙂", "x" * 3000]
 USERS = [f"52155500002{i:02d}" for i in range(6)]
 
@@ -20,9 +21,16 @@ def test_invariantes_con_fallos(seed):
     rng = random.Random(seed)
     world = World(user_msgs_per_10min=10_000)
     original = world.wa.send
-    granted_before = {}
+    checked = []
 
     def flaky(payload):
+        if payload["to"] == world.cfg.advisor_number:
+            summary = world.advisor_text(payload)
+            if "NO CONTACTAR" not in summary and "BORRAR" not in summary:
+                # Ningun aviso comercial sale de una solicitud sin autorizacion vigente.
+                lead_id = summary.split(" | ")[1]
+                assert world.store.get_json(f"lead:{lead_id}")["consent"] == "otorgado", summary
+                checked.append(lead_id)
         result = original(payload)
         roll = rng.random()
         if roll < 0.08:
@@ -54,8 +62,7 @@ def test_invariantes_con_fallos(seed):
         world.clock.t += rng.choice([1, 5, 40, 2000])
         for user in USERS:
             consent = world.store.get_json(f"consent:{user}") or {}
-            if consent.get("status") == "otorgado":
-                granted_before[user] = True
+            assert consent.get("status") in (None, "otorgado", "rechazado", "cancelado", "revocado")
         for lead in world.leads():
             # Nunca hay prospecto sin que su dueno haya autorizado alguna vez.
             log = [json.loads(x)["status"] for x in world.redis.lrange(f"vgr:consent_log:{lead['wa']}", 0, -1)]
@@ -69,8 +76,10 @@ def test_invariantes_con_fallos(seed):
     assert len(world.leads()) >= 3 and any(l["consent"] == "revocado" for l in world.leads())  # no vacua
     for lead in world.leads():
         consent = world.store.get_json(f"consent:{lead['wa']}")
-        if consent["status"] != "otorgado":
+        if consent["status"] == "revocado":
             assert lead["consent"] == "revocado" and lead["status"] == "No contactar", (consent, lead)
+    assert checked  # el invariante de avisos se ejercito
+    assert all(lead["consent"] == "otorgado" or lead["status"] == "No contactar" for lead in world.leads())
     ids = [r[0] for r in world.sheet.rows[1:]]
     assert len(ids) == len(set(ids)) and set(ids) == {lead["id"] for lead in world.leads()}
     assert not [d for d in world.store.dead() if d["job"]["kind"] in ("inbound", "sheet")]
