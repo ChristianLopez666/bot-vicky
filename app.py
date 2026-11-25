@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 import whatsapp_interactive as wai
 import imss_flow
 import radar_bridge
+import gastroradar_redes
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -77,6 +78,9 @@ SHEET_TAB = os.getenv("SHEETS_TAB_CONVERSACIONES", "Conversaciones").strip()
 # telefono (upsert), no una fila por mensaje -- ver _report_upsert_lead().
 SHEET_TAB_REPORTE = os.getenv("SHEETS_TAB_REPORTE_LEADS", "Reporte Leads").strip()
 
+
+# Vicky Redes atiende GastroRadar. "false" regresa a los flujos financieros.
+GASTRORADAR_MENU = os.getenv("GASTRORADAR_MENU", "true").strip().lower() != "false"
 
 STATE_TTL = 24 * 60 * 60
 
@@ -447,6 +451,8 @@ def _sheets_init():
 
 def _svc_name(phone: str) -> str:
     s = user_state.get(phone, "")
+    if s.startswith("gr_"):
+        return "gastroradar"
     if s.startswith("imss_"):
         return "imss"
     if s.startswith("emp_"):
@@ -495,8 +501,10 @@ def _report_upsert_lead(phone: str, **campos) -> None:
             spreadsheetId=SHEET_ID, range=f"{SHEET_TAB_REPORTE}!A:K").execute().get("values", [])
         fila_idx = None
         actual = {}
+        es_gr = str(campos.get("producto") or "").startswith(gastroradar_redes.PRODUCT)
         for i, fila in enumerate(existentes[1:], start=2):
-            if fila and re.sub(r"\D", "", fila[0]) == ph:
+            fila_gr = len(fila) > 3 and fila[3].startswith(gastroradar_redes.PRODUCT)
+            if fila and re.sub(r"\D", "", fila[0]) == ph and fila_gr == es_gr:
                 fila_idx = i
                 fila_completa = fila + [""] * (len(_HDR_REPORTE) - len(fila))
                 actual = dict(zip(_HDR_REPORTE, fila_completa))
@@ -3862,6 +3870,12 @@ def handle(msg_obj: dict) -> None:
         _flush_boardroom_observation()
 
 
+def _handle_gastroradar(phone: str, mtype: str, text: str, mid: str) -> None:
+    _log(phone, _nombre(phone), text or f"[{_canonical_message_type(mtype)}]",
+         "entrante", "cliente", "gastroradar", "", mid)
+    gastroradar_redes.handle(phone, mtype, text, states=user_state, store=user_data,
+                             send=send_msg, notify=notify_advisor, report=_report_upsert_lead)
+
 def _handle_dispatch(msg_obj: dict) -> None:
     phone = msg_obj.get("from", "")
     if not phone:
@@ -3911,6 +3925,10 @@ def _handle_dispatch(msg_obj: dict) -> None:
             interactive_event["kind"], interactive_event["raw_type"],
             interactive_event["interactive_id"],
         )
+
+    if GASTRORADAR_MENU:
+        _handle_gastroradar(phone, mtype, text_for_boardroom, mid)
+        return
 
     # Rodys/Boardroom (RFC-003 Fase 3): el evento canonico se construye UNA
     # sola vez por mensaje, exactamente aqui. Ni antes ni despues:
@@ -4466,6 +4484,11 @@ def imss_dynamic_flow():
     elif action == "error":
         log.warning("⚠️ Flow IMSS: error notificado por el cliente: %s", step_data)
         response = imss_flow.build_error_ack_response()
+    elif GASTRORADAR_MENU:
+        # Tarjetas antiguas que sigan en un chat: no abren ni completan el tramite.
+        response = imss_flow.build_next_screen_response(
+            imss_flow.SCREEN_PROFILE, {},
+            error_message="Este trámite ya no se atiende por este chat. Escribe MENU en WhatsApp.")
     else:
         phone = _state_store.aux_get(f"imss_flow_token:{flow_token}") or ""
         if not phone:
@@ -4508,11 +4531,15 @@ def boardroom_instruct():
             "error": "phone e instruction requeridos"
         }), 400
 
+    if GASTRORADAR_MENU and instruction in ("resume_funnel", "existing_client_greeting"):
+        return jsonify({"ok": False, "error": "disabled_gastroradar"}), 409
+    informar = (lambda *_: None) if GASTRORADAR_MENU else send_msg
+
     if instruction == "hot_transfer":
         asesor_origen = payload.get("asesor_origen", "don_chiwy")
         sub_campana = payload.get("sub_campana", "")
         nombre = payload.get("nombre", "")
-        send_msg(phone,
+        informar(phone,
             f"Hola {nombre} 👋 Veo que ya eres parte de nuestra "
             f"familia COHIFIS "
             f"{'en la campaña ' + sub_campana if sub_campana else ''}. "
@@ -4544,7 +4571,7 @@ def boardroom_instruct():
             f"WhatsApp: {phone}\n"
             f"Motivo: {motivo}"
         )
-        send_msg(phone,
+        informar(phone,
             "✅ Tu solicitud es importante. Christian López te "
             "contactará personalmente en breve."
         )
