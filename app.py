@@ -780,6 +780,7 @@ def _advisor_wamid_remember(wamid: str, level: str, msg: str) -> None:
         _ADV_WAMID_TTL,
     )
     _state_store.aux_set(f"adv_retry:{wamid}", str(msg or "")[:2000], _ADV_RETRY_TTL)
+    gastroradar_redes.note_advisor_send(wamid, msg, _state_store.aux_set)
 
 
 def _advisor_wamid_lookup(wamid: str):
@@ -4309,7 +4310,11 @@ def _format_status_errors(errors) -> str:
     return (" errors=[" + " | ".join(parts) + "]") if parts else ""
 
 
-def _advisor_handle_failed(wamid: str, tracked: dict, err_txt: str) -> None:
+def _gr_release_stop(wamid: str, body=None) -> None:
+    gastroradar_redes.release_stop(wamid, _state_store.aux_get, _state_store.aux_set, body=body)
+
+
+def _advisor_handle_failed(wamid: str, tracked: dict, err_txt: str):
     """Meta confirma que una alerta al asesor NO se entregó: reenvía por
     template si hay un nivel superior disponible.
 
@@ -4333,18 +4338,30 @@ def _advisor_handle_failed(wamid: str, tracked: dict, err_txt: str) -> None:
         body = _state_store.aux_get(f"adv_retry:{wamid}") or "(cuerpo no disponible, TTL vencido)"
         _log(ADVISOR_NUM, "Asesor", body, "saliente", "asesor", "error",
              f"status_failed{err_txt}"[:300], wamid)
+        _gr_release_stop(wamid, body)
         return
     if not ADV_TPL:
         log.error("asesor_reenvio_omitido: ADVISOR_TEMPLATE_NAME no configurado")
+        _gr_release_stop(wamid)
         return
     body = _state_store.aux_get(f"adv_retry:{wamid}")
     if not body:
         log.error("asesor_reenvio_omitido: sin cuerpo correlacionado para wamid=%s", wamid[:24])
+        _gr_release_stop(wamid)
         return
-    if not gastroradar_redes.may_resend(body, _state_store.aux_get):
-        log.info("asesor_reenvio_omitido: solicitud retirada wamid=%s", wamid[:24])
-        return
-    _notify_advisor_via_template(body, motivo="status_failed")
+    block = gastroradar_redes.resend_block(body, _state_store.aux_get, _gr_report_lookup)
+    if block:
+        log.warning("asesor_reenvio_bloqueado: motivo=%s wamid=%s", block, wamid[:24])
+        _log(ADVISOR_NUM, "Asesor", body, "saliente", "asesor", "error",
+             f"reenvio_bloqueado_{block}", wamid)
+        # False: no se dio por procesado; si Meta repite el estado, se vuelve a verificar.
+        return False if block == "sin_verificar" else None
+    sent = False
+    try:
+        sent = _notify_advisor_via_template(body, motivo="status_failed")
+    finally:
+        if not sent:
+            _gr_release_stop(wamid, body)
 
 
 def _handle_statuses(statuses) -> None:
@@ -4381,7 +4398,11 @@ def _handle_statuses(statuses) -> None:
                      status, wamid[:24], _mask_phone(st.get("recipient_id")),
                      bool(tracked), err_txt)
             if status == "failed" and tracked:
-                _advisor_handle_failed(wamid, tracked, err_txt)
+                if _advisor_handle_failed(wamid, tracked, err_txt) is False:
+                    with _id_lock:
+                        _ADV_STATUS_SET.discard(seen_key)
+            elif status == "failed":
+                _gr_release_stop(wamid)
         except Exception:
             log.exception("💥 _handle_statuses")
 

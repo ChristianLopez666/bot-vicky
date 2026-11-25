@@ -12,11 +12,19 @@ import json
 import pytest
 
 import app
+import gastroradar_redes
 import imss_flow
 from test_imss_dynamic_flow_route import _decrypt_response, _encrypt_request, keypair  # noqa: F401
 
 USER, OTHER, ADVISOR, PHONE_ID, SECRET = "5215550000001", "5215550000002", "5215550000099", "111", "s3cr3t"
 ids = itertools.count(1)
+
+
+def restart_process():
+    """Pierde la memoria del proceso. Redis y Sheets (simulados) se conservan."""
+    getattr(gastroradar_redes, "reset_memory", lambda: None)()
+    app._ADV_STATUS_SEEN.clear()
+    app._ADV_STATUS_SET.clear()
 
 
 class Resp:
@@ -102,6 +110,7 @@ class Radar:
 
 class World:
     def __init__(self, monkeypatch):
+        restart_process()
         self.meta, self.sheets, self.radar, self.redis = FakeMeta(), FakeSheets(), Radar(), FakeRedis()
         store = app.StateStore()
         store._redis = self.redis                       # misma ruta de código que con KV_URL
@@ -631,3 +640,259 @@ def test_pregunta_con_solicitud_vigente_no_duplica(w):
     w.say("asesor")
     assert "no he enviado otra" in w.say("¿cuándo me llama el asesor?")
     assert len(w.advisor()) == 1
+
+
+# ── Revisión de 3838726 (PR #26) ────────────────────────────────────────────
+def down(*_a, **_k):
+    raise TimeoutError()
+
+
+def break_aux(w, monkeypatch, *ops):
+    """Falla el almacén auxiliar solo en las claves de esta conversación."""
+    for op in ops:
+        real = getattr(w.redis, op)
+
+        def fake(key, *a, _real=real):
+            if key.startswith("vicky:gr_"):
+                raise TimeoutError()
+            return _real(key, *a)
+        monkeypatch.setattr(w.redis, op, fake)
+
+
+def break_sheets(w, monkeypatch, mode):
+    names = {"ok": (), "sin_lectura": ("get",), "sin_escritura": ("append", "update"),
+             "caido": ("get", "append", "update")}[mode]
+    for name in names:
+        monkeypatch.setattr(w.sheets, name, down)
+
+
+def blocked_rows(w):
+    return [r for r in w.sheets.tabs[app.SHEET_TAB][1:] if "reenvio_bloqueado" in json.dumps(r)]
+
+
+# ── 1. Solo se reenvía una solicitud cuya vigencia se puede comprobar ───────
+@pytest.mark.parametrize("restart", [False, True])
+def test_retiro_que_no_se_pudo_guardar_no_se_reenvia(w, monkeypatch, restart):
+    app._advisor_window_touch()
+    w.say("asesor")
+    with monkeypatch.context() as m:
+        break_aux(w, m, "setex")
+        w.say("cancelar")
+    assert w.report()[0]["Estado"] == "No contactar"
+    if restart:                 # sin memoria del proceso queda el reporte como segunda fuente
+        restart_process()
+    failed(w, advisor_wamids(w, "piden un asesor")[0])
+    assert count(w, "piden un asesor") == 1
+
+
+@pytest.mark.parametrize("fault", ["lectura_fallida", "ausente"])
+def test_sin_poder_leer_la_vigencia_no_se_reenvia(w, monkeypatch, caplog, fault):
+    app._advisor_window_touch()
+    w.say("asesor"); w.say("cancelar")
+    old = advisor_wamids(w, "piden un asesor")[0]
+    restart_process()
+    if fault == "lectura_fallida":
+        break_aux(w, monkeypatch, "get")
+    else:
+        for key in [k for k in w.redis.data if k.startswith("vicky:gr_")]:
+            del w.redis.data[key]
+    failed(w, old)
+    assert count(w, "piden un asesor") == 1
+    assert "asesor_reenvio_bloqueado: motivo=sin_verificar" in caplog.text and blocked_rows(w)
+
+
+@pytest.mark.parametrize("fault", ["almacen", "sheets"])
+def test_recuperacion_si_el_estado_se_repite_cuando_ya_se_puede_comprobar(w, monkeypatch, fault):
+    app._advisor_window_touch()
+    w.say("asesor")
+    wamid = advisor_wamids(w, "piden un asesor")[0]
+    with monkeypatch.context() as m:
+        if fault == "almacen":
+            break_aux(w, m, "get")
+        else:
+            m.setattr(w.sheets, "get", down)
+        failed(w, wamid)
+    assert count(w, "piden un asesor") == 1
+    failed(w, wamid)
+    assert count(w, "piden un asesor") == 2
+    failed(w, wamid)
+    assert count(w, "piden un asesor") == 2
+
+
+def test_tras_un_bloqueo_sin_verificar_asesor_vuelve_a_avisar(w, monkeypatch):
+    app._advisor_window_touch()
+    w.say("hola"); w.say("4"); w.say("asesor"); w.say("menu")
+    with monkeypatch.context() as m:
+        break_aux(w, m, "get")
+        failed(w, advisor_wamids(w, "piden un asesor")[0])
+    assert "Envié tu solicitud" in w.say("asesor")
+    assert count(w, "piden un asesor") == 2 and "Publicidad y banners" in w.advisor()[-1]
+    assert "no la repito" in w.say("asesor") and count(w, "piden un asesor") == 2
+
+
+def test_solicitud_vigente_comprobada_se_reenvia_aun_tras_reiniciar(w):
+    app._advisor_window_touch()
+    w.say("asesor"); w.say("Ana, Tacos")
+    restart_process()
+    failed(w, advisor_wamids(w, "piden un asesor")[0])
+    failed(w, advisor_wamids(w, "datos de quien")[0])
+    assert count(w, "piden un asesor") == 2 and count(w, "datos de quien") == 2
+
+
+def test_no_contactar_y_otros_avisos_se_reintentan_sin_poder_leer_la_vigencia(w, monkeypatch):
+    app._advisor_window_touch()
+    w.say("asesor"); w.say("cancelar")
+    app._advisor_window_touch()
+    w.client.post("/ext/lead", json={"nombre": "Prueba", "telefono": "6680000000", "interes": "auto"},
+                  headers={"X-Internal-Token": "interno"})
+    break_aux(w, monkeypatch, "get", "setex")
+    monkeypatch.setattr(w.sheets, "get", down)
+    failed(w, advisor_wamids(w, "NO CONTACTAR")[0])
+    failed(w, advisor_wamids(w, "cohifis.com")[0])
+    assert count(w, "NO CONTACTAR") == 2 and count(w, "cohifis.com") == 2
+
+
+# ── 2. El mismo retiro no se avisa dos veces ────────────────────────────────
+@pytest.mark.parametrize("sheets", ["ok", "sin_lectura", "sin_escritura", "caido"])
+@pytest.mark.parametrize("phrase", ["cancelar", "BAJA"])
+@pytest.mark.parametrize("requested", [True, False])
+def test_tres_negativas_un_solo_aviso(w, monkeypatch, sheets, phrase, requested):
+    if requested:
+        w.say("asesor")
+    break_sheets(w, monkeypatch, sheets)
+    for _ in range(3):
+        reply = w.say(phrase)
+    expected = 1
+    if not requested and phrase == "cancelar" and sheets in ("ok", "sin_escritura"):
+        expected = 0            # consta que no hay solicitud: no hay nada que retirar
+    assert count(w, "NO CONTACTAR") == expected
+    if expected:
+        assert "no la repito" in reply
+
+
+@pytest.mark.parametrize("ops", [("get",), ("setex",), ("get", "setex")])
+def test_dedup_con_el_almacen_auxiliar_fallando_usa_la_memoria(w, monkeypatch, ops):
+    w.say("asesor")
+    break_aux(w, monkeypatch, *ops)
+    break_sheets(w, monkeypatch, "caido")
+    for _ in range(3):
+        w.say("BAJA")
+    assert count(w, "NO CONTACTAR") == 1
+
+
+def test_con_redis_la_marca_sobrevive_al_reinicio(w, monkeypatch):
+    break_sheets(w, monkeypatch, "caido")
+    w.say("BAJA")
+    restart_process()
+    w.say("BAJA"); w.say("cancelar")
+    assert count(w, "NO CONTACTAR") == 1
+
+
+def test_limite_declarado_sin_marca_persistente_se_repite_una_vez(w, monkeypatch):
+    """Solo memoria + reinicio, o almacén auxiliar y Sheets caídos + reinicio."""
+    break_sheets(w, monkeypatch, "caido")
+    w.say("BAJA")
+    restart_process()
+    w.redis.data.clear()
+    w.say("BAJA"); w.say("BAJA")
+    assert count(w, "NO CONTACTAR") == 2
+
+
+def test_aviso_rechazado_permite_reintentar(w, monkeypatch):
+    break_sheets(w, monkeypatch, "caido")
+    w.meta.reject_all_to.add(ADVISOR)
+    assert "No pude avisar" in w.say("BAJA")
+    w.meta.reject_all_to.clear()
+    w.say("BAJA"); w.say("BAJA")
+    assert count(w, "NO CONTACTAR") == 1
+
+
+def test_excepcion_al_avisar_no_deja_marca(w, monkeypatch):
+    break_sheets(w, monkeypatch, "caido")
+    with monkeypatch.context() as m:
+        m.setattr(app.requests, "post", down)
+        w.say("BAJA")
+    w.say("BAJA")
+    assert count(w, "NO CONTACTAR") == 1
+
+
+def stop_accepted(w, monkeypatch):
+    app._advisor_window_touch()
+    break_sheets(w, monkeypatch, "caido")
+    w.say("BAJA")
+    return advisor_wamids(w, "NO CONTACTAR")[0]
+
+
+def test_failed_con_reintento_aceptado_mantiene_la_marca(w, monkeypatch):
+    failed(w, stop_accepted(w, monkeypatch))
+    w.say("BAJA")
+    assert count(w, "NO CONTACTAR") == 2           # original + reintento por plantilla
+
+
+def test_failed_de_la_plantilla_libera_la_marca(w, monkeypatch):
+    failed(w, stop_accepted(w, monkeypatch))
+    failed(w, advisor_wamids(w, "NO CONTACTAR")[-1])
+    w.say("BAJA"); w.say("BAJA")
+    assert count(w, "NO CONTACTAR") == 3
+
+
+def test_reintento_rechazado_libera_la_marca(w, monkeypatch):
+    wamid = stop_accepted(w, monkeypatch)
+    w.meta.reject_all_to.add(ADVISOR)
+    failed(w, wamid)
+    w.meta.reject_all_to.clear()
+    w.say("BAJA"); w.say("BAJA")
+    assert count(w, "NO CONTACTAR") == 2
+
+
+@pytest.mark.parametrize("lost", ["sin_cuerpo", "sin_plantilla", "sin_correlacion"])
+def test_failed_que_no_se_puede_reintentar_libera_la_marca(w, monkeypatch, lost):
+    wamid = stop_accepted(w, monkeypatch)
+    with monkeypatch.context() as m:
+        if lost == "sin_cuerpo":                    # venció a las 2 h
+            del w.redis.data[f"vicky:adv_retry:{wamid}"]
+        elif lost == "sin_plantilla":
+            m.setattr(app, "ADV_TPL", "")
+        else:
+            del w.redis.data[f"vicky:adv_wamid:{wamid}"]
+        failed(w, wamid)
+    w.say("BAJA"); w.say("BAJA")
+    assert count(w, "NO CONTACTAR") == 2
+
+
+@pytest.mark.parametrize("clear_fails", [False, True])
+def test_solicitud_nueva_permite_un_nuevo_retiro(w, monkeypatch, clear_fails):
+    w.say("asesor"); w.say("BAJA"); w.say("BAJA")
+    with monkeypatch.context() as m:
+        if clear_fails:
+            break_aux(w, m, "setex")
+        w.say("asesor")
+    break_sheets(w, monkeypatch, "caido")
+    w.say("BAJA"); w.say("BAJA")
+    assert count(w, "NO CONTACTAR") == 2
+
+
+@pytest.mark.parametrize("requested", [False, True])
+def test_segundo_mensaje_mientras_se_envia_no_duplica(w, monkeypatch, requested):
+    if requested:
+        w.say("asesor")
+    break_sheets(w, monkeypatch, "caido")
+    real, nested = w.meta.post, []
+
+    def post(url, headers=None, json=None, timeout=None):
+        if json.get("to") == ADVISOR and not nested:
+            nested.append(None)
+            nested.append(w.say("BAJA"))
+        return real(url, headers=headers, json=json, timeout=timeout)
+    monkeypatch.setattr(app.requests, "post", post)
+    w.say("BAJA")
+    assert count(w, "NO CONTACTAR") == 1 and "Ya estoy enviando" in nested[1]
+
+
+def test_la_marca_en_curso_se_guarda_con_vencimiento_corto(w, monkeypatch):
+    seen, real = [], w.redis.setex
+    monkeypatch.setattr(w.redis, "setex",
+                        lambda k, ttl, v: (seen.append((k, ttl, v)), real(k, ttl, v))[1])
+    w.say("BAJA")
+    marks = [(ttl, v) for k, ttl, v in seen if k == f"vicky:gr_baja:{USER}"]
+    assert marks == [(120, "en_curso"), (48 * 3600, "avisado")]
