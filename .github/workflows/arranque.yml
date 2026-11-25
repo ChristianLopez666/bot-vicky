@@ -1,0 +1,33 @@
+name: arranque
+
+# Comprobacion temporal pedida en la revision del PR #26. No se fusiona.
+on:
+  push:
+    branches: ["verify/arranque-gunicorn"]
+
+permissions:
+  contents: read
+
+jobs:
+  boot:
+    name: gunicorn sin red (Python 3.13.4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.4"
+
+      - name: Instalar como Render (pip install -r requirements.txt)
+        run: pip install -r requirements.txt
+
+      - name: Codigo de aplicacion identico al SHA revisado
+        run: |
+          git fetch -q --depth=1 origin 83b6924913f43903c6b5b316df67245b309d42f6
+          git diff --exit-code FETCH_HEAD HEAD -- . ':(exclude).github'
+
+      - name: Arrancar sin salida a la red
+        run: |
+          PY="$(which python)"
+          sudo unshare --net bash -c "ip link set lo up && setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups env HOME=$HOME LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-} bash .github/boot_check.sh $PY"
