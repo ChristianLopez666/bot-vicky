@@ -62,7 +62,7 @@ Ver [RESULTADOS_PRUEBAS.txt](RESULTADOS_PRUEBAS.txt). Las pruebas `test_01` a `t
 - **13, 15, 16, 17:** dobles de OpenAI, Sheets y Meta.
 - **20:** simula entrega atrasada; no una suspensión real de Render.
 - **24:** comprueba que los archivos anteriores no cambiaron y que la app vieja importa y responde `/health`. No es una restauración en Render.
-- `gunicorn` no corre en Windows: **no se probó el arranque de producción**.
+- `gunicorn` no corre en Windows. En GitHub Actions (Linux, Python 3.13, commit `fd96700`, ejecución 45661024930) arrancó sin credenciales y `/health` respondió bien: 104 pruebas pasan y 1 se omite. Es la única con omisión prevista allí: `test_24`, porque no se instalan las dependencias del bot anterior. **No se probó el arranque en Render ni con un Redis real.**
 - `pip-audit` sobre las seis dependencias fijadas: sin vulnerabilidades conocidas (las transitivas quedan sin fijar).
 
 ## Información comercial
@@ -95,7 +95,7 @@ Total aproximado: **18 a 37**, según lo que ya se pague. Si el número no tiene
 2. Verificar Render: commit, plan, Key Value persistente y registros del problema de 24 h.
 3. Verificar número, `phone_number_id`, token permanente y qué apps de Meta comparten la cuenta con SECOM.
 4. Aprobar la plantilla del asesor y confirmar un aviso `delivered`.
-5. Ensayo real con número de prueba: WhatsApp, Redis, Sheets y arranque con gunicorn.
+5. Ensayo real con número de prueba: WhatsApp, Redis, Sheets y arranque en Render.
 6. Actualizar el aviso de privacidad y definir retención y borrado.
 7. Confirmar "primer mes sin costo" y condiciones del beneficio de la terminal.
 8. Si se quiere IA: confirmar que el modelo sigue disponible y probarlo con conversaciones reales.
