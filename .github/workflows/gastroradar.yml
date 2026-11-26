@@ -1,0 +1,29 @@
+name: gastroradar
+
+on:
+  push:
+    paths: ["gastroradar/**", ".github/workflows/gastroradar.yml"]
+  pull_request:
+    paths: ["gastroradar/**", ".github/workflows/gastroradar.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r gastroradar/requirements-dev.txt
+      - run: python -m pytest gastroradar/tests -q
+      - name: Arranque con gunicorn (sin credenciales)
+        working-directory: gastroradar
+        run: |
+          gunicorn app:app --workers 1 --threads 8 --bind 127.0.0.1:8000 --daemon
+          sleep 5
+          curl -fsS http://127.0.0.1:8000/health
