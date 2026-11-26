@@ -20,6 +20,14 @@ USER, OTHER, ADVISOR, PHONE_ID, SECRET = "5215550000001", "5215550000002", "5215
 ids = itertools.count(1)
 
 
+def body_of(payload):
+    if payload["type"] == "text":
+        return payload["text"]["body"]
+    if payload["type"] == "interactive":
+        return payload["interactive"]["body"]["text"]
+    return payload["template"]["components"][0]["parameters"][0]["text"]
+
+
 def restart_process():
     """Pierde la memoria del proceso. Redis y Sheets (simulados) se conservan."""
     getattr(gastroradar_redes, "reset_memory", lambda: None)()
@@ -93,6 +101,12 @@ class FakeRedis:
     def setex(self, k, ttl, v):
         self.data[k] = v
 
+    def set(self, k, v, nx=False, ex=None):            # como redis-py: None si nx y ya existe
+        if nx and k in self.data:
+            return None
+        self.data[k] = v
+        return True
+
     def expire(self, k, ttl):
         pass
 
@@ -111,6 +125,9 @@ class Radar:
 class World:
     def __init__(self, monkeypatch):
         restart_process()
+        # Las pruebas escriben lo mismo seguido a propósito; la protección contra
+        # toques repetidos tiene sus propias pruebas.
+        monkeypatch.setattr(gastroradar_redes, "ECHO_SECONDS", 0, raising=False)
         self.meta, self.sheets, self.radar, self.redis = FakeMeta(), FakeSheets(), Radar(), FakeRedis()
         store = app.StateStore()
         store._redis = self.redis                       # misma ruta de código que con KV_URL
@@ -141,8 +158,7 @@ class World:
             msg["text"] = {"body": text}
         before = len(self.meta.payloads)
         assert self.webhook({"messages": [msg]}).status_code == 200
-        return "\n".join(p["text"]["body"] for p in self.meta.payloads[before:]
-                         if p["to"] == user and p["type"] == "text")
+        return "\n".join(body_of(p) for p in self.meta.payloads[before:] if p["to"] == user)
 
     def advisor(self):
         out = []
@@ -174,39 +190,39 @@ def assert_no_financial(text):
 
 
 def test_recorrido_completo(w):
-    assert "asistente virtual de GastroRadar" in w.say("hola")
+    assert "Soy Vicky de GastroRadar" in w.say("hola")
     assert "$499" in w.say("4")
-    assert "hasta 4 anunciantes" in w.say("¿cuánto cuesta?")          # seguimiento del tema
+    assert "$499" in w.say("¿cuánto cuesta?")                       # seguimiento del tema\n    assert "hasta 4 anunciantes" in w.say("detalles")
     assert "no tengo una respuesta confirmada" in w.say("¿hacen diseños?").lower()
-    assert "ASESOR" in w.say("sí")
-    assert "Encontrar comida" in w.say("menu")
+    assert "Hablar con asesor" in w.say("sí")
+    assert "Soy Vicky de GastroRadar" in w.say("menu")
     assert "$89.90" in w.say("3")
-    assert "Registrarte es gratis" in w.say("quiero registrar mi negocio")
+    assert "El registro es gratis" in w.say("quiero registrar mi negocio")
     assert w.advisor() == []
     reply = w.say("asesor")
-    assert "Envié tu solicitud" in reply and "nombre" in reply
+    assert "Envié el aviso al asesor" in reply and "nombre" in reply
     assert "Registro de negocio" in w.advisor()[0] and USER in w.advisor()[0]
     assert w.report()[0]["Estado"] == "Solicita asesor"
     assert "envié tus datos" in w.say("Ana Prueba, Tacos Ficticios").lower()
     assert "Ana Prueba" in w.advisor()[1]
     [row] = w.report()
     assert row["Nombre"] == "Ana Prueba, Tacos Ficticios" and row["Producto"] == "GastroRadar: Registro de negocio"
-    assert "Encontrar comida" in w.say("menu")
+    assert "Soy Vicky de GastroRadar" in w.say("menu")
     assert "$39.90" in w.say("3")
     assert_no_financial(w.everything_to_users())
     assert w.boardroom == []
 
 
 @pytest.mark.parametrize("option,expected", [
-    ("1", "Cerca de mí"), ("2", "verifica por teléfono"), ("3", "aún no está disponible"),
-    ("4", "Mercado Pago"), ("5", "terminal"), ("6", "reportar un problema"),
+    ("1", "Cerca de mí"), ("2", "verificamos por teléfono"), ("3", "aún no está disponible"),
+    ("4", "se comparte"), ("5", "terminal"), ("6", "reportar un problema"),
 ])
 def test_cada_opcion_y_regreso(w, option, expected):
     w.say("hola")
     reply = w.say(option)
     assert expected.lower() in reply.lower()
     assert_no_financial(reply)
-    assert "Encontrar comida" in w.say("menu")
+    assert "Soy Vicky de GastroRadar" in w.say("menu")
 
 
 def test_terminal_no_inventa_condiciones(w):
@@ -264,7 +280,7 @@ def test_baja_sin_solicitud_reciente_se_comunica_y_queda_registrada(w):
 
 def test_aviso_usa_plantilla_si_el_texto_libre_falla(w):
     w.meta.reject_text_to.add(ADVISOR)
-    assert "Envié tu solicitud" in w.say("asesor")
+    assert "Envié el aviso al asesor" in w.say("asesor")
     assert [p["type"] for p in w.meta.payloads if p["to"] == ADVISOR] == ["template"]
 
 
@@ -273,7 +289,7 @@ def test_si_el_aviso_falla_queda_registrado_y_se_puede_reintentar(w):
     assert "No pude enviar" in w.say("asesor")
     assert w.report()[0]["Estado"] == "Solicita asesor - aviso fallido"
     w.meta.reject_all_to.clear()
-    assert "Envié tu solicitud" in w.say("asesor")
+    assert "Envié el aviso al asesor" in w.say("asesor")
 
 
 def test_estado_failed_de_meta_reenvia_por_plantilla(w):
@@ -298,7 +314,7 @@ def test_sesion_financiera_pasa_al_menu_nuevo_sin_borrar_datos(w, old, answer):
     w.redis.data[f"vicky:state:{USER}"] = old
     w.redis.data[f"vicky:data:{USER}"] = json.dumps({"nombre": "Dato previo", "pension": 8500})
     reply = w.say(answer)
-    assert "GastroRadar" in reply and "Encontrar comida" in reply
+    assert "Soy Vicky de GastroRadar" in reply
     assert_no_financial(reply)
     assert json.loads(w.redis.data[f"vicky:data:{USER}"]) == {"nombre": "Dato previo", "pension": 8500}
     assert w.redis.data[f"vicky:state:{USER}"] == "gr_menu"
@@ -306,8 +322,8 @@ def test_sesion_financiera_pasa_al_menu_nuevo_sin_borrar_datos(w, old, answer):
 
 
 def test_numero_sin_menu_nuevo_mostrado_no_se_interpreta(w):
-    assert "Encontrar comida" in w.say("2")          # estado vencido: vio el menú viejo
-    assert "Registrarte es gratis" in w.say("2")
+    assert "Soy Vicky de GastroRadar" in w.say("2")          # estado vencido: vio el menú viejo
+    assert "El registro es gratis" in w.say("2")
 
 
 @pytest.mark.parametrize("item", ["menu_imss", "menu_auto", "lo_que_sea"])
@@ -423,7 +439,7 @@ def test_interruptor_apagado_conserva_el_bot_anterior(w, monkeypatch):
                                     "que me atienda alguien", "No, quiero un asesor"])
 def test_otras_formas_de_pedir_persona(w, phrase):
     w.say("hola")
-    assert "Envié tu solicitud" in w.say(phrase) and len(w.advisor()) == 1
+    assert "Envié el aviso al asesor" in w.say(phrase) and len(w.advisor()) == 1
 
 
 @pytest.mark.parametrize("phrase", ["ya no lo quiero", "ya no es necesario", "siempre no", "cancélalo",
@@ -448,7 +464,7 @@ def test_como_contratar_respeta_el_tema(w, option, expected):
 
 def test_negacion_ambigua_con_asesor_no_avisa(w):
     w.say("hola")
-    assert "escribe ASESOR" in w.say("no sé si hablar con un asesor") and w.advisor() == []
+    assert "Hablar con asesor" in w.say("no sé si hablar con un asesor") and w.advisor() == []
 
 
 # ── RGR-01: preguntar por un asesor no es pedirlo ───────────────────────────
@@ -464,8 +480,8 @@ def test_pregunta_sobre_asesor_no_avisa(w, question, option):
     w.say(option)
     reply = w.say(question)
     assert w.advisor() == [] and w.report() == []
-    assert "No he enviado" in reply and "ASESOR" in reply
-    assert "Envié tu solicitud" in w.say("asesor")        # la confirmación sí avisa
+    assert "No he enviado" in reply and "Hablar con asesor" in reply
+    assert "Envié el aviso al asesor" in w.say("asesor")        # la confirmación sí avisa
     assert len(w.advisor()) == 1
 
 
@@ -477,7 +493,7 @@ def test_pregunta_sobre_asesor_no_avisa(w, question, option):
 ])
 def test_peticion_explicita_si_avisa(w, request_text):
     w.say("hola")
-    assert "Envié tu solicitud" in w.say(request_text)
+    assert "Envié el aviso al asesor" in w.say(request_text)
     assert len(w.advisor()) == 1
 
 
@@ -623,7 +639,7 @@ def test_negativa_tardia_no_toca_el_historial_financiero(w):
 def test_despues_de_24h_se_puede_pedir_otra_vez(w):
     w.say("asesor")
     age(w, "presente")
-    assert "Envié tu solicitud" in w.say("asesor") and count(w, "piden un asesor") == 2
+    assert "Envié el aviso al asesor" in w.say("asesor") and count(w, "piden un asesor") == 2
 
 
 @pytest.mark.parametrize("text", [
@@ -725,7 +741,7 @@ def test_tras_un_bloqueo_sin_verificar_asesor_vuelve_a_avisar(w, monkeypatch):
     with monkeypatch.context() as m:
         break_aux(w, m, "get")
         failed(w, advisor_wamids(w, "piden un asesor")[0])
-    assert "Envié tu solicitud" in w.say("asesor")
+    assert "Envié el aviso al asesor" in w.say("asesor")
     assert count(w, "piden un asesor") == 2 and "Publicidad y banners" in w.advisor()[-1]
     assert "no la repito" in w.say("asesor") and count(w, "piden un asesor") == 2
 

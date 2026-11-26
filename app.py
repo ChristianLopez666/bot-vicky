@@ -20,6 +20,7 @@ import whatsapp_interactive as wai
 import imss_flow
 import radar_bridge
 import gastroradar_redes
+import sheets_client
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -189,6 +190,18 @@ class StateStore:
             return True
         except Exception:
             return False
+
+    def aux_claim(self, key: str, value: str, ttl: int):
+        """Escribe solo si la clave no existe. True: la tomó; False: ya existía;
+        None: el almacén falló."""
+        try:
+            if self._redis:
+                return bool(self._redis.set(f"vicky:{key}", value, nx=True, ex=max(int(ttl), 1)))
+            if self.aux_get(key) is not None:
+                return False
+            return True if self.aux_set(key, value, ttl) else None
+        except Exception:
+            return None
 
     def aux_get(self, key: str):
         try:
@@ -436,7 +449,8 @@ def _sheets_init():
         creds = Credentials.from_service_account_info(
             json.loads(GG_CREDS),
             scopes=["https://www.googleapis.com/auth/spreadsheets"])
-        _svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+        _svc = sheets_client.reuse_spreadsheets(
+            build("sheets", "v4", credentials=creds, cache_discovery=False))
         _srdy = True
         _sheets_ensure_tab(SHEET_TAB, _HDR)
         try:
@@ -3888,13 +3902,97 @@ def _gr_report_lookup(phone: str):
         log.exception("❌ Error leyendo reporte de leads")
         return None
 
-def _handle_gastroradar(phone: str, mtype: str, text: str, mid: str) -> None:
+# ── GastroRadar: presentación y recepción ─────────────────────────────────────
+_GR_IMAGE_PATH = "/static/gastroradar-bienvenida.jpg"
+_GR_IMAGE_KEY = "gr_img:"
+_GR_IMAGE_TTL = 60 * 60
+_GR_BODY_LIMIT = 1024          # cuerpo de un mensaje interactivo
+
+
+def _gr_image_url() -> str:
+    """Render define RENDER_EXTERNAL_URL por sí mismo. Sin ella no se envía imagen."""
+    base = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    return base + _GR_IMAGE_PATH if base.startswith("https://") else ""
+
+
+def _gr_payload(phone: str, view: dict, image_url: str):
+    if len(view["text"]) > _GR_BODY_LIMIT:
+        raise ValueError("cuerpo demasiado largo para un mensaje interactivo")
+    if view.get("list"):
+        button_text, rows = view["list"]
+        return wai.build_list_message_payload(
+            str(phone), view["text"], button_text, [{"rows": [{"id": i, "title": t} for i, t in rows]}])
+    payload = wai.build_reply_buttons_payload(str(phone), view["text"], list(view["buttons"]))
+    if image_url:
+        payload["interactive"]["header"] = {"type": "image", "image": {"link": image_url}}
+    return payload
+
+
+def _gr_present(phone: str, view: dict) -> bool:
+    """Envía una vista con botones o lista. Si Meta rechaza la imagen se envía sin
+    ella; si rechaza el formato, como texto. Ante un error de red no se reintenta:
+    Meta pudo haber recibido el mensaje y se duplicaría."""
+    if not META_TOKEN or not WABA_ID:
+        log.error("❌ META_TOKEN o WABA_PHONE_ID no configurados")
+        return False
+    image_url = _gr_image_url() if view.get("image") else ""
+    for url in ([image_url, ""] if image_url else [""]):
+        try:
+            payload = _gr_payload(phone, view, url)
+            response = _wa_post(payload)
+        except ValueError as exc:
+            log.error("gr_vista_invalida: %s", exc)
+            break
+        except Exception as exc:
+            log.exception("💥 gr_present")
+            _log(phone, _nombre(phone), view["text"], "saliente", "bot", "error", str(exc)[:200], _mid())
+            return False
+        if response.status_code in (200, 201):
+            _log(phone, _nombre(phone), view["text"], "saliente", "bot", "ok", "", _mid())
+            if url:
+                _gr_remember_image(response, phone, view)
+            return True
+        log.error("gr_interactivo_rechazado: http=%s con_imagen=%s %s",
+                  response.status_code, bool(url), response.text[:200])
+    return send_msg(phone, view["text"] + "\n\n" + view["alt"])
+
+
+def _gr_remember_image(response, phone: str, view: dict) -> None:
+    """Meta puede aceptar el mensaje y fallar después al descargar la imagen."""
+    try:
+        wamid = response.json()["messages"][0]["id"]
+    except Exception:
+        return
+    _state_store.aux_set(_GR_IMAGE_KEY + wamid, json.dumps({"phone": str(phone), "view": view}),
+                         _GR_IMAGE_TTL)
+
+
+def _gr_retry_without_image(wamid: str) -> None:
+    raw = _state_store.aux_get(_GR_IMAGE_KEY + wamid)
+    if not raw or raw == "reenviado":
+        return
+    _state_store.aux_set(_GR_IMAGE_KEY + wamid, "reenviado", _GR_IMAGE_TTL)
+    saved = json.loads(raw)
+    log.warning("gr_imagen_no_entregada: reenvío sin imagen wamid=%s", wamid[:24])
+    _gr_present(saved["phone"], {**saved["view"], "image": False})
+
+
+def _handle_gastroradar(phone: str, mtype: str, text: str, mid: str, action=None) -> None:
+    started = time.time()
+    reason = gastroradar_redes.claim_message(
+        mid, _state_store.aux_claim, _state_store.aux_get, _state_store.aux_set)
+    if reason:
+        log.info("gr_mensaje_descartado: motivo=%s id=%s destino=%s", reason, mid[-12:], _mask_phone(phone))
+        return
     _log(phone, _nombre(phone), text or f"[{_canonical_message_type(mtype)}]",
          "entrante", "cliente", "gastroradar", "", mid)
-    gastroradar_redes.handle(phone, mtype, text, states=user_state, store=user_data,
-                             send=send_msg, notify=notify_advisor, report=_report_upsert_lead,
-                             lookup=_gr_report_lookup, aux_get=_state_store.aux_get,
-                             aux_set=_state_store.aux_set)
+    result = gastroradar_redes.handle(
+        phone, mtype, text, states=user_state, store=user_data, send=_gr_present, notify=notify_advisor,
+        report=_report_upsert_lead, lookup=_gr_report_lookup, aux_get=_state_store.aux_get,
+        aux_set=_state_store.aux_set, action=action)
+    gastroradar_redes.finish_message(mid, _state_store.aux_set)
+    log.info("gr_mensaje: id=%s tipo=%s accion=%s resultado=%s ms=%d destino=%s", mid[-12:], mtype,
+             action or "-", result or "atendido", (time.time() - started) * 1000, _mask_phone(phone))
 
 def _handle_dispatch(msg_obj: dict) -> None:
     phone = msg_obj.get("from", "")
@@ -3947,7 +4045,9 @@ def _handle_dispatch(msg_obj: dict) -> None:
         )
 
     if GASTRORADAR_MENU:
-        _handle_gastroradar(phone, mtype, text_for_boardroom, mid)
+        action = (interactive_event or {}).get("interactive_id") or ""
+        _handle_gastroradar(phone, mtype, text_for_boardroom, mid,
+                            action=action if action.startswith("gr_") else None)
         return
 
     # Rodys/Boardroom (RFC-003 Fase 3): el evento canonico se construye UNA
@@ -4403,6 +4503,7 @@ def _handle_statuses(statuses) -> None:
                         _ADV_STATUS_SET.discard(seen_key)
             elif status == "failed":
                 _gr_release_stop(wamid)
+                _gr_retry_without_image(wamid)
         except Exception:
             log.exception("💥 _handle_statuses")
 
