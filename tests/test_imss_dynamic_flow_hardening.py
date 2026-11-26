@@ -286,6 +286,50 @@ def _preparar_prospecto_con_propuesta(token, avisos):
     avisos.clear()
 
 
+def test_handoff_captura_el_horario_dentro_del_flow(monkeypatch, avisos):
+    """El horario se pregunta DENTRO del Flow, junto al nombre. Al salir, el
+    prospecto ya quedo agendado: no se le deja un estado abierto esperando
+    que conteste 1/2/3 por texto."""
+    token = imss_flow.generate_flow_token()
+    _preparar_prospecto_con_propuesta(token, avisos)
+    enviados = []
+    monkeypatch.setattr(vicky_app, "send_msg",
+                        lambda to, text: enviados.append(text) or True)
+
+    etiquetas = vicky_app._imss_horarios_ofrecidos(vicky_app.user_data[PHONE])
+    r = vicky_app._imss_flow_handle_handoff(
+        PHONE, {"nombre": "Juan Pérez", "horario": "1"}, token)
+
+    assert r["data"]["extension_message_response"]["params"]["resultado"] == "calificado"
+    assert vicky_app.user_data[PHONE]["horario_contacto"] == etiquetas["1"]
+    # Ya no queda esperando la respuesta 1/2/3 por texto.
+    assert vicky_app.user_state.get(PHONE) != "imss_q_horario_calc"
+    # Y el asesor recibe el horario en la MISMA ficha, no en un aviso aparte.
+    assert len(avisos) == 1
+    assert etiquetas["1"] in avisos[0]
+
+
+def test_handoff_con_otro_horario_sigue_esperando_el_texto(monkeypatch, avisos):
+    """Unico caso que queda abierto: si elige "otro dia y horario", falta el
+    dato y hay que pedirlo por texto en el estado de siempre."""
+    token = imss_flow.generate_flow_token()
+    _preparar_prospecto_con_propuesta(token, avisos)
+    enviados = []
+    monkeypatch.setattr(vicky_app, "send_msg",
+                        lambda to, text: enviados.append(text) or True)
+
+    etiquetas = vicky_app._imss_horarios_ofrecidos(vicky_app.user_data[PHONE])
+    otro = next(k for k, v in etiquetas.items()
+                if v == vicky_app._IMSS_OTRO_HORARIO_LABEL)
+
+    vicky_app._imss_flow_handle_handoff(
+        PHONE, {"nombre": "Juan Pérez", "horario": otro}, token)
+
+    assert not vicky_app.user_data[PHONE].get("horario_contacto")
+    assert vicky_app.user_state.get(PHONE) == "imss_q_horario_calc"
+    assert any("horario" in m.lower() for m in enviados)
+
+
 def test_handoff_con_cierre_fallido_no_se_marca_completado(monkeypatch, avisos):
     """Si el mensaje de cierre no se entrego, el prospecto queda esperando
     una pregunta de horario que nunca vio. Un reintento de Meta DEBE volver a
