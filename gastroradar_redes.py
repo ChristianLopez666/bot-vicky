@@ -9,8 +9,9 @@ marcas, que se pierde al reiniciar. Textos fijos, sin IA y sin mensajes por
 iniciativa propia.
 
 Información comercial contrastada con tugastroradar.com (inicio, /planes,
-/ayuda) el 25-nov-2026. La terminal no tiene texto en el sitio: no se describen
-precio, requisitos ni beneficios.
+/ayuda) el 25-nov-2026. El beneficio de un año sin costo con TPV Inbursa lo definió
+el titular el 26-nov-2026; el sitio no publica sus condiciones ni el precio de la
+terminal, así que no se describen.
 """
 import os
 import re
@@ -44,20 +45,29 @@ B_ADVISOR = ("gr_asesor", "Hablar con asesor")
 B_HOME = ("gr_inicio", "Volver al menú")
 B_CANCEL = ("gr_cancelar", "Cancelar solicitud")
 B_DETAILS = ("gr_banners_detalle", "Ver detalles")
+B_CHRISTIAN = ("gr_asesor", "Hablar con Christian")
+B_REGISTER = ("gr_registro", "Registrar mi negocio")
 NAV = (B_ADVISOR, B_HOME)
+NAV_REGISTER = (B_REGISTER, B_ADVISOR, B_HOME)
 BACK = (B_HOME,)
 AFTER_REQUEST = (B_HOME, B_CANCEL)
 WELCOME_BUTTONS = (("gr_comida", "Busco comida"), ("gr_negocio", "Tengo un negocio"),
                    ("gr_ayuda", "Necesito ayuda"))
-BUSINESS_LIST = ("Ver opciones", (("gr_registro", "Registrar mi negocio"), ("gr_planes", "Conocer los planes"),
-                                  ("gr_banners", "Anunciar mi negocio"), ("gr_terminal", "Terminal Inbursa"),
-                                  ("gr_inicio", "Volver al menú")))
+BUSINESS_LIST = ("Ver opciones", (
+    ("gr_registro", "Registrar mi negocio"),
+    ("gr_planes", "Planes"),
+    ("gr_banners", "Publicidad y banners"),
+    # La fila admite 24 caracteres: el nombre completo y su condición van en la descripción.
+    ("gr_beneficio", "Un año sin costo", "Un año de publicidad sin costo al contratar TPV Inbursa"),
+    ("gr_inicio", "Volver al menú")))
 ALT_NAV = "Escribe ASESOR para hablar con una persona o MENU para volver."
 ALT_BACK = "Escribe MENU para volver."
 ALT_REQUEST = "Escribe MENU para volver o CANCELAR si ya no quieres la solicitud."
 ALT_WELCOME = ("Responde con un número:\n1. Encontrar comida\n2. Registrar mi negocio\n3. Planes\n"
-               "4. Publicidad y banners\n5. Terminal Inbursa\n6. Ayuda y contacto")
-ALT_BUSINESS = "Responde: 2 registro, 3 planes, 4 publicidad, 5 terminal. MENU para volver."
+               "4. Publicidad y banners\n5. Un año de publicidad sin costo (al contratar TPV Inbursa)\n"
+               "6. Soporte o atención humana")
+ALT_BUSINESS = ("Responde: 2 registro, 3 planes, 4 publicidad y banners, 5 un año de publicidad sin costo "
+                "(al contratar TPV Inbursa). MENU para volver.")
 
 WELCOME = ("¡Hola! 👋 Soy Vicky de GastroRadar. ¿Buscas dónde comer, quieres dar a conocer tu negocio "
            "o necesitas ayuda?")
@@ -65,7 +75,7 @@ CHANGED = "Ahora atiendo GastroRadar.\n\n" + WELCOME
 BUSINESS = "🏪 *Tengo un negocio*\n\n¿Qué quieres hacer?"
 
 LABELS = {"comida": "Encontrar comida", "registro": "Registro de negocio", "planes": "Planes",
-          "banners": "Publicidad y banners", "terminal": "Terminal punto de venta",
+          "banners": "Publicidad y banners", "beneficio": "Un año sin costo con TPV Inbursa",
           "soporte": "Soporte", "general": "Atención humana"}
 
 ANSWERS = {
@@ -73,7 +83,8 @@ ANSWERS = {
               "• Busca por nombre o tipo de comida.\n"
               "• Elige estado y municipio, o usa «Cerca de mí».\n"
               "• Filtra por forma de pago, servicio o «Abierto ahora».\n\n"
-              f"🔗 {SITE}",
+              f"👉 *Siguiente paso:* entra a {SITE} y busca.\n\n"
+              "¿Tienes un negocio de comida? Regístralo gratis.",
     "registro": "🏪 *Registra y administra tu negocio*\n\n"
                 "*El registro es gratis.* Estos son los pasos:\n\n"
                 f"*1. Busca tu negocio*\nEntra a {PLANS_URL} y búscalo por nombre. Puedes indicar el "
@@ -87,7 +98,8 @@ ANSWERS = {
                 "*¿Qué podrás hacer después?*\nCuando se autorice tu acceso, podrás actualizar datos de "
                 "contacto, horarios, formas de pago, servicios y fotos. Las fotos se publican después de "
                 "revisarlas.\n\n"
-                "Si no encuentras tu negocio o necesitas ayuda, elige *Hablar con asesor*.",
+                "👉 *Siguiente paso:* busca tu negocio en el enlace del paso 1. Si no lo encuentras o "
+                "necesitas ayuda, toca *Hablar con asesor*.",
     "planes": "📋 *Planes* (pesos, IVA incluido)\n\n"
               "*Esencial: gratis*\n• Nombre, dirección y contacto\n• Búsqueda por cercanía\n\n"
               "*Conecta: $39.90 al mes*\n• Agrega «Cómo llegar»\n• Botones de llamada y WhatsApp\n"
@@ -95,16 +107,24 @@ ANSWERS = {
               "*Presencia: $89.90 al mes*\n• Agrega perfil personalizado y portada\n• Hasta 8 imágenes\n"
               "• Vacantes\n\n"
               "El sitio anuncia primer mes sin costo en Conecta y Presencia. La contratación de planes "
-              f"aún no está disponible.\n\n🔗 {PLANS_URL}",
+              f"aún no está disponible.\n\n🔗 {PLANS_URL}\n\n"
+              "👉 *Siguiente paso:* registra tu negocio gratis o resuelve tus dudas con un asesor.",
     "banners": "📣 *Anuncia tu negocio en GastroRadar*\n\n"
                "$499 MXN al mes, IVA incluido, por posición y ubicación.\n"
                "El espacio se comparte con otros anunciantes.\n\n"
-               "¿Quieres ver los detalles o hablar con un asesor?",
-    "terminal": "💳 *Terminal punto de venta de Inbursa*\n\nUn asesor te informa requisitos y "
-                "condiciones.",
+               "👉 *Siguiente paso:* revisa los detalles o habla con un asesor.",
+    "beneficio": "🎁 *Un año de publicidad sin costo*\n\n"
+                 "El beneficio consiste en *12 meses del Plan Presencia de GastroRadar sin costo* mediante la "
+                 "contratación de una terminal punto de venta (TPV) Inbursa, *sujeto a las condiciones "
+                 "aplicables*.\n\n"
+                 "La publicidad la presta GastroRadar, no Inbursa. Los banners son aparte.\n\n"
+                 f"🔗 Qué es el Plan Presencia: {PLANS_URL}\n\n"
+                 "👉 *Siguiente paso:* toca *Hablar con Christian* para conocer las condiciones y "
+                 "continuar.",
     "soporte": "🛟 *Ayuda y contacto*\n\nPara reportar un problema o corregir una ficha:\n"
                f"🔗 {HELP_URL}\n✉️ {CONTACT_EMAIL}\n\n"
-               "No envíes contraseñas ni datos de tarjeta.",
+               "No envíes contraseñas ni datos de tarjeta.\n\n"
+               "👉 *Siguiente paso:* si prefieres que te atienda una persona, toca *Hablar con asesor*.",
 }
 BANNER_DETAILS = (
     "📣 *Condiciones del banner*\n\n"
@@ -115,14 +135,19 @@ BANNER_DETAILS = (
     "• Apartar tu lugar es gratis y no publica nada.\n"
     "• El pago en línea es con Mercado Pago.\n"
     "• Se publica después de revisar tu arte y tu pago.\n\n"
-    f"🔗 {PLANS_URL}")
-BUTTONS_BY_TOPIC = {"comida": NAV, "registro": NAV, "planes": NAV, "banners": (B_DETAILS, B_ADVISOR, B_HOME),
-                    "terminal": NAV, "soporte": NAV}
-OPTIONS = dict(zip("123456", ("comida", "registro", "planes", "banners", "terminal", "soporte")))
+    f"🔗 {PLANS_URL}\n\n"
+    "👉 *Siguiente paso:* toca *Hablar con asesor* para continuar.")
+BUTTONS_BY_TOPIC = {"comida": NAV_REGISTER, "registro": NAV, "planes": NAV_REGISTER,
+                    "banners": (B_DETAILS, B_ADVISOR, B_HOME), "beneficio": (B_CHRISTIAN, B_HOME),
+                    "soporte": NAV}
+OPTIONS = dict(zip("123456", ("comida", "registro", "planes", "banners", "beneficio", "soporte")))
 
 # El orden importa: lo específico antes que lo general.
 TOPICS = (
-    ("terminal", r"\b(terminal|tpv|punto de venta|inbursa|cobrar con tarjeta)\b"),
+    # Va primero: «publicidad sin costo» también contiene «publicidad».
+    ("beneficio", r"\b(terminal|tpv|punto de venta|inbursa|cobrar con tarjeta|beneficio|"
+                  r"(un|1) ano( de publicidad)? (sin costo|gratis)|publicidad (sin costo|gratis)|"
+                  r"12 meses (sin costo|gratis))\b"),
     ("banners", r"\b(banner|banners|publicidad|anunci\w+|promocionar)\b"),
     ("soporte", r"\b(soporte|ayuda|problema|error|falla|queja|reporte|no funciona|corregir|"
                 r"retirar (mi )?ficha|dar de baja|no puedo|mi cuenta|acceso)\b"),
@@ -156,7 +181,7 @@ PERSON = (r"\b(asesor|asesora|humano|persona|ejecutivo|que me (llamen|contacten)
 NEGATION = r"\b(no|ni|sin)\b"
 # Pedir contacto sin ambigüedad. Nombrar al asesor o preguntar por él no basta.
 _LEAD = r"^((hola|buenas|buenos dias|buenas tardes|buenas noches|si|ok|oye|vicky|por favor) )*"
-_WHO = r"( un| una| el| al)? (asesor|asesora|ejecutivo|agente|humano|persona|atencion humana|alguien)\b"
+_WHO = r"( un| una| el| al)? (asesor|asesora|ejecutivo|agente|humano|persona|atencion humana|alguien|christian)\b"
 _ASK = r"(yo )?(quiero|quisiera|necesito|ocupo|solicito|pido|deseo|requiero|me gustaria)( por favor)?"
 EXPLICIT = _LEAD + (
     r"((un |una )?(asesor|asesora|ejecutivo|humano|persona real|atencion humana)"
@@ -182,15 +207,16 @@ SKIP = r"^(omitir|no|no gracias|ninguno|despues)$"
 # En la pregunta de datos: esto es una consulta, no un nombre.
 ASKING = (r"^(que|cuanto|cuanta|como|donde|cuando|cual|quiero|quisiera|necesito|busco|tienen|puedo|hay|ver|"
           r"me interesa|informacion de|info de)( |$)|"
-          r"^(comida|registro|planes?|banners?|publicidad|terminal|soporte|ayuda|precios?|costo)$")
+          r"^(comida|registro|planes?|banners?|publicidad|terminal|tpv|beneficio|soporte|ayuda|precios?|costo)$")
 
 ASK_DETAILS = "\n\nSi quieres, compárteme tu nombre y el de tu negocio. Es opcional."
 SENT = "✅ Envié el aviso al asesor."
+SENT_BENEFIT = "✅ Envié el aviso a Christian sobre el año de publicidad sin costo."
 ALREADY = "Tu solicitud ya fue enviada al asesor; no la repito."
 FAILED = f"No pude enviar el aviso al asesor. Por favor escribe a {CONTACT_EMAIL}."
-DETAILS_OK = "Gracias, envié tus datos al asesor."
+DETAILS_OK = "Gracias, envié tus datos al asesor. Si necesitas algo más, toca *Volver al menú*."
 DETAILS_FAILED = f"No pude enviar tus datos al asesor. Puedes escribirlos a {CONTACT_EMAIL}."
-SKIPPED = "De acuerdo. Tu solicitud ya fue enviada."
+SKIPPED = "De acuerdo. Tu solicitud ya fue enviada. Si necesitas algo más, toca *Volver al menú*."
 STOP_SENT = ("El aviso anterior ya se había enviado y no puedo deshacerlo. Le envié al asesor la "
              "indicación de no contactarte, pero no puedo asegurar que la vea a tiempo.")
 STOP_RECORDED = "Envié al asesor la indicación de no contactarte."
@@ -437,6 +463,8 @@ def _converse(phone, text, action, outcome, *, states, store, send, notify, repo
 
     if action == "gr_negocio":
         return business()
+    if action == "gr_terminal":                    # botón de una lista enviada antes de este cambio
+        action = "gr_beneficio"
     if action == "gr_ayuda":
         return topic_reply("soporte")
     if action == "gr_banners_detalle":
@@ -524,7 +552,8 @@ def _converse(phone, text, action, outcome, *, states, store, send, notify, repo
         record(topic, "Solicita asesor" if ok else "Solicita asesor - aviso fallido")
         if not ok:
             return finish(FAILED, retry=True)
-        return finish(SENT + ASK_DETAILS, "gr_datos", buttons=AFTER_REQUEST, alt=ALT_REQUEST)
+        return finish((SENT_BENEFIT if topic == "beneficio" else SENT) + ASK_DETAILS, "gr_datos",
+                      buttons=AFTER_REQUEST, alt=ALT_REQUEST)
 
     if re.search(PERSON, t):
         return finish(CONFIRM_PENDING if request else CONFIRM, previous if mine else "gr_menu",
@@ -568,14 +597,18 @@ def _converse(phone, text, action, outcome, *, states, store, send, notify, repo
     if topic_now == "banners" and re.search(CONTRACT + r"|\b(detalles|condiciones|requisitos)\b", t):
         return finish(BANNER_DETAILS, "gr_banners", buttons=NAV, alt=ALT_NAV)
     if re.search(CONTRACT, t):
-        return topic_reply(topic_now if topic_now in ("terminal", "planes") else "planes")
+        return topic_reply(topic_now if topic_now in ("beneficio", "planes") else "planes")
+    if topic_now == "beneficio" and re.search(r"\b(condiciones|requisitos|detalles)\b", t):
+        return topic_reply("beneficio")
 
     # 5) Pregunta de seguimiento sobre el tema abierto.
     if re.search(PRICE, t):
         if topic_now in ("planes", "banners", "registro"):
             return topic_reply(topic_now, previous)
-        if topic_now == "terminal":
-            return finish("No tengo precio confirmado de la terminal.", previous, buttons=NAV, alt=ALT_NAV)
+        if topic_now == "beneficio":
+            return finish("El beneficio está sujeto a las condiciones aplicables y no tengo confirmado el "
+                          "costo de la terminal.\n\n👉 *Siguiente paso:* toca *Hablar con Christian* para "
+                          "que te las explique.", previous, buttons=(B_CHRISTIAN, B_HOME), alt=ALT_NAV)
         return topic_reply("planes")
 
     if not mine:
