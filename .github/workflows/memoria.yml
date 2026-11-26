@@ -1,0 +1,37 @@
+name: memoria
+
+# Medicion temporal antes/despues. No se fusiona.
+on:
+  push:
+    branches: ["verify/memoria-redes"]
+
+permissions:
+  contents: read
+
+jobs:
+  medir:
+    name: memoria de gunicorn sin red (Python 3.13.4)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.4"
+
+      - run: pip install -r requirements.txt
+
+      - name: Preparar las dos versiones
+        run: |
+          git worktree add ../antes c21b54d27ae6de1bc29b465c4ffbb0523cc23621
+          git worktree add ../despues "$(cat .github/memoria/SHA)"
+
+      - name: Medir sin salida a la red
+        run: |
+          PY="$(which python)"
+          export ANTES_DIR="$(cd ../antes && pwd)" DESPUES_DIR="$(cd ../despues && pwd)"
+          sudo unshare --net bash -c "ip link set lo up && setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups env HOME=$HOME LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-} ANTES_DIR=$ANTES_DIR DESPUES_DIR=$DESPUES_DIR bash .github/memoria/run.sh $PY"
+          echo "--- errores distintos"
+          grep -hE "ERROR|Error:" gunicorn_*.log | sed -E 's/^.{20}//' | cut -c1-160 | sort | uniq -c | sort -rn | head -15
