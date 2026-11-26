@@ -3921,7 +3921,8 @@ def _gr_payload(phone: str, view: dict, image_url: str):
     if view.get("list"):
         button_text, rows = view["list"]
         return wai.build_list_message_payload(
-            str(phone), view["text"], button_text, [{"rows": [{"id": i, "title": t} for i, t in rows]}])
+            str(phone), view["text"], button_text,
+            [{"rows": [dict(zip(("id", "title", "description"), row)) for row in rows]}])
     payload = wai.build_reply_buttons_payload(str(phone), view["text"], list(view["buttons"]))
     if image_url:
         payload["interactive"]["header"] = {"type": "image", "image": {"link": image_url}}

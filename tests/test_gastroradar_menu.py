@@ -225,15 +225,16 @@ def test_cada_opcion_y_regreso(w, option, expected):
     assert "Soy Vicky de GastroRadar" in w.say("menu")
 
 
-def test_terminal_no_inventa_condiciones(w):
+def test_beneficio_tpv_no_inventa_condiciones_ni_precio(w):
     w.say("hola")
     reply = w.say("5") + w.say("¿cuánto cuesta?")
-    assert "$" not in reply and "sin costo" not in reply
+    assert "$" not in reply and "sujeto a las condiciones aplicables" in reply
+    assert "no tengo confirmado el costo de la terminal" in reply
 
 
 def test_asesor_conserva_tema_y_no_se_repite(w):
     w.say("hola"); w.say("5"); w.say("asesor")
-    assert "Terminal" in w.advisor()[0]
+    assert "Un año sin costo con TPV Inbursa" in w.advisor()[0]
     w.say("omitir")
     assert "no la repito" in w.say("asesor")
     assert len(w.advisor()) == 1
@@ -493,7 +494,7 @@ def test_pregunta_sobre_asesor_no_avisa(w, question, option):
 ])
 def test_peticion_explicita_si_avisa(w, request_text):
     w.say("hola")
-    assert "Envié el aviso al asesor" in w.say(request_text)
+    assert "Envié el aviso a" in w.say(request_text)          # «al asesor» o «a Christian»
     assert len(w.advisor()) == 1
 
 

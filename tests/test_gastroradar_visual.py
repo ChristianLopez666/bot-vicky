@@ -76,15 +76,15 @@ def test_sin_url_publica_la_bienvenida_va_sin_imagen(w, monkeypatch):
     assert "header" not in last(w)["interactive"] and len(controls(last(w))) == 3
 
 
-def test_tengo_un_negocio_abre_lista_con_las_cuatro_opciones(w):
+def test_tengo_un_negocio_abre_lista_con_sus_opciones(w):
     w.say("hola")
     tap(w, "gr_negocio")
     message = last(w)
     assert message["interactive"]["type"] == "list" and "header" not in message["interactive"]
     assert message["interactive"]["action"]["button"] == "Ver opciones"
     assert controls(message) == [
-        ("gr_registro", "Registrar mi negocio"), ("gr_planes", "Conocer los planes"),
-        ("gr_banners", "Anunciar mi negocio"), ("gr_terminal", "Terminal Inbursa"),
+        ("gr_registro", "Registrar mi negocio"), ("gr_planes", "Planes"),
+        ("gr_banners", "Publicidad y banners"), ("gr_beneficio", "Un año sin costo"),
         ("gr_inicio", "Volver al menú")]
 
 
@@ -124,7 +124,7 @@ def test_botones_de_bienvenida(w, button, expected, topic):
 
 @pytest.mark.parametrize("button,expected", [
     ("gr_registro", "4. Verifica que lo representas"), ("gr_planes", "Presencia: $89.90"),
-    ("gr_banners", "$499 MXN"), ("gr_terminal", "requisitos y condiciones")])
+    ("gr_banners", "$499 MXN"), ("gr_beneficio", "12 meses del Plan Presencia")])
 def test_cada_opcion_del_negocio(w, button, expected):
     w.say("hola")
     tap(w, "gr_negocio")
@@ -393,3 +393,131 @@ def test_app_y_radar_usan_el_cliente_con_memoria_acotada():
         source = open(app.__file__.replace("app.py", module), encoding="utf-8").read()
         builds = source.count('build("sheets", "v4"')
         assert builds == 1 and "reuse_spreadsheets(" in source
+
+
+# ── Seis opciones y beneficio con TPV Inbursa (26-nov) ──────────────────────
+SIX = [("1", "gr_comida", "Encontrar comida", "Encuentra dónde comer"),
+       ("2", "gr_registro", "Registro de negocio", "Registra y administra tu negocio"),
+       ("3", "gr_planes", "Planes", "Esencial: gratis"),
+       ("4", "gr_banners", "Publicidad y banners", "Anuncia tu negocio"),
+       ("5", "gr_beneficio", "Un año sin costo con TPV Inbursa", "Un año de publicidad sin costo"),
+       ("6", "gr_ayuda", "Soporte", "Ayuda y contacto")]
+
+
+def reach(w, button):
+    """Llega a una opción solo con toques, como en el teléfono."""
+    w.say("hola")
+    if button not in ("gr_comida", "gr_ayuda"):
+        tap(w, "gr_negocio")
+    return tap(w, button)
+
+
+@pytest.mark.parametrize("number,button,label,title", SIX)
+def test_seis_opciones_por_toque_siguiente_paso_regreso_y_asesor(w, number, button, label, title):
+    reply = reach(w, button)
+    assert title in reply and "Siguiente paso" in reply
+    assert {"gr_asesor", "gr_inicio"} <= set(ids_of(last(w)))
+    assert "Soy Vicky" in tap(w, "gr_inicio")                                  # volver al menú
+    reach(w, button)
+    assert "Envié el aviso" in tap(w, "gr_asesor")
+    [notice] = w.advisor()                                                     # canalizado una vez
+    assert f"Tema: {label}." in notice and USER in notice
+    assert w.report()[0]["Estado"] == "Solicita asesor"
+    assert w.report()[0]["Producto"] == "GastroRadar: " + label
+    assert "Soy Vicky" in tap(w, "gr_inicio")
+
+
+@pytest.mark.parametrize("number,button,label,title", SIX)
+def test_las_mismas_seis_opciones_por_numero(w, number, button, label, title):
+    w.say("hola")
+    assert title in w.say(number)
+    assert "Soy Vicky" in w.say("menu")
+
+
+def test_texto_del_beneficio(w):
+    text = reach(w, "gr_beneficio").replace("*", "")
+    for fact in ("12 meses del Plan Presencia de GastroRadar sin costo",
+                 "mediante la contratación de una terminal punto de venta (TPV) Inbursa",
+                 "sujeto a las condiciones aplicables", "La publicidad la presta GastroRadar, no Inbursa",
+                 "Los banners son aparte", "Hablar con Christian"):
+        assert fact in text, fact
+    assert "$" not in text and "requisitos" not in text
+    assert controls(last(w)) == [("gr_asesor", "Hablar con Christian"), ("gr_inicio", "Volver al menú")]
+
+
+def test_el_nombre_corto_de_la_lista_lleva_la_condicion(w):
+    w.say("hola"); tap(w, "gr_negocio")
+    rows = last(w)["interactive"]["action"]["sections"][0]["rows"]
+    [row] = [r for r in rows if r["id"] == "gr_beneficio"]
+    assert row == {"id": "gr_beneficio", "title": "Un año sin costo",
+                   "description": "Un año de publicidad sin costo al contratar TPV Inbursa"}
+    assert all(len(r["title"]) <= 24 and len(r.get("description", "")) <= 72 for r in rows)
+    assert not [r for r in rows if "Terminal" in r["title"]]
+
+
+def test_el_menu_por_texto_lista_las_seis_opciones(w, monkeypatch):
+    reject(w, monkeypatch, lambda p: p["type"] == "interactive")
+    w.say("hola")
+    body = body_of(last(w))
+    for option in ("1. Encontrar comida", "2. Registrar mi negocio", "3. Planes",
+                   "4. Publicidad y banners", "5. Un año de publicidad sin costo (al contratar TPV Inbursa)",
+                   "6. Soporte o atención humana"):
+        assert option in body
+    assert "Terminal punto de venta" not in body
+
+
+@pytest.mark.parametrize("phrase", [
+    "terminal", "quiero una TPV", "terminal Inbursa", "punto de venta", "un año de publicidad sin costo",
+    "publicidad gratis", "quiero el beneficio", "12 meses sin costo"])
+def test_frases_que_abren_el_beneficio(w, phrase):
+    w.say("hola")
+    assert "sujeto a las condiciones aplicables" in w.say(phrase).replace("*", "")
+    assert w.advisor() == []
+
+
+@pytest.mark.parametrize("phrase,expected", [
+    ("banner por 12 meses", "$499"), ("el registro es gratis", "El registro es gratis"),
+    ("publicidad", "$499"), ("planes", "Esencial")])
+def test_frases_que_no_abren_el_beneficio(w, phrase, expected):
+    w.say("hola")
+    reply = w.say(phrase).replace("*", "")
+    assert expected in reply and "TPV" not in reply
+
+
+@pytest.mark.parametrize("follow", ["¿cómo lo contrato?", "¿qué condiciones tiene?", "requisitos"])
+def test_seguimiento_del_beneficio_no_cambia_de_tema(w, follow):
+    reach(w, "gr_beneficio")
+    assert "sujeto a las condiciones aplicables" in w.say(follow).replace("*", "")
+
+
+def test_boton_antiguo_de_terminal_abre_el_beneficio(w):
+    reply = w.say("", kind="interactive", interactive={
+        "type": "list_reply", "list_reply": {"id": "gr_terminal", "title": "Terminal Inbursa"}})
+    assert "Un año de publicidad sin costo" in reply
+
+
+@pytest.mark.parametrize("phrase", ["hablar con Christian", "quiero que me contacte Christian"])
+def test_pedir_a_christian_avisa(w, phrase):
+    reach(w, "gr_beneficio")
+    assert "Envié el aviso a Christian" in w.say(phrase)
+    assert "Un año sin costo con TPV Inbursa" in w.advisor()[0]
+
+
+@pytest.mark.parametrize("name", ["Christian Prueba, Tacos Ficticios", "Mariscos Christian"])
+def test_el_nombre_christian_se_toma_como_dato(w, name):
+    w.say("hola"); w.say("asesor")
+    assert "envié tus datos" in w.say(name).lower() and name in w.advisor()[1]
+
+
+def test_beneficio_solicitud_canalizada_aun_si_el_texto_libre_falla(w):
+    w.meta.reject_text_to.add(ADVISOR)
+    reach(w, "gr_beneficio")
+    assert "Envié el aviso a Christian" in tap(w, "gr_asesor")
+    assert [p["type"] for p in w.meta.payloads if p["to"] == ADVISOR] == ["template"]
+
+
+def test_beneficio_si_no_sale_el_aviso_no_dice_que_se_envio(w):
+    reach(w, "gr_beneficio")
+    w.meta.reject_all_to.add(ADVISOR)
+    reply = tap(w, "gr_asesor")
+    assert "No pude enviar" in reply and "Envié el aviso" not in reply
